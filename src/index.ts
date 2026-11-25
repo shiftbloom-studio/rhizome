@@ -4,7 +4,7 @@
 // MemoryObject. All memory logic lives in the Durable Object.
 
 import { Hono, type Context } from "hono";
-import { authenticate, createClient, createUser, listClients, parseGrants, revokeClient, safeEqual, validGrantPattern } from "./auth";
+import { authenticate, createClient, createKey, createUser, listClients, listKeys, parseExpiresAt, parseGrants, revokeClient, revokeKey, safeEqual, validGrantPattern } from "./auth";
 import type { Env } from "./env";
 import { ForbiddenError, NOTE_KINDS, TRUST_LEVELS, type NoteKind, type Trust } from "./memory-object";
 import { can, isValidScope, isValidSlug, recallScopes, type Client, type Grants } from "./scopes";
@@ -88,6 +88,14 @@ function str(v: unknown, field: string, max: number): string | undefined {
 
 // -------------------------------------------------------------------- admin
 
+function expiresAt(v: unknown): number | null {
+  try {
+    return parseExpiresAt(v);
+  } catch (e) {
+    throw new HttpError(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
 const admin = new Hono<App>();
 admin.use("*", async (c, next) => {
   const token = c.env.ADMIN_TOKEN;
@@ -104,7 +112,7 @@ admin.post("/users", async (c) => {
 });
 
 admin.post("/clients", async (c) => {
-  const b = await body<{ userId?: string; name?: string; agent?: string; provider?: string; grants?: Grants }>(c);
+  const b = await body<{ userId?: string; name?: string; agent?: string; provider?: string; grants?: Grants; label?: string; expiresAt?: number | string }>(c);
   if (!b.userId || !b.agent || !b.provider) throw new HttpError(400, "userId, agent and provider are required");
   const grants = b.grants ? parseGrants(JSON.stringify(b.grants)) : undefined;
   if (grants) for (const p of [...grants.read, ...grants.write]) if (!validGrantPattern(p)) throw new HttpError(400, `invalid grant pattern: ${p}`);
@@ -114,11 +122,32 @@ admin.post("/clients", async (c) => {
     agent: b.agent,
     provider: b.provider,
     grants,
+    label: str(b.label, "label", 120)?.trim() || null,
+    expiresAt: expiresAt(b.expiresAt),
   });
   return c.json({ ...created, note: "Store the apiKey now. It is not shown again." }, 201);
 });
 
 admin.get("/users/:id/clients", async (c) => c.json({ clients: await listClients(c.env, c.req.param("id")) }));
+
+admin.post("/clients/:id/keys", async (c) => {
+  const b = await body<{ label?: string; expiresAt?: number | string }>(c);
+  try {
+    const created = await createKey(c.env, c.req.param("id"), { label: str(b.label, "label", 120)?.trim() || null, expiresAt: expiresAt(b.expiresAt) });
+    return c.json({ ...created, note: "Store the apiKey now. It is not shown again." }, 201);
+  } catch (e) {
+    if (e instanceof Error && e.message === "unknown client") throw new HttpError(404, e.message);
+    throw e;
+  }
+});
+
+admin.get("/clients/:id/keys", async (c) => c.json({ keys: await listKeys(c.env, c.req.param("id")) }));
+
+admin.delete("/clients/:id/keys/:prefix", async (c) => {
+  const n = await revokeKey(c.env, c.req.param("id"), c.req.param("prefix"));
+  if (!n) throw new HttpError(404, "no active key with this prefix");
+  return c.json({ revoked: n });
+});
 
 admin.delete("/clients/:id", async (c) => {
   await revokeClient(c.env, c.req.param("id"));
