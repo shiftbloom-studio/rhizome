@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// API of the memory explorer (the web UI). Every request carries a Cloudflare
-// Access JWT; the signed-in email address selects the person's memory. The
+// API of the memory explorer (the web UI). Every request comes from a signed-in
+// person (see identity.ts); their email address selects the person's memory. The
 // explorer acts as the owner and sees every scope, including agents' private ones.
 
 import { Hono } from "hono";
-import { verifyAccess } from "./access";
 import type { Env } from "./env";
+import { authMode, identify, signInHint, signInProblem, signInUrl } from "./identity";
 import type { MemoryObject } from "./memory-object";
 import { isValidScope, type Client } from "./scopes";
 
@@ -16,9 +16,10 @@ export const explorer = new Hono<Explorer>();
 const json = (c: { json: (b: unknown, s?: number) => Response }, status: number, error: string) => c.json({ error }, status);
 
 explorer.use("*", async (c, next) => {
-  if (!c.env.ACCESS_AUD || !c.env.ACCESS_TEAM_DOMAIN) return json(c, 404, "the explorer is disabled (no Cloudflare Access configured)");
-  const identity = await verifyAccess(c.req.header("cf-access-jwt-assertion"), c.env.ACCESS_TEAM_DOMAIN, c.env.ACCESS_AUD);
-  if (!identity) return json(c, 401, "sign in through Cloudflare Access");
+  const problem = signInProblem(c.env);
+  if (problem) return json(c, 404, `the explorer is disabled (${problem})`);
+  const identity = await identify(c.env, c.req.raw);
+  if (!identity) return c.json({ error: signInHint(c.env).toLowerCase(), signIn: signInUrl(c.env) }, 401);
   // Same-origin JSON only: a cross-site form post cannot set this header.
   if (c.req.method !== "GET" && c.req.header("x-rhizome") !== "1") return json(c, 403, "missing x-rhizome header");
   c.set("email", identity.email);
@@ -54,10 +55,12 @@ function requested(raw: string | undefined, all: string[]): string[] {
 
 explorer.get("/me", async (c) => {
   const client = c.get("client") as Client | undefined;
-  if (!client) return c.json({ email: c.get("email"), linked: false });
+  // A sign-out button only makes sense when rhizome owns the session.
+  const signOut = authMode(c.env) === "password" ? "/auth/logout" : null;
+  if (!client) return c.json({ email: c.get("email"), linked: false, signOut });
   const stub = memory(c.env, client);
   const [stats, scopes] = await Promise.all([stub.stats(client), stub.scopes(client)]);
-  return c.json({ email: c.get("email"), linked: true, stats, scopes });
+  return c.json({ email: c.get("email"), linked: true, userId: client.userId, stats, scopes, signOut });
 });
 
 explorer.use("*", async (c, next) => {

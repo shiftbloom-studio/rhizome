@@ -34,6 +34,18 @@ export interface Env {
   /** Cloudflare Access team domain, e.g. example.cloudflareaccess.com. */
   ACCESS_TEAM_DOMAIN?: string;
 
+  /** How people sign in to the explorer and the consent page: "access" (default), "password" or "proxy". See src/identity.ts. */
+  AUTH_MODE?: string;
+  /** AUTH_MODE=password: the one email address that may sign in, and its password (secret). */
+  LOGIN_EMAIL?: string;
+  LOGIN_PASSWORD?: string;
+  /** Secret, at least 32 characters. Signs session cookies (password) and consent tokens (proxy). */
+  SESSION_SECRET?: string;
+  /** AUTH_MODE=proxy: request header with the signed-in email, e.g. Remote-Email or Tailscale-User-Login. */
+  PROXY_AUTH_HEADER?: string;
+  /** AUTH_MODE=proxy, optional: the proxy must also send this value in x-rhizome-proxy-secret. */
+  PROXY_AUTH_SECRET?: string;
+
   /** Operator details for the imprint and privacy pages. Set at deploy time, never committed. */
   OPERATOR_NAME?: string;
   OPERATOR_BUSINESS?: string;

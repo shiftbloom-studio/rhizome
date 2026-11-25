@@ -2,7 +2,9 @@
 
 rhizome is a long-horizon memory that belongs to a person, not to an agent. Claude, ChatGPT, Hermes, Cursor and your own agents all read and write the same memory, so each of them knows how you work, what you decided and what you prefer, whichever provider it comes from.
 
-It runs entirely on Cloudflare: one Durable Object per person, Vectorize for semantic search, R2 for the raw history and Workers AI for embeddings and reranking. There is no server, database or GPU to run yourself, and an idle memory costs only its storage.
+It was built for Cloudflare: one Durable Object per person, Vectorize for semantic search, R2 for the raw history and Workers AI for embeddings and reranking. There is no server, database or GPU to run yourself, and an idle memory costs only its storage.
+
+The same code also runs on your own machine. `npm run local` or `docker compose up` starts it on Node with SQLite files and any OpenAI-compatible model server, such as Ollama or LM Studio. See [Run it without Cloudflare](#run-it-without-cloudflare).
 
 > Status: version 0.3. Store and find, fact extraction with conflict resolution, nightly reflection, a 3D memory explorer and a remote MCP server for Claude, ChatGPT and other MCP clients work. The evaluation harness and the bi-temporal knowledge graph come next. See [Roadmap](#roadmap).
 
@@ -34,7 +36,7 @@ recall: bge-m3 + Vectorize ─┐
 
 ## What happens in the background
 
-Everything runs on Workers AI inside the person's Durable Object, triggered by its alarm.
+Everything runs inside the person's Durable Object, triggered by its alarm, with Workers AI models by default.
 
 1. **Extraction.** A few seconds after an episode arrives, DeepSeek V4.1 Flash turns it into short English notes (preference, decision, fact, learning) with a scope, a trust level and the people, projects and tools it mentions. An episode without user messages can never produce a note that claims the user said something.
 2. **Resolution.** Each new fact is compared with the notes of its scope using the embeddings stored next to them, so nothing waits for the vector index.
@@ -60,7 +62,15 @@ The web UI at `/` shows the memory as a 3D graph.
 * A detail panel shows where a memory came from, what it replaced and what contradicts it. From there you can confirm or forget it, everywhere.
 * You can also write notes about yourself, and start a reflection.
 
-The explorer is meant to sit behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/). The Worker verifies the Access token itself and opens the memory of the person whose email address matches the signed-in user. Without `ACCESS_AUD` and `ACCESS_TEAM_DOMAIN` its API answers 404.
+The explorer opens the memory of the person whose email address matches the signed-in user. `AUTH_MODE` picks how people sign in:
+
+| `AUTH_MODE` | Sign-in | Settings |
+| --- | --- | --- |
+| `access` (default) | [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/) in front of rhizome. The app checks the Access token itself as well | `ACCESS_AUD`, `ACCESS_TEAM_DOMAIN` |
+| `password` | rhizome's own sign-in page for one person, with a signed cookie that lasts a week. The person is created on the first sign-in | `LOGIN_EMAIL`, `LOGIN_PASSWORD` (12+ characters), `SESSION_SECRET` (32+ characters) |
+| `proxy` | A sign-in proxy you already run, such as Authelia, oauth2-proxy or Tailscale Serve, passes the email address in a header | `PROXY_AUTH_HEADER`, `SESSION_SECRET`, optional `PROXY_AUTH_SECRET` |
+
+Until the chosen mode is fully configured, the explorer API answers 404 and nobody can approve an OAuth connector. The same sign-in protects the OAuth consent page.
 
 ## MCP
 
@@ -77,7 +87,7 @@ The explorer is meant to sit behind [Cloudflare Access](https://developers.cloud
 
 There are two ways to connect.
 
-* **OAuth**, for Claude, ChatGPT and any client that adds a server by URL. Add `https://<your host>/mcp` as a custom connector. The client registers itself, and you approve it on a consent page that sits behind Cloudflare Access. There you choose the agent and provider names its notes are signed with. Approving creates a client with the default grants, or reuses the one you already have for that agent and provider. Access tokens are API keys that expire after an hour and are refreshed automatically, so revoking the client in your token manager ends the connection.
+* **OAuth**, for Claude, ChatGPT and any client that adds a server by URL. Add `https://<your host>/mcp` as a custom connector. The client registers itself, and you approve it on a consent page that needs you signed in. There you choose the agent and provider names its notes are signed with. Approving creates a client with the default grants, or reuses the one you already have for that agent and provider. Access tokens are API keys that expire after an hour and are refreshed automatically, so revoking the client in your token manager ends the connection.
 * **API key**, for Claude Code, Hermes and other clients that can send a header:
 
 ```sh
@@ -135,6 +145,53 @@ A client can hold several keys, each with an optional label and expiry date. Key
 
 ## Self-hosting
 
+rhizome runs in two places. Both use the same code, API and MCP server.
+
+| | Cloudflare | Node (your machine, a VPS, a homelab) |
+| --- | --- | --- |
+| Memory per person | Durable Object with SQLite | SQLite file in `DATA_DIR/memory/` |
+| Control plane | D1 | `DATA_DIR/control.sqlite` |
+| Raw episodes | R2 | files in `DATA_DIR/episodes/` |
+| Semantic index | Vectorize | exact cosine search, `DATA_DIR/vectors.sqlite` |
+| Models | Workers AI | any OpenAI-compatible server (Ollama, LM Studio, llama.cpp, vLLM, OpenAI), or Workers AI over REST |
+| Nightly reflection | cron trigger | timer in the process |
+
+The Node version uses small stand-ins for the Cloudflare bindings (`src/node/`), so nothing in the memory logic differs. It is meant for one person or a small group: vector search scans every vector of a person, which is quick for tens of thousands of memories.
+
+### Run it without Cloudflare
+
+You need Node 26 or Docker, and a model server for embeddings and extraction. These steps use [Ollama](https://ollama.com).
+
+**With Docker**
+
+```sh
+cp .env.example .env          # set LOGIN_EMAIL, LOGIN_PASSWORD, SESSION_SECRET and ADMIN_TOKEN
+docker compose up -d
+docker compose exec ollama ollama pull bge-m3
+docker compose exec ollama ollama pull qwen3:8b
+```
+
+**With Node**
+
+```sh
+ollama pull bge-m3 && ollama pull qwen3:8b
+cp .env.example .env          # same settings as above
+npm run setup
+npm run local                 # builds the explorer and the server, then starts on http://localhost:8787
+```
+
+Open http://localhost:8787 and sign in with `LOGIN_EMAIL` and `LOGIN_PASSWORD`. The first sign-in creates you as a person. To connect an agent, add `<PUBLIC_URL>/mcp` as an MCP server and approve it (OAuth), or create a client with an API key through the admin API as in step 4 below. Your user id for that is `userId` at http://localhost:8787/ui/api/me while you are signed in.
+
+Things worth knowing:
+
+* **Models.** `EMBEDDING_MODEL` and `EXTRACTION_MODEL` must be models your server serves. `bge-m3` matches the Worker's embeddings. Any chat model that writes JSON reliably works for extraction; smaller ones miss more facts. `EXTRACTION=off` stores conversations without extracting notes. `AI_PROVIDER=cloudflare` with `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` uses Workers AI and its default models from Node.
+* **Reranking** is optional: point `AI_RERANK_URL` at a `/rerank` endpoint (llama.cpp with `--reranking`, vLLM, TEI or Infinity). Without it, recall keeps the fused order of vector and full-text search.
+* **Reachable from elsewhere.** rhizome listens on `127.0.0.1` unless you set `HOST`. Put a reverse proxy with TLS in front (Caddy, nginx, Traefik) and set `PUBLIC_URL` to its address, because OAuth for Claude and ChatGPT needs an `https` URL they can reach. With `TRUST_PROXY=true` rhizome takes the client address from `X-Forwarded-For`; only set it when the proxy is the only way in.
+* **Sign-in.** `AUTH_MODE=password` needs nothing else. With `proxy`, make sure rhizome can only be reached through the proxy, or set `PROXY_AUTH_SECRET` and have the proxy send it. A Cloudflare Tunnel with Access works too: keep `AUTH_MODE=access`.
+* **Backups.** Everything lives in `DATA_DIR`. Stop the server, or use `sqlite3 .backup`, and copy the folder.
+
+### Run it on Cloudflare
+
 You need a Cloudflare account with Workers Paid and a zone for the hostname.
 
 1. **Create the resources**
@@ -171,13 +228,13 @@ You need a Cloudflare account with Workers Paid and a zone for the hostname.
 
    The response contains the client's API key once. Repeat for every agent.
 
-5. **Protect the explorer.** Create a Cloudflare Access application for your hostname. Add a second one with a Bypass policy for `/v1/*`, `/mcp`, `/.well-known/*`, `/oauth/token`, `/oauth/register`, `/oauth/revoke`, `/privacy`, `/datenschutz`, `/imprint`, `/impressum`, `/fonts/*` and `/favicon.svg`, so agents, MCP clients and the legal pages stay reachable. Agents still need their API key or OAuth token. Leave `/oauth/authorize` behind Access: that is where you approve a connector. Then set `ACCESS_AUD` (the application's audience tag) and `ACCESS_TEAM_DOMAIN`.
+5. **Protect the explorer.** Without Cloudflare Access, set `AUTH_MODE=password` and `LOGIN_EMAIL` as build variables and `LOGIN_PASSWORD` and `SESSION_SECRET` as secrets, and skip the rest of this step. With Access, create a Cloudflare Access application for your hostname. Add a second one with a Bypass policy for `/v1/*`, `/mcp`, `/.well-known/*`, `/oauth/token`, `/oauth/register`, `/oauth/revoke`, `/privacy`, `/datenschutz`, `/imprint`, `/impressum`, `/fonts/*` and `/favicon.svg`, so agents, MCP clients and the legal pages stay reachable. Agents still need their API key or OAuth token. Leave `/oauth/authorize` behind Access: that is where you approve a connector. Then set `ACCESS_AUD` (the application's audience tag) and `ACCESS_TEAM_DOMAIN`.
 
 If your zone challenges bots, add a WAF skip rule for requests to your hostname that carry an `Authorization` header, otherwise agents get a challenge page instead of JSON.
 
 ## Costs
 
-Measured list prices on Workers AI and Vectorize (November 2026). An idle memory costs only storage, roughly $0.20 a month after a year of heavy use. Active use is dominated by fact extraction, about $0.0006 per short episode with DeepSeek V4.1 Flash, and by the nightly reflection, which only calls GLM 5.3 when notes changed. Details in [docs/m0-spike.md](docs/m0-spike.md).
+On Node the costs are your machine's. On Cloudflare, measured list prices on Workers AI and Vectorize (November 2026). An idle memory costs only storage, roughly $0.20 a month after a year of heavy use. Active use is dominated by fact extraction, about $0.0006 per short episode with DeepSeek V4.1 Flash, and by the nightly reflection, which only calls GLM 5.3 when notes changed. Details in [docs/m0-spike.md](docs/m0-spike.md).
 
 ## Roadmap
 

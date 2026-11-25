@@ -49,6 +49,9 @@ export interface Stats {
 export interface Me {
   email: string;
   linked: boolean;
+  userId?: string;
+  /** Set when rhizome's own sign-in is used: POST here to sign out. */
+  signOut?: string | null;
   stats?: Stats;
   scopes?: string[];
 }

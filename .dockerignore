@@ -1,0 +1,11 @@
+node_modules
+web/node_modules
+dist
+web/dist
+data
+.env
+.env.deploy
+.dev.vars
+.wrangler
+wrangler.deploy.jsonc
+.git

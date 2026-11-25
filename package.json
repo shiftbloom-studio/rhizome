@@ -2,7 +2,7 @@
   "name": "rhizome",
   "version": "0.3.0",
   "private": true,
-  "description": "Personal long-horizon memory for AI agents, shared across agents and providers. Runs entirely on Cloudflare.",
+  "description": "Personal long-horizon memory for AI agents, shared across agents and providers. Runs on Cloudflare, or on any machine with Node and SQLite.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {
@@ -14,9 +14,13 @@
     "test": "vitest run",
     "check": "tsc --noEmit && npm run build:web && node scripts/render-config.mjs && wrangler deploy -c wrangler.deploy.jsonc --dry-run --outdir .wrangler/dry-run",
     "build:web": "npm --prefix web run build",
+    "build:node": "node scripts/build-node.mjs",
+    "start": "node --disable-warning=ExperimentalWarning dist/node/server.mjs",
+    "local": "npm run build:web && npm run build:node && npm start",
     "setup": "npm ci && npm ci --prefix web"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.11",
     "hono": "^4.12.0"
   },
   "devDependencies": {

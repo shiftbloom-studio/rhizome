@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for security problems. Use GitHub's private vulnerability reporting instead: **Security → Report a vulnerability** on this repository. We answer within a few days and credit reporters who want to be credited.
+Please do not open a public issue for security problems. Write to **safety@shiftbloom.studio**, or use GitHub's private vulnerability reporting: **Security → Report a vulnerability** on this repository. We answer within a few days and credit reporters who want to be credited.
 
 ## How rhizome is protected
 
@@ -14,8 +14,17 @@ rhizome stores what AI agents learn about a person, so it treats every memory as
 * **Vectorize namespaces.** Every vector query is pinned to the person's namespace and filtered by the allowed scopes.
 * **Admin API is off by default.** `/v1/admin/*` only exists when the `ADMIN_TOKEN` secret is set, and the token is compared in constant time.
 * **No second hostname.** `workers_dev` and preview URLs are disabled.
+* **Browser sign-in is checked by the app.** The explorer and the OAuth consent page verify the Cloudflare Access JWT, rhizome's own HMAC-signed session cookie (HttpOnly, SameSite=Lax, seven days) or the sign-in proxy's header, depending on `AUTH_MODE`. The consent form carries a CSRF token keyed with a value only that sign-in knows, and cross-site form posts are refused.
+* **Built-in password sign-in** compares hashes in constant time, is rate limited per client address and only redirects to paths on the same site.
 * **Memories are data, not instructions.** Recall results carry their scope, source agent and trust level. Clients should present them to their model as quoted data.
 * **Forget means delete.** `DELETE /v1/memory/items/:id` removes the item from SQLite, the full-text index, Vectorize and, for episodes, the raw copy in R2.
+
+## Running it yourself on Node
+
+* rhizome listens on `127.0.0.1` by default. Expose it through a reverse proxy with TLS, not directly.
+* With `AUTH_MODE=proxy` rhizome believes the email header it is given. Make sure nobody can reach it around the proxy, or set `PROXY_AUTH_SECRET`.
+* Only set `TRUST_PROXY=true` when a proxy is the only way in, since it makes rhizome trust `X-Forwarded-*` headers.
+* `DATA_DIR` holds every memory in plain SQLite files and JSON. Protect it like a password store and encrypt its backups.
 
 ## Installation-specific values
 
