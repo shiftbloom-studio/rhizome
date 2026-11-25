@@ -136,6 +136,8 @@ describe("OAuth", () => {
     expect((await call(`/oauth/authorize?${q({ redirect_uri: "https://other.example/cb" })}`, { headers: { "cf-access-jwt-assertion": "good-jwt" } })).status).toBe(400);
     const plain = await call(`/oauth/authorize?${q({ code_challenge_method: "plain" })}`, { headers: { "cf-access-jwt-assertion": "good-jwt" } });
     expect(new URL(plain.headers.get("location")!).searchParams.get("error")).toBe("invalid_request");
+    const lookalike = await call(`/oauth/authorize?${q({ resource: `${HOST}.evil.example/mcp` })}`, { headers: { "cf-access-jwt-assertion": "good-jwt" } });
+    expect(new URL(lookalike.headers.get("location")!).searchParams.get("error")).toBe("invalid_target");
 
     const crossSite = await call("/oauth/authorize", {
       ...form({ client_id: reg.client_id, redirect_uri: "https://evil.example/cb", code_challenge: "a".repeat(43), agent: "x", provider: "y", decision: "allow" }),

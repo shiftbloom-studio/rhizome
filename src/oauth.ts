@@ -184,7 +184,10 @@ async function checkAuthorize(env: Env, url: string, p: Record<string, string | 
     return back("invalid_request", "PKCE with code_challenge_method=S256 is required");
   }
   if (p.scope && !p.scope.split(" ").every((s) => s === SCOPE || s === "")) return back("invalid_scope", `the only scope is ${SCOPE}`);
-  if (p.resource && !p.resource.startsWith(origin(url))) return back("invalid_target", "unknown resource");
+  // RFC 8707: the only resource is this server's MCP endpoint (a trailing slash or the bare origin is accepted too).
+  if (p.resource && ![`${origin(url)}/mcp`, `${origin(url)}/mcp/`, origin(url), `${origin(url)}/`].includes(p.resource)) {
+    return back("invalid_target", "unknown resource");
+  }
   return { client, params: { client_id: client.id, redirect_uri: redirect, state: p.state ?? "", code_challenge: p.code_challenge, resource: p.resource ?? "" } };
 }
 
@@ -362,14 +365,19 @@ oauth.post("/oauth/token", async (c) => {
   if (form.grant_type === "refresh_token") {
     const token = typeof form.refresh_token === "string" ? form.refresh_token : "";
     if (!token.startsWith(REFRESH_PREFIX)) return oauthError("invalid_grant", "unknown refresh token");
+    // Rotation: the old refresh token is cleared in the same statement that reads it,
+    // so two concurrent requests with one token cannot both get a new pair.
     const grant = await db
       .prepare(
-        `SELECT g.id, g.oauth_client_id, g.client_id, g.refresh_expires_at FROM oauth_grants g JOIN clients c ON c.id = g.client_id
-          WHERE g.refresh_hash = ? AND g.revoked_at IS NULL AND c.revoked_at IS NULL`,
+        `UPDATE oauth_grants SET refresh_hash = NULL
+          WHERE refresh_hash = ? AND oauth_client_id = ? AND revoked_at IS NULL AND refresh_expires_at >= ?
+          RETURNING id, client_id`,
       )
-      .bind(await sha256Hex(token))
-      .first<{ id: string; oauth_client_id: string; client_id: string; refresh_expires_at: number }>();
-    if (!grant || grant.oauth_client_id !== client.id || grant.refresh_expires_at < now) return oauthError("invalid_grant", "the refresh token is invalid or expired");
+      .bind(await sha256Hex(token), client.id, now)
+      .first<{ id: string; client_id: string }>();
+    if (!grant) return oauthError("invalid_grant", "the refresh token is invalid or expired");
+    const live = await db.prepare("SELECT 1 AS ok FROM clients WHERE id = ? AND revoked_at IS NULL").bind(grant.client_id).first();
+    if (!live) return oauthError("invalid_grant", "the connection was revoked");
     return issueTokens(c.env, grant.id, grant.client_id);
   }
 

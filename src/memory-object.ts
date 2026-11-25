@@ -291,6 +291,7 @@ export class MemoryObject extends DurableObject<Env> {
     input: { scope: string; notes: string[]; kind?: NoteKind; trust?: Trust; source?: string },
   ): Promise<{ added: number; skipped: number; ids: string[] }> {
     this.userId(client);
+    if (!can(client, "write", input.scope)) throw new ForbiddenError(input.scope);
     const now = Date.now();
     const trust = input.trust ?? "user_confirmed";
     const ids: string[] = [];
