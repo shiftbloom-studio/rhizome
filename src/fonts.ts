@@ -3,9 +3,11 @@
 // Brand fonts (Clash Display, General Sans, JetBrains Mono) are proxied
 // through the Worker, so visitors never connect to Fontshare or Google.
 
+import { faviconSvg } from "./bloom";
+
 const FONT_CSS = [
   // Fontshare returns only the first family per request, so one URL per family.
-  "https://api.fontshare.com/v2/css?f[]=clash-display@500,600&display=swap",
+  "https://api.fontshare.com/v2/css?f[]=clash-display@400,500,600&display=swap",
   "https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap",
   "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap",
 ];
@@ -42,15 +44,5 @@ export async function fontFile(kind: string, path: string): Promise<Response> {
   });
 }
 
-/** Solid bloom (brand rule: below 32 px the mark is drawn solid). */
-export const FAVICON = (() => {
-  const petal = (r: number, w: number) => {
-    const a = w * r, b = w * r * 0.55, y1 = -r * 0.32, y2 = -r * 0.78;
-    return `M0 0C${a} ${y1} ${b} ${y2} 0 ${-r}C${-b} ${y2} ${-a} ${y1} 0 0Z`;
-  };
-  let body = "";
-  for (const [r, n, w, rot] of [[100, 10, 0.27, 0], [74, 10, 0.29, 18]] as const) {
-    for (let k = 0; k < n; k++) body += `<path d="${petal(r, w)}" transform="rotate(${rot + (360 / n) * k})" fill="#FF2E52"/>`;
-  }
-  return `<svg viewBox="-105 -105 210 210" xmlns="http://www.w3.org/2000/svg">${body}<circle r="7" fill="#C81040"/></svg>`;
-})();
+/** Favicon: the solid bloom from shiftbloom.studio (brand rule: below 32 px the mark is drawn solid). */
+export const FAVICON = faviconSvg();
