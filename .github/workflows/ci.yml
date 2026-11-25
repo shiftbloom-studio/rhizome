@@ -1,23 +1,38 @@
 name: CI
 
+# Lean CI: one run per PR head, newest push wins. Main is not re-checked after
+# merge (PR checks already ran). Runner comes from the org/repo
+# variable CI_RUNNER (self-hosted label) and falls back to GitHub-hosted.
+# PRs from forks always use GitHub-hosted runners.
 on:
-  push:
-    branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/dependabot.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  push:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm ci --prefer-offline --no-audit --no-fund
       - run: npm test
       - run: npm run check
         env:
