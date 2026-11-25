@@ -525,6 +525,7 @@ export class MemoryObject extends DurableObject<Env> {
         this.sql.exec("DELETE FROM episodes WHERE id = ?", id);
         for (const c of chunks) this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('delete', ?, ?)", c, now);
         this.audit(client, "forget.episode", { id, chunks: chunks.length });
+        this.dropOrphanEntities();
       });
       await this.env.EPISODES.delete(String(episode.r2_key));
       await this.kick();
@@ -540,6 +541,7 @@ export class MemoryObject extends DurableObject<Env> {
       this.sql.exec("DELETE FROM items WHERE id = ?", id);
       this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('delete', ?, ?)", id, now);
       this.audit(client, "forget.item", { id });
+      this.dropOrphanEntities();
     });
     await this.kick();
     return { deleted: 1 };
@@ -1187,6 +1189,11 @@ export class MemoryObject extends DurableObject<Env> {
       now,
     );
     this.sql.exec("UPDATE items SET importance = ? WHERE id = ?", value, id);
+  }
+
+  /** Forgotten memories take the names only they mentioned with them. */
+  private dropOrphanEntities(): void {
+    this.sql.exec("DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)");
   }
 
   /** Removes derived rows of an item or episode before it is deleted. */

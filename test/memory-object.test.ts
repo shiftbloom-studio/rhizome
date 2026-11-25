@@ -149,6 +149,10 @@ describe("MemoryObject pipeline", () => {
     expect(fake.vectors.size).toBe(before - 1);
     expect(db.prepare("SELECT COUNT(*) AS n FROM links WHERE src = ? OR dst = ?").get(ep.id, ep.id)).toEqual({ n: 0 });
     expect(db.prepare("SELECT COUNT(*) AS n FROM mentions WHERE ref = ?").get(ep.id)).toEqual({ n: 0 });
+    // Workers Builds and GitHub are still mentioned by the two extracted notes.
+    expect(db.prepare("SELECT COUNT(*) AS n FROM entities").get()).toEqual({ n: 2 });
+    for (const n of notes()) await mo.forget(web, String(n.id));
+    expect(db.prepare("SELECT COUNT(*) AS n FROM entities").get()).toEqual({ n: 0 });
   });
 
   it("serves the explorer: graph, detail, scopes and activity", async () => {
