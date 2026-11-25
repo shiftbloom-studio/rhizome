@@ -8,10 +8,13 @@ import { authenticate, createClient, createKey, createUser, listClients, listKey
 import type { Env } from "./env";
 import { ForbiddenError, NOTE_KINDS, TRUST_LEVELS, type NoteKind, type Trust } from "./memory-object";
 import { can, isValidScope, isValidSlug, recallScopes, type Client, type Grants } from "./scopes";
+import { explorer } from "./explorer";
+import { FAVICON, fontCss, fontFile } from "./fonts";
+import { LEGAL_PATHS, legalPage } from "./legal";
 
 export { MemoryObject } from "./memory-object";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 type App = { Bindings: Env; Variables: { client: Client } };
 const app = new Hono<App>();
@@ -33,10 +36,16 @@ app.onError((err, c) => {
   return c.json({ error: "internal error" }, 500);
 });
 
-app.get("/", (c) =>
-  c.json({ name: "rhizome", version: VERSION, description: "Personal long-horizon memory for AI agents", docs: "/v1/health" }),
-);
 app.get("/v1/health", (c) => c.json({ ok: true, version: VERSION }));
+
+// Public pages: imprint, privacy policy, fonts and icon (bypassed in Cloudflare Access).
+for (const [path, kind] of Object.entries(LEGAL_PATHS)) app.get(path, (c) => legalPage(kind, c.env));
+app.get("/fonts/fonts.css", (c) => fontCss(c.executionCtx));
+app.get("/fonts/:host{fs|gs}/:path{.+}", (c) => fontFile(c.req.param("host"), c.req.param("path")));
+app.get("/favicon.svg", () => new Response(FAVICON, { headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=604800" } }));
+
+// Memory explorer API, behind Cloudflare Access.
+app.route("/ui/api", explorer);
 
 // ------------------------------------------------------------------ helpers
 
@@ -126,6 +135,15 @@ admin.post("/clients", async (c) => {
     expiresAt: expiresAt(b.expiresAt),
   });
   return c.json({ ...created, note: "Store the apiKey now. It is not shown again." }, 201);
+});
+
+admin.patch("/users/:id", async (c) => {
+  const b = await body<{ email?: string | null }>(c);
+  const email = b.email === null ? null : str(b.email, "email", 254)?.trim().toLowerCase();
+  if (email !== null && (!email || !/^[^@\s]+@[^@\s]+$/.test(email))) throw new HttpError(400, "email must be an email address or null");
+  const res = await c.env.CONTROL_DB.prepare("UPDATE users SET email = ? WHERE id = ?").bind(email, c.req.param("id")).run();
+  if (!res.meta.changes) throw new HttpError(404, "unknown user");
+  return c.json({ id: c.req.param("id"), email });
 });
 
 admin.get("/users/:id/clients", async (c) => c.json({ clients: await listClients(c.env, c.req.param("id")) }));
@@ -303,6 +321,21 @@ mem.get("/stats", async (c) => c.json(await memory(c).stats(c.get("client"))));
 
 app.route("/v1/memory", mem);
 
-app.notFound((c) => c.json({ error: "not found" }, 404));
+app.notFound(async (c) => {
+  // Everything else is the explorer's single-page app.
+  if (c.env.ASSETS && c.req.method === "GET" && !c.req.path.startsWith("/v1/") && !c.req.path.startsWith("/ui/api/")) {
+    return c.env.ASSETS.fetch(c.req.raw);
+  }
+  return c.json({ error: "not found" }, 404);
+});
 
-export default app;
+export default {
+  fetch: app.fetch,
+  /** Nightly reflection for every person: consolidation, decay, profile distillation. */
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    const { results } = await env.CONTROL_DB.prepare("SELECT id FROM users").all<{ id: string }>();
+    ctx.waitUntil(
+      Promise.allSettled(results.map((u) => env.MEMORY.get(env.MEMORY.idFromName(`user:${u.id}`)).requestReflection())),
+    );
+  },
+} satisfies ExportedHandler<Env>;

@@ -25,6 +25,8 @@ if (missing.length) {
 
 let config = readFileSync("wrangler.jsonc", "utf8");
 for (const k of Object.keys(KEYS)) config = config.replaceAll(`<${k}>`, JSON.stringify(env[k]).slice(1, -1));
+// Optional settings (<NAME?>): Cloudflare Access for the explorer, operator details for the legal pages.
+config = config.replace(/<([A-Z0-9_]+)\?>/g, (_m, k) => JSON.stringify(env[k] ?? "").slice(1, -1));
 const left = config.replace(/^\s*\/\/.*$/gm, "").match(/<[A-Z0-9_]+>/);
 if (left) {
   console.error(`Unfilled placeholder ${left[0]} in wrangler.jsonc`);

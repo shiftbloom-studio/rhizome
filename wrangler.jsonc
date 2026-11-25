@@ -10,6 +10,28 @@
   "preview_urls": false,
   "routes": [{ "pattern": "<RHIZOME_HOSTNAME>", "custom_domain": true }],
   "observability": { "enabled": true },
+  // The memory explorer (web/). The Worker runs first for the API, the public pages and fonts.
+  "assets": {
+    "directory": "./web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/v1/*", "/ui/api/*", "/fonts/*", "/favicon.svg", "/privacy", "/datenschutz", "/imprint", "/impressum"]
+  },
+  // Nightly reflection (consolidation, decay, profile distillation) at 03:17 UTC.
+  "triggers": { "crons": ["17 3 * * *"] },
+  "vars": {
+    "ACCESS_AUD": "<ACCESS_AUD?>",
+    "ACCESS_TEAM_DOMAIN": "<ACCESS_TEAM_DOMAIN?>",
+    "OPERATOR_NAME": "<OPERATOR_NAME?>",
+    "OPERATOR_BUSINESS": "<OPERATOR_BUSINESS?>",
+    "OPERATOR_STREET": "<OPERATOR_STREET?>",
+    "OPERATOR_CITY": "<OPERATOR_CITY?>",
+    "OPERATOR_COUNTRY_EN": "<OPERATOR_COUNTRY_EN?>",
+    "OPERATOR_COUNTRY_DE": "<OPERATOR_COUNTRY_DE?>",
+    "OPERATOR_EMAIL": "<OPERATOR_EMAIL?>",
+    "OPERATOR_PHONE": "<OPERATOR_PHONE?>",
+    "SUPERVISORY_AUTHORITY": "<SUPERVISORY_AUTHORITY?>"
+  },
   "ai": { "binding": "AI" },
   "durable_objects": { "bindings": [{ "name": "MEMORY", "class_name": "MemoryObject" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MemoryObject"] }],
@@ -20,5 +42,6 @@
   "vectorize": [{ "binding": "VECTORS", "index_name": "rhizome-memory" }],
   "ratelimits": [{ "name": "RATE_LIMITER", "namespace_id": "4201", "simple": { "limit": 120, "period": 60 } }]
   // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Enables the /v1/admin endpoints.
-  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL.
+  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT.
+  // Placeholders ending in "?" are optional and become empty strings when unset.
 }
