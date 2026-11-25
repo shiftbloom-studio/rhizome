@@ -64,10 +64,19 @@ async function connect() {
   expect(html).toContain('value="anthropic"');
   expect(consent.headers.get("content-security-policy")).toContain("form-action 'self' https://claude.ai");
 
-  const approve = await call("/oauth/authorize", {
-    ...form({ client_id, redirect_uri: REDIRECT, state: "xyz", code_challenge: challenge, resource: `${HOST}/mcp`, agent: "claude", provider: "anthropic", decision: "allow" }),
-    headers: { "content-type": "application/x-www-form-urlencoded", "cf-access-jwt-assertion": "good-jwt", origin: HOST, "sec-fetch-site": "same-origin" },
-  });
+  const consentToken = /name="consent" value="([^"]+)"/.exec(html)![1]!;
+  const fields = { client_id, redirect_uri: REDIRECT, state: "xyz", code_challenge: challenge, resource: `${HOST}/mcp`, agent: "claude", provider: "anthropic", decision: "allow" };
+  const post = (extra: Record<string, string>, headers: Record<string, string> = {}) =>
+    call("/oauth/authorize", {
+      ...form({ ...fields, ...extra }),
+      // Browsers send Origin: null here when the page came through the Access sign-in redirects.
+      headers: { "content-type": "application/x-www-form-urlencoded", "cf-access-jwt-assertion": "good-jwt", origin: "null", "sec-fetch-site": "same-origin", ...headers },
+    });
+  expect((await post({})).status).toBe(403); // no consent token
+  expect((await post({ consent: consentToken.replace(/.$/, (ch) => (ch === "0" ? "1" : "0")) })).status).toBe(403);
+  expect((await post({ consent: consentToken, state: "other" })).status).toBe(403); // token bound to the request
+  expect((await post({ consent: consentToken }, { "sec-fetch-site": "cross-site" })).status).toBe(403);
+  const approve = await post({ consent: consentToken });
   expect(approve.status).toBe(302);
   const back = new URL(approve.headers.get("location")!);
   expect(back.origin + back.pathname).toBe(REDIRECT);
@@ -204,5 +213,17 @@ describe("MCP tools", () => {
     });
     expect(ok.status).toBe(201);
     expect(await ok.json()).toEqual({ scope: "agent:claude", added: 2, skipped: 0 });
+  });
+});
+
+describe("consent token", () => {
+  it("expires after 15 minutes and only works with the same sign-in", async () => {
+    const { consentToken, verifyConsentToken } = await import("../src/oauth");
+    const p = { client_id: "rzc_1", redirect_uri: REDIRECT, state: "s", code_challenge: "c".repeat(43), resource: "" };
+    const t = await consentToken("jwt-a", p, 1_000_000);
+    expect(await verifyConsentToken("jwt-a", p, t, 1_000_000 + 60_000)).toBe(true);
+    expect(await verifyConsentToken("jwt-b", p, t, 1_000_000 + 60_000)).toBe(false);
+    expect(await verifyConsentToken("jwt-a", p, t, 1_000_000 + 16 * 60_000)).toBe(false);
+    expect(await verifyConsentToken("jwt-a", p, undefined)).toBe(false);
   });
 });

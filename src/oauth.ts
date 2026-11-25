@@ -221,7 +221,8 @@ oauth.get("/oauth/authorize", async (c) => {
   const target = new URL(params.redirect_uri);
   const where = target.host || target.protocol;
   const known = KNOWN_HOSTS.some((h) => target.hostname === h || target.hostname.endsWith(`.${h}`)) || target.hostname === "localhost" || target.hostname === "127.0.0.1";
-  const hidden = Object.entries(params).map(([k, v]) => `<input type="hidden" name="${k}" value="${esc(v)}">`).join("");
+  const consent = await consentToken(c.req.header("cf-access-jwt-assertion")!, params);
+  const hidden = [...Object.entries(params), ["consent", consent]].map(([k, v]) => `<input type="hidden" name="${k}" value="${esc(v!)}">`).join("");
   return page(
     `Connect ${esc(client.name)}?`,
     `<p><b>${esc(client.name)}</b> wants to read and write your memory as <b>${esc(user.email)}</b>. It gets the same access as an agent with a key: your profile, every project and its own private notes.</p>
@@ -238,10 +239,11 @@ oauth.get("/oauth/authorize", async (c) => {
 });
 
 oauth.post("/oauth/authorize", async (c) => {
-  // Cross-site form posts carry the Access cookie, so only same-origin posts count.
+  // Cross-site form posts carry the Access cookie. Browsers mark them in Sec-Fetch-Site,
+  // and the consent token proves the form came from a page rendered for this sign-in.
+  // The Origin header is not used: it can be "null" after the Access redirect chain.
   const site = c.req.header("sec-fetch-site");
-  const from = c.req.header("origin");
-  if ((site && site !== "same-origin") || (from && from !== origin(c.req.url)) || (!site && !from)) {
+  if (site && site !== "same-origin" && site !== "none") {
     return page("Request refused", "<p>This approval did not come from the rhizome page. Nothing was shared.</p>", 403);
   }
   const form = await c.req.parseBody();
@@ -259,6 +261,9 @@ oauth.post("/oauth/authorize", async (c) => {
   const { client, params } = checked;
   const user = await signedInUser(c.env, c.req.header("cf-access-jwt-assertion"));
   if (!user) return page("Sign-in needed", "<p>Your sign-in expired. Start the connection again.</p>", 401);
+  if (!(await verifyConsentToken(c.req.header("cf-access-jwt-assertion")!, params, field("consent")))) {
+    return page("Request refused", "<p>This approval did not come from the rhizome page, or the page was open too long. Start the connection again from the app. Nothing was shared.</p>", 403);
+  }
   const iss = origin(c.req.url);
   if (field("decision") !== "allow") {
     return redirectWith(params.redirect_uri, { error: "access_denied", error_description: "the person declined", state: params.state, iss });
@@ -291,6 +296,37 @@ oauth.post("/oauth/authorize", async (c) => {
     .run();
   return redirectWith(params.redirect_uri, { code, state: params.state, iss });
 });
+
+const CONSENT_TTL = 15 * 60_000;
+
+async function hmacHex(key: string, message: string): Promise<string> {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(message)));
+  return [...sig].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const consentMessage = (issued: string, p: AuthorizeParams) =>
+  [issued, p.client_id, p.redirect_uri, p.state, p.code_challenge, p.resource].join("\n");
+
+/**
+ * CSRF token for the consent form: an HMAC over the request, keyed with the
+ * person's Access token. Another site can neither read that token nor make one.
+ */
+export async function consentToken(accessJwt: string, p: AuthorizeParams, now = Date.now()): Promise<string> {
+  const issued = String(now);
+  return `${issued}.${await hmacHex(accessJwt, consentMessage(issued, p))}`;
+}
+
+export async function verifyConsentToken(accessJwt: string, p: AuthorizeParams, token: string | undefined, now = Date.now()): Promise<boolean> {
+  const [issued, mac] = (token ?? "").split(".");
+  if (!issued || !mac || !/^\d+$/.test(issued)) return false;
+  const age = now - Number(issued);
+  if (age < 0 || age > CONSENT_TTL) return false;
+  const expected = await hmacHex(accessJwt, consentMessage(issued, p));
+  let diff = expected.length ^ mac.length;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ (mac.charCodeAt(i) || 0);
+  return diff === 0;
+}
 
 // --------------------------------------------------------------------- token
 
@@ -477,7 +513,7 @@ footer{margin-top:28px;font-size:13px;color:var(--ink60)}footer a{color:var(--in
       ...noStore,
       "content-security-policy": `default-src 'none'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; form-action 'self'${formAction ? ` ${formAction}` : ""}; frame-ancestors 'none'; base-uri 'none'`,
       "x-frame-options": "DENY",
-      "referrer-policy": "no-referrer",
+      "referrer-policy": "same-origin",
     },
   });
 }
