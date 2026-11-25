@@ -15,8 +15,10 @@ interface Jwk extends JsonWebKey {
 
 let cache: { team: string; keys: Map<string, CryptoKey>; at: number } | null = null;
 
-async function keys(team: string): Promise<Map<string, CryptoKey>> {
-  if (cache && cache.team === team && Date.now() - cache.at < 3_600_000) return cache.keys;
+async function keys(team: string, refresh = false): Promise<Map<string, CryptoKey>> {
+  const age = cache && cache.team === team ? Date.now() - cache.at : Infinity;
+  // A forced refresh (unknown kid after a key rotation) is allowed at most once a minute.
+  if (cache && age < (refresh ? 60_000 : 3_600_000)) return cache.keys;
   const res = await fetch(`https://${team}/cdn-cgi/access/certs`);
   if (!res.ok) throw new Error(`Access certs: HTTP ${res.status}`);
   const body = (await res.json()) as { keys: Jwk[] };
@@ -61,7 +63,7 @@ export async function verifyAccess(token: string | undefined, team: string, aud:
   const seconds = now / 1000;
   if (!payload.exp || payload.exp < seconds - 30) return null;
   if (payload.nbf && payload.nbf > seconds + 30) return null;
-  const key = (await keys(team)).get(header.kid);
+  const key = (await keys(team)).get(header.kid) ?? (await keys(team, true)).get(header.kid);
   if (!key) return null;
   const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64url(s), new TextEncoder().encode(`${h}.${p}`));
   if (!ok || !payload.email) return null;

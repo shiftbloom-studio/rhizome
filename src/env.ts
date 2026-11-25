@@ -24,6 +24,8 @@ export interface Env {
   REFLECTION_MODEL?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
+  /** Maximum episodes per person and UTC day that go through fact extraction. Default: 200. */
+  EXTRACTION_DAILY_LIMIT?: string;
 
   /** Static files of the memory explorer. */
   ASSETS?: Fetcher;

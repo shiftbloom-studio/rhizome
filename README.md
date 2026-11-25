@@ -48,7 +48,7 @@ Everything runs on Workers AI inside the person's Durable Object, triggered by i
    * Duplicates the day produced are merged.
    * GLM 5.3 rewrites the `distilled-profile` block from the profile notes, and a `summary` block for each changed project. It only runs when the notes changed.
 
-Set `EXTRACTION=off` to store episodes without extraction, and `EXTRACTION_MODEL` or `REFLECTION_MODEL` to use other Workers AI models.
+Set `EXTRACTION=off` to store episodes without extraction, and `EXTRACTION_MODEL` or `REFLECTION_MODEL` to use other Workers AI models. At most `EXTRACTION_DAILY_LIMIT` episodes (default 200) per person and UTC day go through extraction; the rest are stored and searchable without extracted notes.
 
 ## Memory explorer
 

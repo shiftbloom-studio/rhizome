@@ -189,6 +189,21 @@ export class MemoryObject extends DurableObject<Env> {
     this.sql.exec("INSERT INTO jobs (kind, ref, not_before, created_at) VALUES (?, ?, ?, ?)", kind, ref, now + delayMs, now);
   }
 
+  /**
+   * Caps fact extraction per person and UTC day (EXTRACTION_DAILY_LIMIT, default 200),
+   * so a chatty or misbehaving agent cannot run up Workers AI usage. Episodes over
+   * the cap are still stored and searchable, they just get no extracted notes.
+   */
+  private takeExtractionBudget(): boolean {
+    const limit = Number(this.env.EXTRACTION_DAILY_LIMIT ?? 200);
+    const day = new Date().toISOString().slice(0, 10);
+    const [d, n] = (this.meta("extraction_budget") ?? "").split("|");
+    const used = d === day ? Number(n) || 0 : 0;
+    if (Number.isFinite(limit) && used >= limit) return false;
+    this.setMeta("extraction_budget", `${day}|${used + 1}`);
+    return true;
+  }
+
   private get extractionEnabled(): boolean {
     return (this.env.EXTRACTION ?? "on") !== "off";
   }
@@ -236,7 +251,7 @@ export class MemoryObject extends DurableObject<Env> {
         this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", itemId, now);
       }
       this.audit(client, "episode.add", { id, scope: input.scope, chunks: parts.length });
-      if (this.extractionEnabled && text.length >= 40) this.enqueue("extract", id, 2_000);
+      if (this.extractionEnabled && text.length >= 40 && this.takeExtractionBudget()) this.enqueue("extract", id, 2_000);
     });
     await this.kick();
     return { id, chunks: parts.length };
@@ -762,7 +777,7 @@ export class MemoryObject extends DurableObject<Env> {
   activity(client: Client, limit = 50) {
     this.userId(client);
     return this.sql
-      .exec("SELECT at, client_id, action, detail FROM audit ORDER BY seq DESC LIMIT ?", Math.min(limit, 200))
+      .exec("SELECT at, client_id, action, detail FROM audit ORDER BY seq DESC LIMIT ?", Math.min(Math.max(Number.isFinite(limit) ? Math.trunc(limit) : 50, 1), 200))
       .toArray()
       .map((r) => ({ at: iso(r.at), client: String(r.client_id), action: String(r.action), detail: r.detail ? JSON.parse(String(r.detail)) : null }));
   }

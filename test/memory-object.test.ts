@@ -186,4 +186,11 @@ describe("MemoryObject pipeline", () => {
     expect(db.prepare("SELECT version FROM blocks WHERE label = 'distilled-profile'").get()).toEqual({ version: 1 });
     expect(mo.stats(web).lastReflection).not.toBeNull();
   });
+  it("stops queueing extraction once the daily limit is reached", async () => {
+    (fake.env as { EXTRACTION_DAILY_LIMIT?: string }).EXTRACTION_DAILY_LIMIT = "1";
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "SMALLTALK how are you doing today, a long enough message" }] });
+    expect((db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'extract'").get() as { n: number }).n).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM episodes").get() as { n: number }).n).toBe(2);
+  });
 });
