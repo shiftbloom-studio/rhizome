@@ -57,7 +57,7 @@ export function legalPage(kind: LegalKind, env: Env): Response {
 <title>${title} · rhizome.</title><meta name="robots" content="noindex"><link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/fonts/fonts.css">
 <style>
-:root{--ink:#1A1216;--ink60:rgba(26,18,22,.6);--paper:#FFFFFF;--panel:#FAF6F4;--root:#C81040;--bloom:#FF2E52;--blush:#FFE9EF}
+:root{--ink:#1A1216;--ink60:rgba(26,18,22,.62);--paper:#F6F1EE;--panel:#EEE6E2;--root:#C81040;--bloom:#FF2E52;--blush:#FFE9EF}
 *{box-sizing:border-box}html{background:var(--paper);color:var(--ink)}
 body{margin:0;font:16px/1.6 "General Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
 ::selection{background:var(--blush)}
