@@ -97,4 +97,65 @@ export const MIGRATIONS: string[] = [
   );
   CREATE INDEX audit_time ON audit (at DESC);
   `,
+  // 2: background intelligence: lifecycle, importance, local embeddings, links, entities, jobs
+  `
+  ALTER TABLE items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'; -- active | disputed | superseded | archived
+  ALTER TABLE items ADD COLUMN superseded_by TEXT;
+  ALTER TABLE items ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'; -- agent | extracted | reflection | user
+  ALTER TABLE items ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;
+  ALTER TABLE items ADD COLUMN confirmations INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE items ADD COLUMN updated_at INTEGER;
+  CREATE INDEX items_status ON items (status, kind, scope);
+
+  -- Embeddings kept next to the items: exact similarity for linking and
+  -- deduplication without waiting for the vector index to catch up.
+  CREATE TABLE embeddings (
+    item_id TEXT PRIMARY KEY,
+    model   TEXT NOT NULL,
+    vec     BLOB NOT NULL
+  );
+
+  -- Typed edges between items and episodes: similar, derived_from, supersedes,
+  -- contradicts, merged_into.
+  CREATE TABLE links (
+    src        TEXT NOT NULL,
+    dst        TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    weight     REAL NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (src, dst, kind)
+  );
+  CREATE INDEX links_dst ON links (dst);
+
+  -- Things the memory talks about: people, projects, tools, devices, orgs, concepts.
+  CREATE TABLE entities (
+    id         TEXT PRIMARY KEY,
+    key        TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    mentions   INTEGER NOT NULL DEFAULT 0,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL
+  );
+
+  -- Which item or episode mentions which entity.
+  CREATE TABLE mentions (
+    ref       TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    PRIMARY KEY (ref, entity_id)
+  );
+  CREATE INDEX mentions_entity ON mentions (entity_id);
+
+  -- Background work: fact extraction per episode, reflection runs.
+  CREATE TABLE jobs (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,
+    ref        TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    not_before INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_error TEXT
+  );
+  CREATE INDEX jobs_due ON jobs (not_before);
+  `,
 ];

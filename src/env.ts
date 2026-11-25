@@ -18,6 +18,30 @@ export interface Env {
   ADMIN_TOKEN?: string;
   EMBEDDING_MODEL?: string;
   RERANK_MODEL?: string;
+  /** Model that turns episodes into notes. Default: DeepSeek V4.1 Flash on Workers AI. */
+  EXTRACTION_MODEL?: string;
+  /** Model for nightly reflection (profile distillation, project summaries). Default: GLM 5.3. */
+  REFLECTION_MODEL?: string;
+  /** "off" disables fact extraction from episodes. */
+  EXTRACTION?: string;
+
+  /** Static files of the memory explorer. */
+  ASSETS?: Fetcher;
+  /** Cloudflare Access application audience tag. Without it the explorer API is disabled. */
+  ACCESS_AUD?: string;
+  /** Cloudflare Access team domain, e.g. example.cloudflareaccess.com. */
+  ACCESS_TEAM_DOMAIN?: string;
+
+  /** Operator details for the imprint and privacy pages. Set at deploy time, never committed. */
+  OPERATOR_NAME?: string;
+  OPERATOR_BUSINESS?: string;
+  OPERATOR_STREET?: string;
+  OPERATOR_CITY?: string;
+  OPERATOR_COUNTRY_EN?: string;
+  OPERATOR_COUNTRY_DE?: string;
+  OPERATOR_EMAIL?: string;
+  OPERATOR_PHONE?: string;
+  SUPERVISORY_AUTHORITY?: string;
 }
 
 export const DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-m3";

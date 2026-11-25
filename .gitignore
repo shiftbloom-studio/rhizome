@@ -6,3 +6,5 @@ dist/
 *.log
 .env.deploy
 wrangler.deploy.jsonc
+web/node_modules
+web/dist
