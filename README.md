@@ -4,7 +4,7 @@ rhizome is a long-horizon memory that belongs to a person, not to an agent. Clau
 
 It runs entirely on Cloudflare: one Durable Object per person, Vectorize for semantic search, R2 for the raw history and Workers AI for embeddings and reranking. There is no server, database or GPU to run yourself, and an idle memory costs only its storage.
 
-> Status: version 0.2. Store and find, fact extraction with conflict resolution, nightly reflection and a 3D memory explorer work. The remote MCP server and the bi-temporal knowledge graph come next. See [Roadmap](#roadmap).
+> Status: version 0.3. Store and find, fact extraction with conflict resolution, nightly reflection, a 3D memory explorer and a remote MCP server for Claude, ChatGPT and other MCP clients work. The evaluation harness and the bi-temporal knowledge graph come next. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -62,6 +62,28 @@ The web UI at `/` shows the memory as a 3D graph.
 
 The explorer is meant to sit behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/). The Worker verifies the Access token itself and opens the memory of the person whose email address matches the signed-in user. Without `ACCESS_AUD` and `ACCESS_TEAM_DOMAIN` its API answers 404.
 
+## MCP
+
+`https://<your host>/mcp` is a remote MCP server (Streamable HTTP, stateless). It has six tools:
+
+| Tool | What it does |
+| --- | --- |
+| `get_context` | Profile, working style and, with a `project`, its summary and most trusted notes. For the start of a task |
+| `recall` | Hybrid search across the profile, the agent's own notes and every project it may read, or one `project` |
+| `remember` | Stores one note. `said_by_user: true` marks it as something the person said, which wins conflicts |
+| `save_conversation` | Stores a conversation verbatim; notes are extracted from it in the background |
+| `import_memory_file` | Imports a `CLAUDE.md`, `AGENTS.md`, Hermes `MEMORY.md` or `USER.md`, or any Markdown notes. Each bullet or paragraph becomes a note, and a second import of the same file adds nothing |
+| `forget` | Deletes a note or a conversation by id |
+
+There are two ways to connect.
+
+* **OAuth**, for Claude, ChatGPT and any client that adds a server by URL. Add `https://<your host>/mcp` as a custom connector. The client registers itself, and you approve it on a consent page that sits behind Cloudflare Access. There you choose the agent and provider names its notes are signed with. Approving creates a client with the default grants, or reuses the one you already have for that agent and provider. Access tokens are API keys that expire after an hour and are refreshed automatically, so revoking the client in your token manager ends the connection.
+* **API key**, for Claude Code, Hermes and other clients that can send a header:
+
+```sh
+claude mcp add --transport http rhizome https://memory.example.com/mcp --header "Authorization: Bearer $RHIZOME_KEY"
+```
+
 ## API
 
 All memory endpoints take `Authorization: Bearer <client api key>`.
@@ -77,6 +99,7 @@ All memory endpoints take `Authorization: Bearer <client api key>`.
 | `GET` | `/v1/memory/episodes` | List episodes, newest first |
 | `GET` | `/v1/memory/episodes/:id` | Raw episode from R2 |
 | `DELETE` | `/v1/memory/items/:id` | Forget a note or a whole episode, everywhere |
+| `POST` | `/v1/memory/import` | Import a memory file (`content`, `format`: claude-md, hermes, markdown; optional `scope`, `kind`, `trust`, `fileName`) |
 | `GET` | `/v1/memory/export` | Page through everything the client may read |
 | `GET` | `/v1/memory/stats` | Counts and database size |
 | `GET` | `/v1/memory/me` | The calling client and its grants |
@@ -148,7 +171,7 @@ You need a Cloudflare account with Workers Paid and a zone for the hostname.
 
    The response contains the client's API key once. Repeat for every agent.
 
-5. **Protect the explorer.** Create a Cloudflare Access application for your hostname. Add a second one with a Bypass policy for `/v1/*`, `/privacy`, `/datenschutz`, `/imprint`, `/impressum`, `/fonts/*` and `/favicon.svg`, so agents and the legal pages stay reachable. Agents still need their API key. Then set `ACCESS_AUD` (the application's audience tag) and `ACCESS_TEAM_DOMAIN`.
+5. **Protect the explorer.** Create a Cloudflare Access application for your hostname. Add a second one with a Bypass policy for `/v1/*`, `/mcp`, `/.well-known/*`, `/oauth/token`, `/oauth/register`, `/oauth/revoke`, `/privacy`, `/datenschutz`, `/imprint`, `/impressum`, `/fonts/*` and `/favicon.svg`, so agents, MCP clients and the legal pages stay reachable. Agents still need their API key or OAuth token. Leave `/oauth/authorize` behind Access: that is where you approve a connector. Then set `ACCESS_AUD` (the application's audience tag) and `ACCESS_TEAM_DOMAIN`.
 
 If your zone challenges bots, add a WAF skip rule for requests to your hostname that carry an `Authorization` header, otherwise agents get a challenge page instead of JSON.
 
@@ -163,7 +186,7 @@ Measured list prices on Workers AI and Vectorize (November 2026). An idle memory
 | M0 | Spike: model comparison, FTS5 in Durable Objects, Vectorize latency ([results](docs/m0-spike.md)) |
 | M1 | Store and find: gateway, MemoryObject with scopes, R2, Vectorize, hybrid recall, API keys |
 | **0.2** | **First parts of M4, M6 and M9: extraction with conflict resolution, links, decay, nightly reflection, 3D memory explorer behind Access** |
-| M2 | Remote MCP server for Claude, ChatGPT and other MCP clients; import of CLAUDE.md and Hermes memory files |
+| **M2** | **Remote MCP server with OAuth for Claude, ChatGPT and other MCP clients; import of CLAUDE.md and Hermes memory files (0.3)** |
 | M3 | Evaluation harness (LongMemEval, LOCOMO, own data) in CI |
 | M4 | Fact extraction and update resolver (add, update, invalidate) via Queues |
 | M5 | Bi-temporal knowledge graph, entity resolution, as-of queries |

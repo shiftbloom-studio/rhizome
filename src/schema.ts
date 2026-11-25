@@ -101,7 +101,7 @@ export const MIGRATIONS: string[] = [
   `
   ALTER TABLE items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'; -- active | disputed | superseded | archived
   ALTER TABLE items ADD COLUMN superseded_by TEXT;
-  ALTER TABLE items ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'; -- agent | extracted | reflection | user
+  ALTER TABLE items ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'; -- agent | extracted | reflection | user | import
   ALTER TABLE items ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;
   ALTER TABLE items ADD COLUMN confirmations INTEGER NOT NULL DEFAULT 1;
   ALTER TABLE items ADD COLUMN updated_at INTEGER;

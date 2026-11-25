@@ -281,6 +281,52 @@ export class MemoryObject extends DurableObject<Env> {
     return { id };
   }
 
+  /**
+   * Adds many notes at once, e.g. from an imported CLAUDE.md. Notes whose exact
+   * text already exists in the scope are skipped, so importing a file twice is
+   * harmless. Near duplicates are merged later by the background resolver.
+   */
+  async importNotes(
+    client: Client,
+    input: { scope: string; notes: string[]; kind?: NoteKind; trust?: Trust; source?: string },
+  ): Promise<{ added: number; skipped: number; ids: string[] }> {
+    this.userId(client);
+    const now = Date.now();
+    const trust = input.trust ?? "user_confirmed";
+    const ids: string[] = [];
+    let skipped = 0;
+    this.ctx.storage.transactionSync(() => {
+      const existing = new Set(
+        this.sql
+          .exec("SELECT lower(content) AS c FROM items WHERE kind = 'note' AND scope = ? AND status != 'superseded'", input.scope)
+          .toArray()
+          .map((r) => String(r.c)),
+      );
+      for (const raw of input.notes) {
+        const content = raw.trim();
+        if (!content || existing.has(content.toLowerCase())) {
+          skipped++;
+          continue;
+        }
+        existing.add(content.toLowerCase());
+        const id = newId();
+        this.sql.exec(
+          `INSERT INTO items (id, kind, episode_id, scope, content, note_kind, trust, client_id, agent, provider, model, t_event, created_at,
+                              origin, importance, updated_at)
+           VALUES (?, 'note', NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'import', ?, ?)`,
+          id, input.scope, content, input.kind ?? "note", trust, client.id, client.agent, client.provider, now, now,
+          importance({ trust, kind: "note", confirmations: 1, accessCount: 0, lastTouched: now }, now),
+          now,
+        );
+        this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", id, now);
+        ids.push(id);
+      }
+      this.audit(client, "notes.import", { scope: input.scope, added: ids.length, skipped, source: input.source ?? null });
+    });
+    if (ids.length) await this.kick();
+    return { added: ids.length, skipped, ids };
+  }
+
   async putBlock(
     client: Client,
     input: { scope: string; label: string; value: string; description?: string; charLimit?: number },
