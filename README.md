@@ -65,6 +65,19 @@ curl -X POST https://memory.example.com/v1/memory/recall \
 
 Admin endpoints (`/v1/admin/users`, `/v1/admin/clients`) create people and agent clients. They take `Authorization: Bearer <ADMIN_TOKEN>` and are disabled when no `ADMIN_TOKEN` secret is set.
 
+### API keys
+
+A client can hold several keys, each with an optional label and expiry date. Keys are stored as SHA-256 hashes; the plain key is returned once. A key is refused as soon as its expiry has passed or it is revoked.
+
+| Method | Path | Body |
+| --- | --- | --- |
+| `POST` | `/v1/admin/clients` | `userId`, `agent`, `provider`, optional `name`, `grants`, `label`, `expiresAt` |
+| `POST` | `/v1/admin/clients/:id/keys` | optional `label`, `expiresAt` (epoch ms or ISO date) |
+| `GET` | `/v1/admin/clients/:id/keys` | – |
+| `DELETE` | `/v1/admin/clients/:id/keys/:prefix` | – (prefix = first 10 characters of the key) |
+
+[field](https://github.com/shiftbloom-studio/field) offers the same through a screen, using a D1 binding to `rhizome-control`.
+
 ## Self-hosting
 
 You need a Cloudflare account with Workers Paid and a zone for the hostname.
