@@ -12,9 +12,9 @@ export async function authenticate(env: Env, key: string, ctx?: { waitUntil(p: P
   const row = await env.CONTROL_DB.prepare(
     `SELECT c.id, c.user_id, c.name, c.agent, c.provider, c.grants, k.last_used_at
        FROM api_keys k JOIN clients c ON c.id = k.client_id
-      WHERE k.hash = ? AND k.revoked_at IS NULL AND c.revoked_at IS NULL`,
+      WHERE k.hash = ? AND k.revoked_at IS NULL AND c.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > ?)`,
   )
-    .bind(hash)
+    .bind(hash, Date.now())
     .first<{ id: string; user_id: string; name: string; agent: string; provider: string; grants: string; last_used_at: number | null }>();
   if (!row) return null;
   const now = Date.now();
