@@ -2,7 +2,7 @@
 /* shiftbloom brand book v2: white mode, ink text, Bloom Red as the only accent. */
 :root {
   --ink: #1a1216;
-  --ink60: rgba(26, 18, 22, 0.6);
+  --ink60: rgba(26, 18, 22, 0.62);
   --ink40: rgba(26, 18, 22, 0.4);
   --line: rgba(26, 18, 22, 0.1);
   --paper: #f6f1ee;
