@@ -1,0 +1,34 @@
+{
+  "name": "rhizome",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal long-horizon memory for AI agents, shared across agents and providers. Runs entirely on Cloudflare.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/render-config.mjs && wrangler dev --remote -c wrangler.deploy.jsonc",
+    "deploy": "node scripts/render-config.mjs && wrangler deploy -c wrangler.deploy.jsonc",
+    "config": "node scripts/render-config.mjs",
+    "migrate": "node scripts/render-config.mjs && wrangler d1 migrations apply rhizome-control --remote -c wrangler.deploy.jsonc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "tsc --noEmit && node scripts/render-config.mjs && wrangler deploy -c wrangler.deploy.jsonc --dry-run --outdir .wrangler/dry-run"
+  },
+  "dependencies": {
+    "hono": "^4.12.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261123.1",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0",
+    "wrangler": "^4.168.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shiftbloom-studio/rhizome.git"
+  }
+}

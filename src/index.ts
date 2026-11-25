@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Gateway worker: authentication, scope checks and routing to the person's
+// MemoryObject. All memory logic lives in the Durable Object.
+
+import { Hono, type Context } from "hono";
+import { authenticate, createClient, createUser, listClients, parseGrants, revokeClient, safeEqual, validGrantPattern } from "./auth";
+import type { Env } from "./env";
+import { ForbiddenError, NOTE_KINDS, TRUST_LEVELS, type NoteKind, type Trust } from "./memory-object";
+import { can, isValidScope, isValidSlug, recallScopes, type Client, type Grants } from "./scopes";
+
+export { MemoryObject } from "./memory-object";
+
+const VERSION = "0.1.0";
+
+type App = { Bindings: Env; Variables: { client: Client } };
+const app = new Hono<App>();
+
+class HttpError extends Error {
+  constructor(public status: 400 | 401 | 403 | 404 | 413 | 429, message: string) {
+    super(message);
+  }
+}
+
+app.onError((err, c) => {
+  if (err instanceof HttpError) return c.json({ error: err.message }, err.status);
+  if (err instanceof ForbiddenError) return c.json({ error: err.message }, 403);
+  if (err instanceof SyntaxError) return c.json({ error: "invalid JSON body" }, 400);
+  const message = err instanceof Error ? err.message : String(err);
+  // Validation errors thrown inside the Durable Object arrive as plain errors.
+  if (/empty|limit is|must be|unknown user|invalid grant/.test(message)) return c.json({ error: message }, 400);
+  console.error(err);
+  return c.json({ error: "internal error" }, 500);
+});
+
+app.get("/", (c) =>
+  c.json({ name: "rhizome", version: VERSION, description: "Personal long-horizon memory for AI agents", docs: "/v1/health" }),
+);
+app.get("/v1/health", (c) => c.json({ ok: true, version: VERSION }));
+
+// ------------------------------------------------------------------ helpers
+
+function bearer(c: Context<App>): string {
+  const h = c.req.header("authorization") ?? "";
+  return h.toLowerCase().startsWith("bearer ") ? h.slice(7).trim() : "";
+}
+
+async function body<T>(c: Context<App>, maxBytes = 256 * 1024): Promise<T> {
+  const len = Number(c.req.header("content-length") ?? 0);
+  if (len > maxBytes) throw new HttpError(413, `body larger than ${maxBytes} bytes`);
+  const text = await c.req.text();
+  if (text.length > maxBytes) throw new HttpError(413, `body larger than ${maxBytes} bytes`);
+  return (text ? JSON.parse(text) : {}) as T;
+}
+
+function memory(c: Context<App>) {
+  const client = c.get("client");
+  return c.env.MEMORY.get(c.env.MEMORY.idFromName(`user:${client.userId}`));
+}
+
+function writableScope(client: Client, scope: unknown): string {
+  const s = typeof scope === "string" && scope ? scope : "profile";
+  if (!isValidScope(s)) throw new HttpError(400, `invalid scope: ${s}`);
+  if (!can(client, "write", s)) throw new HttpError(403, `no write access to scope ${s}`);
+  return s;
+}
+
+function scopeList(raw: string | undefined): string[] | undefined {
+  if (!raw) return undefined;
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  for (const s of list) if (!isValidScope(s)) throw new HttpError(400, `invalid scope: ${s}`);
+  return list;
+}
+
+function parseTime(v: unknown): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  const t = typeof v === "number" ? v : Date.parse(String(v));
+  if (!Number.isFinite(t)) throw new HttpError(400, "invalid timestamp");
+  return t;
+}
+
+function str(v: unknown, field: string, max: number): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "string") throw new HttpError(400, `${field} must be a string`);
+  if (v.length > max) throw new HttpError(400, `${field} is longer than ${max} characters`);
+  return v;
+}
+
+// -------------------------------------------------------------------- admin
+
+const admin = new Hono<App>();
+admin.use("*", async (c, next) => {
+  const token = c.env.ADMIN_TOKEN;
+  if (!token) throw new HttpError(404, "admin API is disabled (no ADMIN_TOKEN set)");
+  if (!safeEqual(bearer(c), token)) throw new HttpError(401, "invalid admin token");
+  await next();
+});
+
+admin.post("/users", async (c) => {
+  const b = await body<{ name?: string }>(c);
+  const name = str(b.name, "name", 120)?.trim();
+  if (!name) throw new HttpError(400, "name is required");
+  return c.json(await createUser(c.env, name), 201);
+});
+
+admin.post("/clients", async (c) => {
+  const b = await body<{ userId?: string; name?: string; agent?: string; provider?: string; grants?: Grants }>(c);
+  if (!b.userId || !b.agent || !b.provider) throw new HttpError(400, "userId, agent and provider are required");
+  const grants = b.grants ? parseGrants(JSON.stringify(b.grants)) : undefined;
+  if (grants) for (const p of [...grants.read, ...grants.write]) if (!validGrantPattern(p)) throw new HttpError(400, `invalid grant pattern: ${p}`);
+  const created = await createClient(c.env, {
+    userId: b.userId,
+    name: str(b.name, "name", 120) ?? `${b.agent} (${b.provider})`,
+    agent: b.agent,
+    provider: b.provider,
+    grants,
+  });
+  return c.json({ ...created, note: "Store the apiKey now. It is not shown again." }, 201);
+});
+
+admin.get("/users/:id/clients", async (c) => c.json({ clients: await listClients(c.env, c.req.param("id")) }));
+
+admin.delete("/clients/:id", async (c) => {
+  await revokeClient(c.env, c.req.param("id"));
+  return c.json({ revoked: true });
+});
+
+app.route("/v1/admin", admin);
+
+// ------------------------------------------------------------------- memory
+
+const mem = new Hono<App>();
+mem.use("*", async (c, next) => {
+  const client = await authenticate(c.env, bearer(c), c.executionCtx);
+  if (!client) throw new HttpError(401, "missing or invalid API key");
+  if (c.env.RATE_LIMITER) {
+    const { success } = await c.env.RATE_LIMITER.limit({ key: client.id });
+    if (!success) throw new HttpError(429, "rate limit exceeded");
+  }
+  c.set("client", client);
+  await next();
+});
+
+mem.get("/me", (c) => {
+  const { id, name, agent, provider, grants } = c.get("client");
+  return c.json({ id, name, agent, provider, grants });
+});
+
+mem.post("/episodes", async (c) => {
+  const client = c.get("client");
+  const b = await body<{
+    scope?: string; sessionId?: string; model?: string; tEvent?: string | number;
+    messages?: { role: string; content: string }[]; text?: string; metadata?: Record<string, unknown>;
+  }>(c, 1024 * 1024);
+  const scope = writableScope(client, b.scope);
+  if (b.messages !== undefined) {
+    if (!Array.isArray(b.messages) || b.messages.length > 500) throw new HttpError(400, "messages must be an array of at most 500 items");
+    for (const m of b.messages) {
+      if (typeof m?.role !== "string" || typeof m?.content !== "string") throw new HttpError(400, "each message needs role and content strings");
+    }
+  }
+  const res = await memory(c).addEpisode(client, {
+    scope,
+    sessionId: str(b.sessionId, "sessionId", 200),
+    model: str(b.model, "model", 200),
+    tEvent: parseTime(b.tEvent),
+    messages: b.messages?.map((m) => ({ role: m.role.slice(0, 32), content: m.content })),
+    text: str(b.text, "text", 500_000),
+    metadata: b.metadata,
+  });
+  return c.json(res, 201);
+});
+
+mem.post("/notes", async (c) => {
+  const client = c.get("client");
+  const b = await body<{ scope?: string; content?: string; kind?: string; trust?: string; model?: string; tEvent?: string | number }>(c);
+  const scope = writableScope(client, b.scope);
+  const content = str(b.content, "content", 8000)?.trim();
+  if (!content) throw new HttpError(400, "content is required");
+  if (b.kind && !NOTE_KINDS.includes(b.kind as NoteKind)) throw new HttpError(400, `kind must be one of ${NOTE_KINDS.join(", ")}`);
+  if (b.trust && !TRUST_LEVELS.includes(b.trust as Trust)) throw new HttpError(400, `trust must be one of ${TRUST_LEVELS.join(", ")}`);
+  const res = await memory(c).addNote(client, {
+    scope,
+    content,
+    kind: b.kind as NoteKind | undefined,
+    trust: b.trust as Trust | undefined,
+    model: str(b.model, "model", 200),
+    tEvent: parseTime(b.tEvent),
+  });
+  return c.json(res, 201);
+});
+
+mem.post("/recall", async (c) => {
+  const client = c.get("client");
+  const b = await body<{ query?: string; scopes?: string[]; project?: string; limit?: number; budgetTokens?: number; rerank?: boolean }>(c);
+  const query = str(b.query, "query", 2000)?.trim();
+  if (!query) throw new HttpError(400, "query is required");
+  if (b.project !== undefined && (typeof b.project !== "string" || !isValidSlug(b.project))) throw new HttpError(400, "invalid project");
+  if (b.scopes !== undefined && (!Array.isArray(b.scopes) || b.scopes.some((s) => typeof s !== "string" || !isValidScope(s)))) {
+    throw new HttpError(400, "scopes must be an array of valid scopes");
+  }
+  const scopes = recallScopes(client, b.scopes, b.project);
+  const res = await memory(c).recall(client, {
+    query,
+    scopes,
+    limit: typeof b.limit === "number" ? b.limit : undefined,
+    budgetTokens: typeof b.budgetTokens === "number" ? Math.min(Math.max(b.budgetTokens, 100), 16_000) : undefined,
+    rerank: b.rerank,
+  });
+  return c.json({ ...res, scopes });
+});
+
+mem.get("/context", async (c) => {
+  const client = c.get("client");
+  const project = c.req.query("project");
+  if (project !== undefined && !isValidSlug(project)) throw new HttpError(400, "invalid project");
+  const scopes = recallScopes(client, scopeList(c.req.query("scopes")), project);
+  const budget = Number(c.req.query("budget") ?? 1500);
+  const res = await memory(c).context(client, scopes, Number.isFinite(budget) ? Math.min(Math.max(budget, 100), 16_000) : 1500);
+  c.header("ETag", `"${res.version}"`);
+  if (c.req.header("if-none-match") === `"${res.version}"`) return c.body(null, 304);
+  return c.json({ ...res, scopes });
+});
+
+mem.get("/blocks", async (c) => {
+  const client = c.get("client");
+  const scopes = recallScopes(client, scopeList(c.req.query("scopes")), c.req.query("project"));
+  return c.json({ blocks: await memory(c).listBlocks(client, scopes) });
+});
+
+mem.put("/blocks/:label", async (c) => {
+  const client = c.get("client");
+  const label = c.req.param("label");
+  if (!isValidSlug(label)) throw new HttpError(400, "label must be a lowercase slug, e.g. working-style");
+  const b = await body<{ scope?: string; value?: string; description?: string; charLimit?: number }>(c);
+  const scope = writableScope(client, b.scope);
+  const value = str(b.value, "value", 20_000);
+  if (value === undefined) throw new HttpError(400, "value is required");
+  const charLimit = b.charLimit === undefined ? undefined : Number(b.charLimit);
+  if (charLimit !== undefined && (!Number.isInteger(charLimit) || charLimit < 100 || charLimit > 20_000)) {
+    throw new HttpError(400, "charLimit must be an integer between 100 and 20000");
+  }
+  return c.json(await memory(c).putBlock(client, { scope, label, value, description: str(b.description, "description", 500), charLimit }));
+});
+
+mem.get("/episodes", async (c) => {
+  const client = c.get("client");
+  const scopes = recallScopes(client, scopeList(c.req.query("scopes")), c.req.query("project"));
+  const cursor = c.req.query("cursor");
+  return c.json(await memory(c).listEpisodes(client, scopes, cursor ? Number(cursor) : undefined, Number(c.req.query("limit") ?? 50)));
+});
+
+mem.get("/episodes/:id", async (c) => {
+  const ep = await memory(c).getEpisode(c.get("client"), c.req.param("id"));
+  if (!ep) throw new HttpError(404, "episode not found");
+  return c.json(ep);
+});
+
+mem.delete("/items/:id", async (c) => {
+  const res = await memory(c).forget(c.get("client"), c.req.param("id"));
+  if (res.deleted === 0) throw new HttpError(404, "nothing found with this id");
+  return c.json(res);
+});
+
+mem.get("/export", async (c) => {
+  const client = c.get("client");
+  if (!client.grants.read.includes("project:*") || !can(client, "read", "profile")) {
+    throw new HttpError(403, "export needs read access to profile and all projects");
+  }
+  return c.json(await memory(c).exportPage(client, c.req.query("after") ?? "", Number(c.req.query("limit") ?? 500)));
+});
+
+mem.get("/stats", async (c) => c.json(await memory(c).stats(c.get("client"))));
+
+app.route("/v1/memory", mem);
+
+app.notFound((c) => c.json({ error: "not found" }, 404));
+
+export default app;

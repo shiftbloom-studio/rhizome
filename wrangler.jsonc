@@ -1,0 +1,24 @@
+// Template. Values written as <PLACEHOLDER> are filled from environment variables by
+// scripts/render-config.mjs, which writes wrangler.deploy.jsonc (not committed).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rhizome",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "<RHIZOME_HOSTNAME>", "custom_domain": true }],
+  "observability": { "enabled": true },
+  "ai": { "binding": "AI" },
+  "durable_objects": { "bindings": [{ "name": "MEMORY", "class_name": "MemoryObject" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MemoryObject"] }],
+  "d1_databases": [
+    { "binding": "CONTROL_DB", "database_name": "rhizome-control", "database_id": "<RHIZOME_D1_DATABASE_ID>", "migrations_dir": "migrations" }
+  ],
+  "r2_buckets": [{ "binding": "EPISODES", "bucket_name": "rhizome-episodes" }],
+  "vectorize": [{ "binding": "VECTORS", "index_name": "rhizome-memory" }],
+  "ratelimits": [{ "name": "RATE_LIMITER", "namespace_id": "4201", "simple": { "limit": 120, "period": 60 } }]
+  // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Enables the /v1/admin endpoints.
+  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL.
+}
