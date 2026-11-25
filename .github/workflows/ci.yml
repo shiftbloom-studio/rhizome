@@ -42,3 +42,4 @@ jobs:
         env:
           RHIZOME_HOSTNAME: memory.example.com
           RHIZOME_D1_DATABASE_ID: 00000000-0000-0000-0000-000000000000
+      - run: npm run build:node

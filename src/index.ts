@@ -14,6 +14,7 @@ import { LEGAL_PATHS, legalPage } from "./legal";
 import { IMPORT_FORMATS, MAX_IMPORT_CHARS, parseMemoryFile, type ImportFormat } from "./importers";
 import { mcpResponse, rpcError } from "./mcp";
 import { cleanupOAuth, oauth, resourceMetadataUrl } from "./oauth";
+import { login } from "./login";
 
 export { MemoryObject } from "./memory-object";
 
@@ -47,9 +48,10 @@ app.get("/fonts/fonts.css", (c) => fontCss(c.executionCtx));
 app.get("/fonts/:host{fs|gs}/:path{.+}", (c) => fontFile(c.req.param("host"), c.req.param("path")));
 app.get("/favicon.svg", () => new Response(FAVICON, { headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=604800" } }));
 
-// Memory explorer API, behind Cloudflare Access.
+// Memory explorer API, for the signed-in person (Cloudflare Access, password or proxy, see identity.ts).
 app.route("/ui/api", explorer);
 app.route("/", oauth);
+app.route("/", login);
 
 // ---------------------------------------------------------------------- mcp
 
@@ -380,7 +382,7 @@ app.route("/v1/memory", mem);
 
 app.notFound(async (c) => {
   // Everything else is the explorer's single-page app.
-  const api = ["/v1/", "/ui/api/", "/oauth/", "/.well-known/"].some((p) => c.req.path.startsWith(p));
+  const api = ["/v1/", "/ui/api/", "/oauth/", "/.well-known/", "/auth/"].some((p) => c.req.path.startsWith(p));
   if (c.env.ASSETS && c.req.method === "GET" && !api) {
     return c.env.ASSETS.fetch(c.req.raw);
   }

@@ -5,14 +5,15 @@
 // server metadata (RFC 8414), dynamic client registration (RFC 7591),
 // authorization code with PKCE S256 only, refresh token rotation, revocation.
 //
-// The consent page sits behind Cloudflare Access, so only the person can approve
+// The consent page needs a signed-in person (Cloudflare Access, the built-in
+// password sign-in or a sign-in proxy, see identity.ts), so only they can approve
 // a connector. Approving maps the connector to a rhizome client (one agent of
 // one provider) and issues short-lived API keys as access tokens.
 
 import { Hono } from "hono";
-import { verifyAccess } from "./access";
 import { KEY_PREFIX } from "./auth";
 import type { Env } from "./env";
+import { identify, hmacHex, signInHint, signInUrl } from "./identity";
 import { newId, newSecret, sha256Hex } from "./ids";
 import { DEFAULT_GRANTS, isValidSlug } from "./scopes";
 
@@ -191,12 +192,11 @@ async function checkAuthorize(env: Env, url: string, p: Record<string, string | 
   return { client, params: { client_id: client.id, redirect_uri: redirect, state: p.state ?? "", code_challenge: p.code_challenge, resource: p.resource ?? "" } };
 }
 
-async function signedInUser(env: Env, jwt: string | undefined): Promise<{ id: string; name: string; email: string } | null> {
-  if (!env.ACCESS_AUD || !env.ACCESS_TEAM_DOMAIN) return null;
-  const identity = await verifyAccess(jwt, env.ACCESS_TEAM_DOMAIN, env.ACCESS_AUD);
+async function signedInUser(env: Env, req: Request): Promise<{ id: string; name: string; email: string; key: string } | null> {
+  const identity = await identify(env, req);
   if (!identity) return null;
   const user = await env.CONTROL_DB.prepare("SELECT id, name FROM users WHERE email = ?").bind(identity.email).first<{ id: string; name: string }>();
-  return user ? { ...user, email: identity.email } : null;
+  return user ? { ...user, email: identity.email, key: identity.key } : null;
 }
 
 /** Guesses agent and provider slugs from the app's name, e.g. "Claude" → claude / anthropic. */
@@ -214,14 +214,18 @@ export function guessIdentity(name: string): { agent: string; provider: string }
 oauth.get("/oauth/authorize", async (c) => {
   const checked = await checkAuthorize(c.env, c.req.url, c.req.query());
   if (checked instanceof Response) return checked;
-  const user = await signedInUser(c.env, c.req.header("cf-access-jwt-assertion"));
-  if (!user) return page("Sign-in needed", "<p>Sign in through Cloudflare Access with the email address linked to your memory, then start the connection again.</p>", 401);
+  const user = await signedInUser(c.env, c.req.raw);
+  if (!user) {
+    const login = signInUrl(c.env, new URL(c.req.url).pathname + new URL(c.req.url).search);
+    if (login && !(await identify(c.env, c.req.raw))) return c.redirect(login, 302);
+    return page("Sign-in needed", `<p>${signInHint(c.env)}, then start the connection again.</p>`, 401);
+  }
   const { client, params } = checked;
   const guess = guessIdentity(client.name);
   const target = new URL(params.redirect_uri);
   const where = target.host || target.protocol;
   const known = KNOWN_HOSTS.some((h) => target.hostname === h || target.hostname.endsWith(`.${h}`)) || target.hostname === "localhost" || target.hostname === "127.0.0.1";
-  const consent = await consentToken(c.req.header("cf-access-jwt-assertion")!, params);
+  const consent = await consentToken(user.key, params);
   const hidden = [...Object.entries(params), ["consent", consent]].map(([k, v]) => `<input type="hidden" name="${k}" value="${esc(v!)}">`).join("");
   return page(
     `Connect ${esc(client.name)}?`,
@@ -239,9 +243,9 @@ oauth.get("/oauth/authorize", async (c) => {
 });
 
 oauth.post("/oauth/authorize", async (c) => {
-  // Cross-site form posts carry the Access cookie. Browsers mark them in Sec-Fetch-Site,
+  // Cross-site form posts can carry the sign-in cookie. Browsers mark them in Sec-Fetch-Site,
   // and the consent token proves the form came from a page rendered for this sign-in.
-  // The Origin header is not used: it can be "null" after the Access redirect chain.
+  // The Origin header is not used: it can be "null" after a sign-in redirect chain.
   const site = c.req.header("sec-fetch-site");
   if (site && site !== "same-origin" && site !== "none") {
     return page("Request refused", "<p>This approval did not come from the rhizome page. Nothing was shared.</p>", 403);
@@ -259,9 +263,9 @@ oauth.post("/oauth/authorize", async (c) => {
   });
   if (checked instanceof Response) return checked;
   const { client, params } = checked;
-  const user = await signedInUser(c.env, c.req.header("cf-access-jwt-assertion"));
+  const user = await signedInUser(c.env, c.req.raw);
   if (!user) return page("Sign-in needed", "<p>Your sign-in expired. Start the connection again.</p>", 401);
-  if (!(await verifyConsentToken(c.req.header("cf-access-jwt-assertion")!, params, field("consent")))) {
+  if (!(await verifyConsentToken(user.key, params, field("consent")))) {
     return page("Request refused", "<p>This approval did not come from the rhizome page, or the page was open too long. Start the connection again from the app. Nothing was shared.</p>", 403);
   }
   const iss = origin(c.req.url);
@@ -299,30 +303,25 @@ oauth.post("/oauth/authorize", async (c) => {
 
 const CONSENT_TTL = 15 * 60_000;
 
-async function hmacHex(key: string, message: string): Promise<string> {
-  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(message)));
-  return [...sig].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
 
 const consentMessage = (issued: string, p: AuthorizeParams) =>
   [issued, p.client_id, p.redirect_uri, p.state, p.code_challenge, p.resource].join("\n");
 
 /**
- * CSRF token for the consent form: an HMAC over the request, keyed with the
- * person's Access token. Another site can neither read that token nor make one.
+ * CSRF token for the consent form: an HMAC over the request, keyed with a value
+ * only this sign-in knows (see Identity.key). Another site can neither read it nor make one.
  */
-export async function consentToken(accessJwt: string, p: AuthorizeParams, now = Date.now()): Promise<string> {
+export async function consentToken(signInKey: string, p: AuthorizeParams, now = Date.now()): Promise<string> {
   const issued = String(now);
-  return `${issued}.${await hmacHex(accessJwt, consentMessage(issued, p))}`;
+  return `${issued}.${await hmacHex(signInKey, consentMessage(issued, p))}`;
 }
 
-export async function verifyConsentToken(accessJwt: string, p: AuthorizeParams, token: string | undefined, now = Date.now()): Promise<boolean> {
+export async function verifyConsentToken(signInKey: string, p: AuthorizeParams, token: string | undefined, now = Date.now()): Promise<boolean> {
   const [issued, mac] = (token ?? "").split(".");
   if (!issued || !mac || !/^\d+$/.test(issued)) return false;
   const age = now - Number(issued);
   if (age < 0 || age > CONSENT_TTL) return false;
-  const expected = await hmacHex(accessJwt, consentMessage(issued, p));
+  const expected = await hmacHex(signInKey, consentMessage(issued, p));
   let diff = expected.length ^ mac.length;
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ (mac.charCodeAt(i) || 0);
   return diff === 0;
@@ -468,7 +467,7 @@ function redirectWith(uri: string, params: Record<string, string | undefined>): 
   return new Response(null, { status: 302, headers: { location: u.toString(), ...noStore } });
 }
 
-function esc(s: string): string {
+export function esc(s: string): string {
   return s.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!);
 }
 
@@ -480,7 +479,7 @@ function formTarget(uri: string): string {
 
 const KNOWN_HOSTS = ["claude.ai", "claude.com", "anthropic.com", "chatgpt.com", "openai.com", "cursor.com", "cursor.sh"];
 
-function page(title: string, body: string, status = 200, formAction = ""): Response {
+export function page(title: string, body: string, status = 200, formAction = ""): Response {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} · rhizome.</title><meta name="robots" content="noindex"><link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/fonts/fonts.css">

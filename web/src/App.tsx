@@ -128,7 +128,7 @@ export function App() {
         <Wordmark />
         <p>You're signed in as <strong>{me.email}</strong>, but no memory is linked to this address yet.</p>
         <p className="muted">An administrator links it with <code>PATCH /v1/admin/users/&lt;id&gt;</code> and your email address.</p>
-        <Footer />
+        <Footer signOut={me.signOut} />
       </div>
     );
   }
@@ -212,7 +212,7 @@ export function App() {
           </section>
         )}
         <Remember scopes={me.scopes ?? []} onSaved={() => { setNotice("Saved. It shows up in the graph after a short moment."); setTimeout(load, 2500); }} />
-        <Footer />
+        <Footer signOut={me.signOut} />
       </aside>
 
       {result && !selected && (
@@ -265,10 +265,20 @@ function Wordmark() {
   );
 }
 
-function Footer() {
+function Footer({ signOut }: { signOut?: string | null }) {
+  const leave = async () => {
+    await fetch(signOut!, { method: "POST", credentials: "same-origin" }).catch(() => undefined);
+    window.location.assign("/auth/login");
+  };
   return (
     <footer className="foot">
       <a href="/privacy">Privacy</a> · <a href="/imprint">Imprint</a> · <a href="https://github.com/shiftbloom-studio/rhizome">AGPL-3.0</a>
+      {signOut && (
+        <>
+          {" · "}
+          <button type="button" className="link" onClick={leave}>Sign out</button>
+        </>
+      )}
     </footer>
   );
 }

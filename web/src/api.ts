@@ -9,8 +9,11 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (res.status === 401) {
-    // The Access session ended: reloading sends the browser through sign-in again.
-    window.location.reload();
+    // The session ended. With the built-in sign-in the server names its page; behind
+    // Cloudflare Access or a sign-in proxy, reloading goes through sign-in again.
+    const { signIn } = (await res.json().catch(() => ({}))) as { signIn?: string | null };
+    if (signIn) window.location.assign(`${signIn}?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+    else window.location.reload();
     throw new Error("signed out");
   }
   const data = (await res.json().catch(() => ({}))) as T & { error?: string };

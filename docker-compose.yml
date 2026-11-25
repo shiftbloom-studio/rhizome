@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# rhizome with Ollama for embeddings and extraction, all on your machine.
+#   cp .env.example .env      # set LOGIN_PASSWORD, SESSION_SECRET, ADMIN_TOKEN
+#   docker compose up -d
+#   docker compose exec ollama ollama pull bge-m3
+#   docker compose exec ollama ollama pull qwen3:8b
+# Then open http://localhost:8787. Already running Ollama or another AI server? Remove the
+# ollama service and set AI_BASE_URL below to its address.
+services:
+  rhizome:
+    build: .
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      DATA_DIR: /data
+      AI_BASE_URL: http://ollama:11434/v1
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - rhizome-data:/data
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  rhizome-data:
+  ollama-models:

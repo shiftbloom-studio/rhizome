@@ -8,3 +8,4 @@ dist/
 wrangler.deploy.jsonc
 web/node_modules
 web/dist
+data/
