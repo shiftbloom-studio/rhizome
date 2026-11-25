@@ -11,10 +11,13 @@ import { can, isValidScope, isValidSlug, recallScopes, type Client, type Grants 
 import { explorer } from "./explorer";
 import { FAVICON, fontCss, fontFile } from "./fonts";
 import { LEGAL_PATHS, legalPage } from "./legal";
+import { IMPORT_FORMATS, MAX_IMPORT_CHARS, parseMemoryFile, type ImportFormat } from "./importers";
+import { mcpResponse, rpcError } from "./mcp";
+import { cleanupOAuth, oauth, resourceMetadataUrl } from "./oauth";
 
 export { MemoryObject } from "./memory-object";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 type App = { Bindings: Env; Variables: { client: Client } };
 const app = new Hono<App>();
@@ -46,6 +49,38 @@ app.get("/favicon.svg", () => new Response(FAVICON, { headers: { "content-type":
 
 // Memory explorer API, behind Cloudflare Access.
 app.route("/ui/api", explorer);
+app.route("/", oauth);
+
+// ---------------------------------------------------------------------- mcp
+
+app.post("/mcp", async (c) => {
+  const client = await authenticate(c.env, bearer(c), c.executionCtx);
+  if (!client) {
+    return new Response(JSON.stringify({ error: "invalid_token", error_description: "missing or invalid access token" }), {
+      status: 401,
+      headers: {
+        "content-type": "application/json",
+        "www-authenticate": `Bearer realm="rhizome", resource_metadata="${resourceMetadataUrl(c.req.url)}"`,
+      },
+    });
+  }
+  if (c.env.RATE_LIMITER) {
+    const { success } = await c.env.RATE_LIMITER.limit({ key: client.id });
+    if (!success) return rpcError(null, -32000, "rate limit exceeded", 429);
+  }
+  const text = await c.req.text();
+  if (text.length > 1024 * 1024) return rpcError(null, -32600, "request is larger than 1 MB", 413);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return rpcError(null, -32700, "parse error");
+  }
+  const stub = c.env.MEMORY.get(c.env.MEMORY.idFromName(`user:${client.userId}`));
+  return mcpResponse(stub, client, raw, VERSION);
+});
+// Stateless server: no server-initiated stream and no sessions to end.
+app.on(["GET", "DELETE"], "/mcp", () => new Response(null, { status: 405, headers: { allow: "POST" } }));
 
 // ------------------------------------------------------------------ helpers
 
@@ -317,13 +352,36 @@ mem.get("/export", async (c) => {
   return c.json(await memory(c).exportPage(client, c.req.query("after") ?? "", Number(c.req.query("limit") ?? 500)));
 });
 
+mem.post("/import", async (c) => {
+  const client = c.get("client");
+  const b = await body<{ content?: string; format?: string; scope?: string; kind?: string; trust?: string; fileName?: string }>(c, MAX_IMPORT_CHARS * 2);
+  const content = str(b.content, "content", MAX_IMPORT_CHARS);
+  if (!content?.trim()) throw new HttpError(400, "content is required");
+  const format = (b.format ?? "markdown") as ImportFormat;
+  if (!IMPORT_FORMATS.includes(format)) throw new HttpError(400, `format must be one of ${IMPORT_FORMATS.join(", ")}`);
+  if (b.kind && !NOTE_KINDS.includes(b.kind as NoteKind)) throw new HttpError(400, `kind must be one of ${NOTE_KINDS.join(", ")}`);
+  if (b.trust && !TRUST_LEVELS.includes(b.trust as Trust)) throw new HttpError(400, `trust must be one of ${TRUST_LEVELS.join(", ")}`);
+  const scope = writableScope(client, b.scope);
+  const notes = parseMemoryFile(content, format);
+  if (!notes.length) throw new HttpError(400, "found nothing to import");
+  const res = await memory(c).importNotes(client, {
+    scope,
+    notes,
+    kind: b.kind as NoteKind | undefined,
+    trust: (b.trust as Trust | undefined) ?? (format === "hermes" ? "agent_inference" : "user_confirmed"),
+    source: str(b.fileName, "fileName", 200) ?? format,
+  });
+  return c.json({ scope, added: res.added, skipped: res.skipped }, 201);
+});
+
 mem.get("/stats", async (c) => c.json(await memory(c).stats(c.get("client"))));
 
 app.route("/v1/memory", mem);
 
 app.notFound(async (c) => {
   // Everything else is the explorer's single-page app.
-  if (c.env.ASSETS && c.req.method === "GET" && !c.req.path.startsWith("/v1/") && !c.req.path.startsWith("/ui/api/")) {
+  const api = ["/v1/", "/ui/api/", "/oauth/", "/.well-known/"].some((p) => c.req.path.startsWith(p));
+  if (c.env.ASSETS && c.req.method === "GET" && !api) {
     return c.env.ASSETS.fetch(c.req.raw);
   }
   return c.json({ error: "not found" }, 404);
@@ -335,7 +393,10 @@ export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     const { results } = await env.CONTROL_DB.prepare("SELECT id FROM users").all<{ id: string }>();
     ctx.waitUntil(
-      Promise.allSettled(results.map((u) => env.MEMORY.get(env.MEMORY.idFromName(`user:${u.id}`)).requestReflection())),
+      Promise.allSettled([
+        ...results.map((u) => env.MEMORY.get(env.MEMORY.idFromName(`user:${u.id}`)).requestReflection()),
+        cleanupOAuth(env),
+      ]),
     );
   },
 } satisfies ExportedHandler<Env>;

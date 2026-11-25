@@ -15,7 +15,7 @@
     "directory": "./web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/v1/*", "/ui/api/*", "/fonts/*", "/favicon.svg", "/privacy", "/datenschutz", "/imprint", "/impressum"]
+    "run_worker_first": ["/v1/*", "/mcp", "/oauth/*", "/.well-known/*", "/ui/api/*", "/fonts/*", "/favicon.svg", "/privacy", "/datenschutz", "/imprint", "/impressum"]
   },
   // Nightly reflection (consolidation, decay, profile distillation) at 03:17 UTC.
   "triggers": { "crons": ["17 3 * * *"] },

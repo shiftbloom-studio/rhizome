@@ -67,7 +67,7 @@ export function DetailPanel({ id, onClose, onSelect, onChanged }: { id: string; 
           <dl className="facts">
             <dt>source</dt>
             <dd><i className="dot" style={{ background: TRUST_COLOR[detail.item.trust] }} />{TRUST_LABEL[detail.item.trust] ?? detail.item.trust}</dd>
-            <dt>written by</dt><dd>{detail.item.agent} · {detail.item.provider}{detail.item.origin === "extracted" ? " (extracted)" : ""}</dd>
+            <dt>written by</dt><dd>{detail.item.agent} · {detail.item.provider}{detail.item.origin === "extracted" ? " (extracted)" : detail.item.origin === "import" ? " (imported)" : ""}</dd>
             <dt>when</dt><dd>{date(detail.item.tEvent)}</dd>
             <dt>importance</dt><dd><span className="meter"><span style={{ width: `${Math.round(detail.item.importance * 100)}%` }} /></span>{detail.item.importance.toFixed(2)}</dd>
             <dt>confirmed</dt><dd>{detail.item.confirmations}×</dd>
