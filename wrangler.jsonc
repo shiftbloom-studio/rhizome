@@ -42,7 +42,11 @@
   ],
   "r2_buckets": [{ "binding": "EPISODES", "bucket_name": "rhizome-episodes" }],
   "vectorize": [{ "binding": "VECTORS", "index_name": "rhizome-memory" }],
-  "ratelimits": [{ "name": "RATE_LIMITER", "namespace_id": "4201", "simple": { "limit": 120, "period": 60 } }]
+  "ratelimits": [
+    { "name": "RATE_LIMITER", "namespace_id": "4201", "simple": { "limit": 120, "period": 60 } },
+    // Sign-in attempts per client address with AUTH_MODE=password.
+    { "name": "LOGIN_RATE_LIMITER", "namespace_id": "4202", "simple": { "limit": 10, "period": 60 } }
+  ]
   // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Enables the /v1/admin endpoints.
   // Sign-in without Cloudflare Access: AUTH_MODE=password with LOGIN_EMAIL, plus the secrets LOGIN_PASSWORD and SESSION_SECRET.
   // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT.

@@ -68,9 +68,9 @@ The explorer opens the memory of the person whose email address matches the sign
 | --- | --- | --- |
 | `access` (default) | [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/) in front of rhizome. The app checks the Access token itself as well | `ACCESS_AUD`, `ACCESS_TEAM_DOMAIN` |
 | `password` | rhizome's own sign-in page for one person, with a signed cookie that lasts a week. The person is created on the first sign-in | `LOGIN_EMAIL`, `LOGIN_PASSWORD` (12+ characters), `SESSION_SECRET` (32+ characters) |
-| `proxy` | A sign-in proxy you already run, such as Authelia, oauth2-proxy or Tailscale Serve, passes the email address in a header | `PROXY_AUTH_HEADER`, `SESSION_SECRET`, optional `PROXY_AUTH_SECRET` |
+| `proxy` | A sign-in proxy you already run, such as Authelia, oauth2-proxy or Tailscale Serve, passes the email address in a header | `PROXY_AUTH_HEADER`, `SESSION_SECRET`, and `PROXY_AUTH_SECRET` (32+ characters, sent by the proxy as `x-rhizome-proxy-secret`) or, on Node only, `PROXY_TRUSTED_IPS` |
 
-Until the chosen mode is fully configured, the explorer API answers 404 and nobody can approve an OAuth connector. The same sign-in protects the OAuth consent page.
+Until the chosen mode is fully configured, the explorer API answers 404 and nobody can approve an OAuth connector. The same sign-in protects the OAuth consent page. In password mode, sign-in attempts are limited to 10 a minute per address, and changing `LOGIN_EMAIL`, `LOGIN_PASSWORD` or `SESSION_SECRET` signs every session out.
 
 ## MCP
 
@@ -186,8 +186,8 @@ Things worth knowing:
 
 * **Models.** `EMBEDDING_MODEL` and `EXTRACTION_MODEL` must be models your server serves. `bge-m3` matches the Worker's embeddings. Any chat model that writes JSON reliably works for extraction; smaller ones miss more facts. `EXTRACTION=off` stores conversations without extracting notes. `AI_PROVIDER=cloudflare` with `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` uses Workers AI and its default models from Node.
 * **Reranking** is optional: point `AI_RERANK_URL` at a `/rerank` endpoint (llama.cpp with `--reranking`, vLLM, TEI or Infinity). Without it, recall keeps the fused order of vector and full-text search.
-* **Reachable from elsewhere.** rhizome listens on `127.0.0.1` unless you set `HOST`. Put a reverse proxy with TLS in front (Caddy, nginx, Traefik) and set `PUBLIC_URL` to its address, because OAuth for Claude and ChatGPT needs an `https` URL they can reach. With `TRUST_PROXY=true` rhizome takes the client address from `X-Forwarded-For`; only set it when the proxy is the only way in.
-* **Sign-in.** `AUTH_MODE=password` needs nothing else. With `proxy`, make sure rhizome can only be reached through the proxy, or set `PROXY_AUTH_SECRET` and have the proxy send it. A Cloudflare Tunnel with Access works too: keep `AUTH_MODE=access`.
+* **Reachable from elsewhere.** rhizome listens on `127.0.0.1` unless you set `HOST`. Put a reverse proxy with TLS in front (Caddy, nginx, Traefik) and set `PUBLIC_URL` to its address, because OAuth for Claude and ChatGPT needs an `https` URL they can reach. With `TRUST_PROXY=true` rhizome takes the client address from the last `X-Forwarded-For` entry, the one your proxy added; only set it when the proxy is the only way in.
+* **Sign-in.** `AUTH_MODE=password` needs nothing else. With `proxy`, rhizome only believes the email header when the proxy also sends `PROXY_AUTH_SECRET`, or when the connection comes from an address in `PROXY_TRUSTED_IPS` (the TCP peer, never a header). Use the address list for proxies that can't add headers, such as Tailscale Serve. A Cloudflare Tunnel with Access works too: keep `AUTH_MODE=access`.
 * **Backups.** Everything lives in `DATA_DIR`. Stop the server, or use `sqlite3 .backup`, and copy the folder.
 
 ### Run it on Cloudflare

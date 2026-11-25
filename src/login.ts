@@ -7,7 +7,7 @@
 import { Hono } from "hono";
 import { createUser } from "./auth";
 import type { Env } from "./env";
-import { SESSION_COOKIE, SESSION_TTL, authMode, createSession, safeEqualHashed, signInProblem } from "./identity";
+import { SESSION_COOKIE, SESSION_TTL, authMode, createSession, safeEqualHashed, sessionKey, signInProblem } from "./identity";
 import { esc, page } from "./oauth";
 
 type Login = { Bindings: Env };
@@ -37,8 +37,9 @@ login.get("/auth/login", (c) => page("Sign in", form(safeNext(c.req.query("next"
 login.post("/auth/login", async (c) => {
   const site = c.req.header("sec-fetch-site");
   if (site && site !== "same-origin" && site !== "none") return page("Request refused", "<p>This sign-in did not come from the rhizome page.</p>", 403);
-  if (c.env.RATE_LIMITER) {
-    const { success } = await c.env.RATE_LIMITER.limit({ key: `login:${c.req.header("cf-connecting-ip") ?? "?"}` });
+  const limiter = c.env.LOGIN_RATE_LIMITER ?? c.env.RATE_LIMITER;
+  if (limiter) {
+    const { success } = await limiter.limit({ key: `login:${c.req.header("cf-connecting-ip") ?? "?"}` });
     if (!success) return page("Slow down", "<p>Too many sign-in attempts. Wait a minute and try again.</p>", 429);
   }
   const body = await c.req.parseBody();
@@ -58,7 +59,7 @@ login.post("/auth/login", async (c) => {
     await db.prepare("UPDATE users SET email = ? WHERE id = ?").bind(email, created.id).run();
   }
 
-  const token = await createSession(c.env.SESSION_SECRET!, email);
+  const token = await createSession(sessionKey(c.env), email);
   const secure = new URL(c.req.url).protocol === "https:" ? "; Secure" : "";
   return new Response(null, {
     status: 303,

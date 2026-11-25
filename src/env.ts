@@ -43,8 +43,12 @@ export interface Env {
   SESSION_SECRET?: string;
   /** AUTH_MODE=proxy: request header with the signed-in email, e.g. Remote-Email or Tailscale-User-Login. */
   PROXY_AUTH_HEADER?: string;
-  /** AUTH_MODE=proxy, optional: the proxy must also send this value in x-rhizome-proxy-secret. */
+  /** AUTH_MODE=proxy: at least 32 characters, sent by the proxy in x-rhizome-proxy-secret. Required unless PROXY_TRUSTED_IPS is used. */
   PROXY_AUTH_SECRET?: string;
+  /** AUTH_MODE=proxy on Node only: addresses or IPv4 ranges the proxy connects from (checked against the TCP peer). */
+  PROXY_TRUSTED_IPS?: string;
+  /** Optional stricter limiter for /auth/login. Falls back to RATE_LIMITER. */
+  LOGIN_RATE_LIMITER?: RateLimit;
 
   /** Operator details for the imprint and privacy pages. Set at deploy time, never committed. */
   OPERATOR_NAME?: string;

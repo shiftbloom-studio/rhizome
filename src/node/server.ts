@@ -16,7 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import type { Env } from "../env";
-import { signInProblem, authMode } from "../identity";
+import { authMode, setPeerAddress, signInProblem } from "../identity";
 import worker, { MemoryObject } from "../index";
 import { localAssets } from "./assets";
 import { LocalAi, type AiConfig } from "./ai";
@@ -102,6 +102,7 @@ env = {
   VECTORS: vectors as unknown as VectorizeIndex,
   AI: new LocalAi(ai) as unknown as Ai,
   RATE_LIMITER: rateLimiter(Number(vars.RATE_LIMIT ?? 120), 60_000) as unknown as RateLimit,
+  LOGIN_RATE_LIMITER: rateLimiter(Number(vars.LOGIN_RATE_LIMIT ?? 10), 60_000) as unknown as RateLimit,
   ASSETS: (await localAssets(join(appRoot, "web", "dist"))) as unknown as Fetcher,
 };
 
@@ -117,7 +118,8 @@ const ctx = {
 function incoming(req: Request, remote: string | undefined): Request {
   const url = new URL(req.url);
   const headers = new Headers(req.headers);
-  const forwarded = headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  // Proxies append to X-Forwarded-For, so only the last entry comes from the trusted proxy.
+  const forwarded = headers.get("x-forwarded-for")?.split(",").at(-1)?.trim();
   if (publicUrl) {
     url.protocol = publicUrl.protocol;
     url.host = publicUrl.host;
@@ -130,7 +132,9 @@ function incoming(req: Request, remote: string | undefined): Request {
   // The Worker reads the client address from cf-connecting-ip. Never take it from the client.
   headers.set("cf-connecting-ip", (trustProxy && forwarded) || remote || "unknown");
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
-  return new Request(url, { method: req.method, headers, body: hasBody ? req.body : undefined, duplex: "half", redirect: "manual" } as RequestInit);
+  const out = new Request(url, { method: req.method, headers, body: hasBody ? req.body : undefined, duplex: "half", redirect: "manual" } as RequestInit);
+  if (remote) setPeerAddress(out, remote);
+  return out;
 }
 
 const server = serve({

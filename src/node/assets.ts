@@ -42,7 +42,13 @@ export async function localAssets(dir: string) {
   const rules = parseHeaders(await readFile(join(root, "_headers"), "utf8").catch(() => ""));
 
   async function file(path: string): Promise<string | null> {
-    const p = resolve(join(root, decodeURIComponent(path)));
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(path);
+    } catch {
+      return null; // malformed escape, e.g. /%E0%A4%A
+    }
+    const p = resolve(join(root, decoded));
     if (p !== root && !p.startsWith(root + sep)) return null;
     if (p.endsWith(`${sep}_headers`) || p.endsWith(`${sep}_redirects`)) return null;
     const s = await stat(p).catch(() => null);

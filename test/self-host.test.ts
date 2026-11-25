@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createSession, identify, signInProblem, verifySession } from "../src/identity";
+import { createSession, identify, ipAllowed, sessionKey, setPeerAddress, signInProblem, verifySession } from "../src/identity";
 import worker from "../src/index";
 import { MemoryObject } from "../src/memory-object";
 import type { Client } from "../src/scopes";
@@ -43,17 +43,42 @@ describe("sessions", () => {
     expect(signInProblem({} as never)).toMatch(/Cloudflare Access/);
     expect(signInProblem({ AUTH_MODE: "password", LOGIN_EMAIL: "a@b.c", LOGIN_PASSWORD: "short", SESSION_SECRET: SECRET } as never)).toMatch(/12 characters/);
     expect(signInProblem({ AUTH_MODE: "password", LOGIN_EMAIL: "a@b.c", LOGIN_PASSWORD: "long enough pw", SESSION_SECRET: "short" } as never)).toMatch(/SESSION_SECRET/);
-    expect(signInProblem({ AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "remote-email", SESSION_SECRET: SECRET } as never)).toBeNull();
+    // Proxy mode without proof that requests passed the proxy stays off.
+    expect(signInProblem({ AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "remote-email", SESSION_SECRET: SECRET } as never)).toMatch(/PROXY_AUTH_SECRET/);
+    expect(signInProblem({ AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "remote-email", SESSION_SECRET: SECRET, PROXY_AUTH_SECRET: "short" } as never)).toMatch(/32 characters/);
+    expect(signInProblem({ AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "remote-email", SESSION_SECRET: SECRET, PROXY_AUTH_SECRET: SECRET } as never)).toBeNull();
+    expect(signInProblem({ AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "remote-email", SESSION_SECRET: SECRET, PROXY_TRUSTED_IPS: "127.0.0.1" } as never)).toBeNull();
+  });
+
+  it("refuses a spoofed proxy header without a secret, even with the email header set", async () => {
+    const env = { AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "Remote-Email", SESSION_SECRET: SECRET } as never;
+    expect(await identify(env, new Request(HOST, { headers: { "remote-email": "anyone@example.com" } }))).toBeNull();
+  });
+
+  it("trusts the proxy header from trusted socket addresses only", async () => {
+    const env = { AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "Remote-Email", PROXY_TRUSTED_IPS: "::1, 172.18.0.0/16", SESSION_SECRET: SECRET } as never;
+    const from = (peer: string | null, h: Record<string, string> = {}) => {
+      const r = new Request(HOST, { headers: { "remote-email": "me@example.com", ...h } });
+      if (peer) setPeerAddress(r, peer);
+      return identify(env, r);
+    };
+    expect((await from("::ffff:172.18.3.4"))?.email).toBe("me@example.com");
+    expect((await from("::1"))?.email).toBe("me@example.com");
+    expect(await from("172.19.0.1")).toBeNull();
+    expect(await from(null, { "x-forwarded-for": "172.18.0.2", "cf-connecting-ip": "172.18.0.2" })).toBeNull(); // headers don't count
+    expect(ipAllowed("10.1.2.3", ["10.0.0.0/8"])).toBe(true);
+    expect(ipAllowed("11.1.2.3", ["10.0.0.0/8"])).toBe(false);
   });
 
   it("trusts the proxy header only with the shared secret when one is set", async () => {
-    const env = { AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "Remote-Email", PROXY_AUTH_SECRET: "proxy-secret", SESSION_SECRET: SECRET } as never;
+    const env = { AUTH_MODE: "proxy", PROXY_AUTH_HEADER: "Remote-Email", PROXY_AUTH_SECRET: "proxy-secret".padEnd(32, "x"), SESSION_SECRET: SECRET } as never;
     const req = (h: Record<string, string>) => new Request(HOST, { headers: h });
     expect(await identify(env, req({ "remote-email": "Me@Example.com" }))).toBeNull();
-    const id = await identify(env, req({ "remote-email": "Me@Example.com", "x-rhizome-proxy-secret": "proxy-secret" }));
+    expect(await identify(env, req({ "remote-email": "Me@Example.com", "x-rhizome-proxy-secret": "proxy-secret" }))).toBeNull();
+    const id = await identify(env, req({ "remote-email": "Me@Example.com", "x-rhizome-proxy-secret": "proxy-secret".padEnd(32, "x") }));
     expect(id?.email).toBe("me@example.com");
     expect(id?.key).toMatch(/^[0-9a-f]{64}$/);
-    expect(await identify(env, req({ "remote-email": "not an email", "x-rhizome-proxy-secret": "proxy-secret" }))).toBeNull();
+    expect(await identify(env, req({ "remote-email": "not an email", "x-rhizome-proxy-secret": "proxy-secret".padEnd(32, "x") }))).toBeNull();
   });
 });
 
@@ -97,6 +122,23 @@ describe("password sign-in", () => {
     expect((control.db.prepare("SELECT email FROM users").all() as unknown[]).length).toBe(1);
     await login("me@example.com", "correct horse battery");
     expect((control.db.prepare("SELECT email FROM users").all() as unknown[]).length).toBe(1);
+
+    // A new password signs existing sessions out.
+    env.LOGIN_PASSWORD = "another long password";
+    expect((await call("/ui/api/me", { headers: { cookie: cookie.split(";")[0]! } })).status).toBe(401);
+  });
+
+  it("signs the session for the configured email only", async () => {
+    const forged = await createSession(sessionKey(env as never), "other@example.com");
+    expect((await call("/ui/api/me", { headers: { cookie: `rz_session=${forged}` } })).status).toBe(401);
+  });
+
+  it("limits sign-in attempts with its own limiter", async () => {
+    let n = 0;
+    env.LOGIN_RATE_LIMITER = { limit: async () => ({ success: ++n <= 2 }) };
+    await login("me@example.com", "wrong password!");
+    await login("me@example.com", "wrong password!");
+    expect((await login("me@example.com", "correct horse battery")).status).toBe(429);
   });
 
   it("refuses cross-site sign-ins and sends the OAuth consent through sign-in", async () => {
