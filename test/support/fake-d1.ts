@@ -2,11 +2,13 @@
 // A D1 double backed by node:sqlite with every migration applied.
 import { readdirSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export function fakeD1() {
   const db = new DatabaseSync(":memory:");
-  const dir = new URL("../../migrations/", import.meta.url);
-  for (const f of readdirSync(dir).filter((n) => n.endsWith(".sql")).sort()) db.exec(readFileSync(new URL(f, dir), "utf8"));
+  const dir = fileURLToPath(new URL("../../migrations/", import.meta.url).href);
+  for (const f of readdirSync(dir).filter((n) => n.endsWith(".sql")).sort()) db.exec(readFileSync(join(dir, f), "utf8"));
   const statement = (query: string, params: unknown[] = []) => ({
     bind: (...p: unknown[]) => statement(query, p),
     first: async <T>() => ((db.prepare(query).all(...(params as never[]))[0] as T | undefined) ?? null),
