@@ -4,6 +4,7 @@ import { api } from "./api";
 import { DetailPanel } from "./DetailPanel";
 import { MemoryGraph, TRUST_COLOR } from "./MemoryGraph";
 import type { Graph, Me, SearchResult } from "./types";
+import { Bloom } from "./Bloom";
 
 const reducedMotion = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -258,7 +259,8 @@ export function App() {
 function Wordmark() {
   return (
     <a className="wordmark" href="/" aria-label="rhizome">
-      rhizome<i>.</i>
+      <Bloom size={30} />
+      <span>rhizome<i>.</i></span>
     </a>
   );
 }

@@ -3,6 +3,7 @@
 // Imprint and privacy policy in English and German. Operator details come
 // from deploy-time variables (see README); nothing personal is hardcoded.
 
+import { bloomSvg } from "./bloom";
 import type { Env } from "./env";
 
 type LegalKind = "privacy" | "datenschutz" | "imprint" | "impressum";
@@ -61,8 +62,8 @@ export function legalPage(kind: LegalKind, env: Env): Response {
 body{margin:0;font:16px/1.6 "General Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
 ::selection{background:var(--blush)}
 .wrap{max-width:52em;margin:0 auto;padding:28px clamp(20px,5vw,48px) 48px}
-.top{display:flex;align-items:baseline;justify-content:space-between}
-.mark{font:600 24px/1 "Clash Display","General Sans",sans-serif;color:var(--ink);text-decoration:none;letter-spacing:-.01em}
+.top{display:flex;align-items:center;justify-content:space-between}
+.mark{display:inline-flex;align-items:center;gap:12px;font:600 22.4px/1 "Clash Display","General Sans",sans-serif;color:var(--ink);text-decoration:none;letter-spacing:-.02em}
 .mark i{color:var(--bloom);font-style:normal}
 .label{font:500 12px/1 "JetBrains Mono",ui-monospace,monospace;letter-spacing:.16em;color:var(--ink60)}
 h1{font:600 clamp(32px,4.6vw,48px)/1.1 "Clash Display","General Sans",sans-serif;margin:12px 0 0;letter-spacing:-.01em}
@@ -74,7 +75,7 @@ main{padding-top:clamp(28px,5vw,56px)}
 footer{margin-top:56px;padding-top:20px;border-top:1px solid rgba(26,18,22,.1);font-size:14px;color:var(--ink60)}
 footer a{color:var(--ink60)}
 </style></head><body><div class="wrap">
-<div class="top"><a class="mark" href="/">rhizome<i>.</i></a><span class="label">${de ? "rechtliches" : "legal"}</span></div>
+<div class="top"><a class="mark" href="/">${bloomSvg({ size: 30 })}<span>rhizome<i>.</i></span></a><span class="label">${de ? "rechtliches" : "legal"}</span></div>
 <main><h1>${title}</h1>
 <div class="meta">${isPrivacy ? `<span>${UPDATED[lang]}</span>` : ""}<a href="${other}" hreflang="${de ? "en" : "de"}">${de ? "English" : "Deutsch"}</a></div>
 ${body}
