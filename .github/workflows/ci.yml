@@ -3,6 +3,7 @@ name: CI
 # Lean CI: one run per PR head, newest push wins. Main is not re-checked after
 # merge (PR checks already ran). Runner comes from the org/repo
 # variable CI_RUNNER (self-hosted label) and falls back to GitHub-hosted.
+# PRs from forks always use GitHub-hosted runners.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
