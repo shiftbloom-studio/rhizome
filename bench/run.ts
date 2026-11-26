@@ -17,6 +17,7 @@ import { AiCache, BenchAi, DEFAULT_API_LIMIT, FakeAi, defaultRpm, type AiRunner 
 import { readResults, runBenchmark, workerVars } from "./harness";
 import { DATASET_FILE, DATASET_URL, loadDataset, select } from "./longmemeval";
 import { compareRuns, comparisonMarkdown } from "./metrics";
+import { MEMORY_VARS } from "./question";
 
 const HELP = `rhizome benchmark: LongMemEval against rhizome's memory code
 
@@ -37,7 +38,7 @@ Run options:
   --features <list>     recall steps for every recall: ${RECALL_FEATURES.join(", ")}, all or none
                         (default: RECALL_FEATURES from the Worker's vars, as deployed)
   --chunking <mode>     episode chunking, fixed or rounds (default: CHUNKING, as deployed)
-  --no-as-of            send the question date only as referenceTime, not as asOf
+  --as-of               also send the question date as asOf (recall then adds an exact vector search)
   --concurrency <n>     questions in parallel (default 4)
   --max-minutes <n>     start no new question after n minutes; run again with the same --out to go on
   --cache <file>        AI cache (default bench/cache/ai.sqlite); --no-cache turns it off
@@ -52,9 +53,6 @@ Run options:
 
 Workers AI needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN (Workers AI Read and Edit).
 `;
-
-/** Variables the memory code reads, taken from the environment when set (they override the Worker's vars). */
-const PASSTHROUGH = ["EMBEDDING_MODEL", "RERANK_MODEL", "EXTRACTION_MODEL", "REFLECTION_MODEL", "RECALL_FEATURES", "CHUNKING", "DISPUTE_RESOLUTION"];
 
 function fail(message: string): never {
   console.error(`bench: ${message}`);
@@ -150,7 +148,7 @@ async function run(args: string[]) {
       reflect: { type: "boolean", default: false },
       features: { type: "string" },
       chunking: { type: "string" },
-      "no-as-of": { type: "boolean", default: false },
+      "as-of": { type: "boolean", default: false },
       concurrency: { type: "string" },
       "max-minutes": { type: "string" },
       cache: { type: "string", default: join("bench", "cache", "ai.sqlite") },
@@ -188,7 +186,8 @@ async function run(args: string[]) {
 
   // Same configuration as the deployed Worker, then the environment, then --set.
   const vars: Record<string, string> = !values["no-worker-vars"] && existsSync("wrangler.jsonc") ? workerVars(readFileSync("wrangler.jsonc", "utf8")) : {};
-  for (const key of PASSTHROUGH) if (process.env[key]) vars[key] = process.env[key]!;
+  // Variables the memory code reads, taken from the environment when set.
+  for (const key of MEMORY_VARS) if (process.env[key]) vars[key] = process.env[key]!;
   for (const pair of values.set ?? []) {
     const at = pair.indexOf("=");
     if (at < 1) fail(`--set needs KEY=VALUE, not "${pair}"`);
@@ -233,7 +232,7 @@ async function run(args: string[]) {
     reflect: values.reflect,
     features,
     chunking,
-    asOf: !values["no-as-of"],
+    asOf: values["as-of"],
     concurrency: int("concurrency", values.concurrency),
     deadline: maxMinutes === undefined ? undefined : Date.now() + maxMinutes * 60_000,
     keepStores: values.keep,
@@ -247,7 +246,7 @@ async function run(args: string[]) {
       reflect: values.reflect,
       features: features ?? null,
       chunking: chunking ?? null,
-      asOf: !values["no-as-of"],
+      asOf: values["as-of"],
     },
     meta: { commit: commit() ?? null, node: process.version },
   });

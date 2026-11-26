@@ -53,28 +53,33 @@ function fail(index: number, problem: string): never {
 
 const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
 
+/** Checks the shape of one question; `i` is its place in the dataset, for the error. */
+export function validateQuestion(raw: unknown, i: number): Question {
+  const q = raw as Partial<Question>;
+  if (!q || typeof q !== "object") fail(i, "not an object");
+  for (const key of ["question_id", "question_type", "question", "question_date"] as const) {
+    if (typeof q[key] !== "string") fail(i, `${key} must be a string`);
+  }
+  if (!isStringArray(q.haystack_session_ids) || !isStringArray(q.haystack_dates) || !isStringArray(q.answer_session_ids)) {
+    fail(i, "haystack_session_ids, haystack_dates and answer_session_ids must be string arrays");
+  }
+  if (!Array.isArray(q.haystack_sessions) || q.haystack_sessions.length !== q.haystack_session_ids.length || q.haystack_dates.length !== q.haystack_session_ids.length) {
+    fail(i, "haystack_sessions, haystack_session_ids and haystack_dates must have the same length");
+  }
+  q.haystack_sessions.forEach((s, n) => {
+    if (!Array.isArray(s) || s.some((t) => !t || typeof t.role !== "string" || typeof t.content !== "string")) {
+      fail(i, `session ${n} must be a list of { role, content } turns`);
+    }
+  });
+  parseDate(q.question_date as string);
+  q.haystack_dates.forEach(parseDate);
+  return q as Question;
+}
+
 /** Checks the shape of the dataset, so a wrong file fails before any model call. */
 export function validateDataset(raw: unknown): Question[] {
   if (!Array.isArray(raw)) throw new Error("dataset must be a JSON array of questions");
-  raw.forEach((q: Partial<Question>, i) => {
-    if (!q || typeof q !== "object") fail(i, "not an object");
-    for (const key of ["question_id", "question_type", "question", "question_date"] as const) {
-      if (typeof q[key] !== "string") fail(i, `${key} must be a string`);
-    }
-    if (!isStringArray(q.haystack_session_ids) || !isStringArray(q.haystack_dates) || !isStringArray(q.answer_session_ids)) {
-      fail(i, "haystack_session_ids, haystack_dates and answer_session_ids must be string arrays");
-    }
-    if (!Array.isArray(q.haystack_sessions) || q.haystack_sessions.length !== q.haystack_session_ids.length || q.haystack_dates.length !== q.haystack_session_ids.length) {
-      fail(i, "haystack_sessions, haystack_session_ids and haystack_dates must have the same length");
-    }
-    q.haystack_sessions.forEach((s, n) => {
-      if (!Array.isArray(s) || s.some((t) => !t || typeof t.role !== "string" || typeof t.content !== "string")) {
-        fail(i, `session ${n} must be a list of { role, content } turns`);
-      }
-    });
-    parseDate(q.question_date as string);
-    q.haystack_dates.forEach(parseDate);
-  });
+  raw.forEach((q, i) => validateQuestion(q, i));
   return raw as Question[];
 }
 
@@ -109,7 +114,7 @@ function random(seed: number): () => number {
 }
 
 /** Picks the questions of a run. The result keeps the dataset's order. */
-export function select(questions: Question[], sel: Selection = {}): Question[] {
+export function select<T extends Pick<Question, "question_id" | "question_type">>(questions: T[], sel: Selection = {}): T[] {
   let out = questions;
   if (sel.ids?.length) {
     const ids = new Set(sel.ids);
@@ -122,7 +127,7 @@ export function select(questions: Question[], sel: Selection = {}): Question[] {
   if (sel.sample !== undefined && sel.sample < out.length) {
     const total = out.length;
     const sample = sel.sample;
-    const groups = new Map<string, Question[]>();
+    const groups = new Map<string, T[]>();
     for (const q of out) groups.set(typeKey(q), [...(groups.get(typeKey(q)) ?? []), q]);
     // Largest remainder: every group gets its share of the sample, rounded so the total fits.
     const shares = [...groups.entries()]
@@ -150,4 +155,65 @@ export function select(questions: Question[], sel: Selection = {}): Question[] {
   }
   if (sel.limit !== undefined) out = out.slice(0, sel.limit);
   return out;
+}
+
+/**
+ * Splits a JSON array of objects into the text of each object, chunk by chunk,
+ * so a dataset of hundreds of megabytes never has to fit in memory at once.
+ */
+export class JsonArraySplitter {
+  /** Before "[", after "[", after ",", inside an object, after an object, after "]". */
+  private state: "start" | "open" | "comma" | "item" | "after" | "end" = "start";
+  private depth = 0;
+  private inString = false;
+  private escaped = false;
+  private parts: string[] = [];
+
+  /** Feeds the next piece of text and returns the objects it completed. */
+  push(chunk: string): string[] {
+    const items: string[] = [];
+    let start = this.state === "item" ? 0 : -1;
+    for (let i = 0; i < chunk.length; i++) {
+      const c = chunk.charCodeAt(i);
+      if (this.state === "item") {
+        if (this.inString) {
+          if (this.escaped) this.escaped = false;
+          else if (c === 0x5c) this.escaped = true;
+          else if (c === 0x22) this.inString = false;
+        } else if (c === 0x22) this.inString = true;
+        else if (c === 0x7b || c === 0x5b) this.depth++;
+        else if ((c === 0x7d || c === 0x5d) && --this.depth === 0) {
+          this.parts.push(chunk.slice(start, i + 1));
+          items.push(this.parts.join(""));
+          this.parts = [];
+          this.state = "after";
+          start = -1;
+        }
+        continue;
+      }
+      if (c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09) continue;
+      if (this.state === "start") {
+        if (c !== 0x5b) throw new Error("the dataset is not a JSON array");
+        this.state = "open";
+      } else if (this.state === "open" || this.state === "comma") {
+        if (c === 0x7b) {
+          this.state = "item";
+          this.depth = 1;
+          start = i;
+        } else if (c === 0x5d && this.state === "open") this.state = "end";
+        else throw new Error("the dataset must be an array of objects");
+      } else if (this.state === "after") {
+        if (c === 0x2c) this.state = "comma";
+        else if (c === 0x5d) this.state = "end";
+        else throw new Error("the dataset must be an array of objects, separated by commas");
+      } else throw new Error("unexpected data after the dataset's array");
+    }
+    if (this.state === "item" && start >= 0) this.parts.push(chunk.slice(start));
+    return items;
+  }
+
+  /** Throws unless the array was closed. */
+  end(): void {
+    if (this.state !== "end") throw new Error("the dataset ended inside its array");
+  }
 }

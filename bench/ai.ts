@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { DEFAULT_API_LIMIT, RetryableError, defaultRpm, isRetryable } from "./limits";
 
 /** What MemoryObject calls as env.AI: `run(model, input)`. */
 export interface AiRunner {
@@ -111,31 +112,7 @@ export class RateWindow {
   }
 }
 
-/**
- * Models that need the Workers Paid plan get 20 requests per minute per account,
- * all other text models 300 (developers.cloudflare.com/workers-ai/platform/limits).
- * The defaults stay a little below.
- */
-const PAID_MODELS = /deepseek-v4|glm-5|kimi-k2|inkling/i;
-
-export function defaultRpm(model: string): number {
-  return PAID_MODELS.test(model) ? 18 : 300;
-}
-
-/** The Cloudflare API allows 1,200 requests per five minutes per token, and blocks all calls for five minutes after that. */
-export const DEFAULT_API_LIMIT = 1000;
-
-class RetryableError extends Error {}
-
-export function isRetryable(err: unknown): boolean {
-  if (err instanceof RetryableError) return true;
-  const e = err as { name?: string; message?: string } | undefined;
-  if (e?.name === "TimeoutError" || e?.name === "AbortError") return true;
-  const message = String(e?.message ?? err);
-  const status = /HTTP (\d{3})/.exec(message)?.[1];
-  if (status) return status === "429" || status === "408" || status.startsWith("5");
-  return /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|network/i.test(message);
-}
+export { DEFAULT_API_LIMIT, defaultRpm, isRetryable } from "./limits";
 
 export interface ModelStats {
   /** Requests sent, retries included. */

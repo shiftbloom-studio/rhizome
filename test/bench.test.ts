@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AiCache, BenchAi, FakeAi, RateWindow, isRetryable, stableJson, type AiRunner, type Clock } from "../bench/ai";
-import { coveredTurns, indexSession, readResults, runBenchmark, workerVars } from "../bench/harness";
+import { readResults, runBenchmark, workerVars } from "../bench/harness";
 import { parseDate, select, typeKey, validateDataset, type Question, type Turn } from "../bench/longmemeval";
 import { compareRuns, mcnemar, rankingScores, scoreQuestion, sessionOrder, summarize, turnCoverage } from "../bench/metrics";
+import { coveredTurns, indexSession } from "../bench/question";
 import { chunk, roundChunks, transcript } from "../src/text";
 
 let dir: string;
