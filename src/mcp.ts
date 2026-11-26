@@ -9,6 +9,7 @@ import { IMPORT_FORMATS, MAX_IMPORT_CHARS, parseMemoryFile, type ImportFormat } 
 import type { MemoryItem, NoteKind, Trust } from "./memory-object";
 import { NOTE_KINDS } from "./memory-object";
 import { agentScope, can, isValidSlug, recallScopes, type Client } from "./scopes";
+import type { McpStat } from "./analytics";
 import { parseRangeBound } from "./timewindow";
 import type { Tracked } from "./walls";
 
@@ -390,13 +391,25 @@ async function readableScopes(memory: MemoryApi, client: Client): Promise<string
   return [...new Set([...recallScopes(client), ...all.filter((s) => s.startsWith("project:") && can(client, "read", s))])];
 }
 
-async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, version: string): Promise<unknown> {
+type Observe = (stat: McpStat) => void;
+
+async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, version: string, observe?: Observe): Promise<unknown> {
   const params = req.params ?? {};
   switch (req.method) {
     case "initialize": {
       const asked = typeof params.protocolVersion === "string" ? params.protocolVersion : "";
+      const protocolVersion = PROTOCOL_VERSIONS.includes(asked) ? asked : PROTOCOL_VERSIONS[0];
+      if (observe) {
+        const info = (params.clientInfo ?? {}) as { name?: unknown; version?: unknown };
+        observe({
+          kind: "initialize",
+          clientName: typeof info.name === "string" ? info.name : undefined,
+          clientVersion: typeof info.version === "string" ? info.version : undefined,
+          protocolVersion,
+        });
+      }
       return {
-        protocolVersion: PROTOCOL_VERSIONS.includes(asked) ? asked : PROTOCOL_VERSIONS[0],
+        protocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "rhizome", title: "rhizome memory", version },
         instructions: INSTRUCTIONS,
@@ -409,13 +422,32 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
       const args = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
+      const started = Date.now();
+      // Only the tool name, the outcome, the time taken and the size of the answer are reported.
+      const report = (result: ToolResult | null, errorType?: "validation" | "internal") =>
+        observe?.({
+          kind: "tool_call",
+          tool: name,
+          ok: !errorType,
+          errorType,
+          durationMs: Date.now() - started,
+          responseBytes: result ? JSON.stringify(result).length : 0,
+        });
       try {
-        return await callTool(memory, client, name, args);
+        const result = await callTool(memory, client, name, args);
+        report(result);
+        return result;
       } catch (e) {
-        if (e instanceof RpcError) throw e;
-        const message = e instanceof ToolError ? e.message : e instanceof Error && /must be|empty|limit is|not allowed|may not/.test(e.message) ? e.message : "the memory service failed, try again";
+        if (e instanceof RpcError) {
+          report(null, "validation");
+          throw e;
+        }
+        const validation = e instanceof ToolError || (e instanceof Error && /must be|empty|limit is|not allowed|may not/.test(e.message));
+        const message = e instanceof ToolError ? e.message : validation ? (e as Error).message : "the memory service failed, try again";
         if (!(e instanceof ToolError)) console.error(e);
-        return { content: [{ type: "text", text: message }], isError: true } satisfies ToolResult;
+        const result = { content: [{ type: "text", text: message }], isError: true } satisfies ToolResult;
+        report(result, validation ? "validation" : "internal");
+        return result;
       }
     }
     case "resources/list":
@@ -427,8 +459,11 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
   }
 }
 
-/** Answers one Streamable HTTP POST body (a single message or a batch). */
-export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknown, version: string): Promise<Response> {
+/**
+ * Answers one Streamable HTTP POST body (a single message or a batch). `observe`, when
+ * given, hears about each initialize and tool call (see analytics.ts).
+ */
+export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknown, version: string, observe?: Observe): Promise<Response> {
   const messages = Array.isArray(raw) ? raw : [raw];
   if (!messages.length) return rpcError(null, -32600, "empty batch");
   const out: JsonRpcResponse[] = [];
@@ -442,7 +477,7 @@ export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknow
     }
     const isNotification = msg.id === undefined;
     try {
-      const result = await handle(memory, client, msg as JsonRpcRequest, version);
+      const result = await handle(memory, client, msg as JsonRpcRequest, version, observe);
       if (!isNotification) out.push({ jsonrpc: "2.0", id: msg.id ?? null, result });
     } catch (e) {
       if (isNotification) continue;
