@@ -220,12 +220,24 @@ export const MIGRATIONS: string[] = [
     item_id     TEXT NOT NULL,
     from_scope  TEXT NOT NULL,
     to_scope    TEXT NOT NULL,
-    via         TEXT NOT NULL,             -- extraction | remember
+    via         TEXT NOT NULL,             -- extraction | remember | import
     state       TEXT NOT NULL DEFAULT 'held', -- held | released | dismissed
     created_at  INTEGER NOT NULL,
     decided_at  INTEGER
   );
   CREATE INDEX promotions_state ON promotions (state, seq);
   CREATE INDEX promotions_item ON promotions (item_id);
+  `,
+  // 7: which wall each conversation was given memory from (walls rule 2).
+  // conversation is h:<client>:<handle> or c:<client> for calls without a handle.
+  `
+  CREATE TABLE wall_reads (
+    conversation TEXT NOT NULL,
+    wall         TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    last_at      INTEGER NOT NULL,
+    PRIMARY KEY (conversation, wall)
+  ) WITHOUT ROWID;
+  CREATE INDEX wall_reads_time ON wall_reads (last_at);
   `,
 ];

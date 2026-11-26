@@ -15,12 +15,13 @@ let now = Date.UTC(2026, 10, 26, 9);
 vi.spyOn(Date, "now").mockImplementation(() => now);
 afterAll(() => vi.restoreAllMocks());
 
-type ToolBody = { result: { content: { text: string }[]; isError?: boolean; structuredContent?: { results?: { scope: string; content: string }[]; notices?: string[] } } };
+type ToolBody = { result: { content: { text: string }[]; isError?: boolean; structuredContent?: { results?: { scope: string; content: string }[]; notices?: string[]; conversation?: string; scope?: string; heldFor?: string } } };
 let rpcId = 0;
 async function tool(memory: MemoryObject, client: Client, name: string, args: Record<string, unknown>) {
   const res = await mcpResponse(memory as unknown as MemoryApi, client, { jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name, arguments: args } }, "test");
   const body = (await res.json()) as ToolBody;
-  return { text: body.result.content[0]!.text, results: body.result.structuredContent?.results ?? [], notices: body.result.structuredContent?.notices, isError: body.result.isError === true };
+  const sc = body.result.structuredContent;
+  return { text: body.result.content[0]!.text, results: sc?.results ?? [], notices: sc?.notices, conversation: sc?.conversation, scope: sc?.scope, heldFor: sc?.heldFor, isError: body.result.isError === true };
 }
 const count = (rows: { scope: string }[], scope: string) => rows.filter((r) => r.scope === scope).length;
 
@@ -207,5 +208,158 @@ describe("walls and extraction (held promotions)", () => {
     await mo.forget(claudeCode, held!.itemId);
     expect(mo.listHeld(claudeCode)).toEqual([]);
     expect(await mo.decideHeld(claudeCode, held!.id, "release")).toBeNull();
+  });
+});
+
+describe("walls and conversations (rule 2)", () => {
+  let mo: MemoryObject;
+  const seed = async (m: MemoryObject) => {
+    await m.addNote(claudeCode, { scope: "profile", content: "The user prefers offers that lead with the budget.", kind: "preference", trust: "user_explicit" });
+    await m.addNote(claudeCode, { scope: "project:acme", content: "Acme's budget for the Orion feature is 60,000 euros.", kind: "fact", trust: "user_confirmed" });
+    await m.addNote(cursor, { scope: "project:globex", content: "Globex's budget for the redesign is 40,000 euros.", kind: "fact", trust: "user_confirmed" });
+    await m.addNote(cursor, { scope: "project:site", content: "The site's budget for hosting is 20 euros a month.", kind: "fact", trust: "user_confirmed" });
+    for (let i = 0; i < 12; i++) {
+      now += 5_000;
+      await m.alarm();
+    }
+  };
+
+  beforeEach(async () => {
+    now = Date.UTC(2026, 10, 26, 9);
+    const s = fakeState();
+    mo = new MemoryObject(s.state as never, fakeEnv(() => JSON.stringify({ facts: [], entities: [] })).env as never);
+    await seed(mo);
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    mo.setWall(claudeCode, "globex", ["project:globex"]);
+  });
+
+  it("give a conversation that read one wall nothing from another, and serve a new conversation", async () => {
+    const ctx = await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "sess-a" });
+    expect(ctx.text).toContain("60,000 euros");
+    expect(ctx.conversation).toBeUndefined();
+
+    const refused = await tool(mo, claudeCode, "recall", { query: "budget euros", project: "globex", conversation: "sess-a" });
+    expect(count(refused.results, "project:globex")).toBe(0);
+    expect(refused.text).toContain('Not searched: project:globex is behind a wall and this conversation has already been given memory from "acme". Use a new conversation for it.');
+    // The profile and projects outside every wall are still served.
+    expect(count(refused.results, "profile")).toBe(1);
+    expect(count(refused.results, "project:site")).toBe(0); // named project only: site is not asked for
+
+    const ctxOther = await tool(mo, claudeCode, "get_context", { project: "globex", conversation: "sess-a" });
+    expect(ctxOther.text).not.toContain("40,000 euros");
+    expect(ctxOther.notices?.[0]).toContain("Not searched: project:globex");
+
+    const fresh = await tool(mo, claudeCode, "recall", { query: "budget euros", project: "globex", conversation: "sess-b" });
+    expect(count(fresh.results, "project:globex")).toBe(1);
+    expect(count(fresh.results, "project:acme")).toBe(0);
+    // The same wall again is fine.
+    const again = await tool(mo, claudeCode, "recall", { query: "budget euros", project: "acme", conversation: "sess-a" });
+    expect(count(again.results, "project:acme")).toBe(1);
+  });
+
+  it("without a handle, count the connector as inside the wall for 30 minutes", async () => {
+    await tool(mo, claudeCode, "recall", { query: "budget euros", project: "acme" });
+    const refused = await tool(mo, claudeCode, "recall", { query: "budget euros", project: "globex" });
+    expect(count(refused.results, "project:globex")).toBe(0);
+    expect(refused.notices?.some((n) => n.includes('"acme"'))).toBe(true);
+    // Another connector is a different conversation.
+    const other = await tool(mo, cursor, "recall", { query: "budget euros", project: "globex" });
+    expect(count(other.results, "project:globex")).toBe(1);
+    now += 31 * 60_000;
+    const later = await tool(mo, claudeCode, "recall", { query: "budget euros", project: "globex" });
+    expect(count(later.results, "project:globex")).toBe(1);
+  });
+
+  it("hand out a handle from get_context only while walls are set", async () => {
+    const withWalls = await tool(mo, cursor, "get_context", { project: "site" });
+    expect(withWalls.conversation).toMatch(/^[0-9a-z]+$/);
+    expect(withWalls.text).toContain(`Conversation handle: ${withWalls.conversation}.`);
+    mo.setWall(claudeCode, "acme", []);
+    mo.setWall(claudeCode, "globex", []);
+    const without = await tool(mo, cursor, "get_context", { project: "site" });
+    expect(without.conversation).toBeUndefined();
+    expect(without.text).not.toContain("Conversation handle");
+  });
+
+  it("start a handle from get_context with what the connector was given in the last 30 minutes", async () => {
+    await tool(mo, claudeCode, "recall", { query: "budget euros", project: "acme" });
+    const ctx = await tool(mo, claudeCode, "get_context", { project: "globex" });
+    expect(ctx.text).not.toContain("40,000 euros");
+    const res = await tool(mo, claudeCode, "recall", { query: "budget euros", project: "globex", conversation: ctx.conversation });
+    expect(count(res.results, "project:globex")).toBe(0);
+  });
+
+  it("keep what a walled conversation remembers inside the wall, held for the person", async () => {
+    await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "sess-a" });
+    const toProfile = await tool(mo, claudeCode, "remember", { content: "The user charges Acme a day rate of 900 euros.", scope: "profile", conversation: "sess-a" });
+    expect(toProfile.scope).toBe("project:acme");
+    expect(toProfile.heldFor).toBe("profile");
+    expect(toProfile.text).toContain("Kept in project:acme");
+    const toGlobex = await tool(mo, claudeCode, "remember", { content: "Globex should get the same offer.", scope: "project", project: "globex", conversation: "sess-a" });
+    expect(toGlobex).toMatchObject({ scope: "project:acme", heldFor: "project:globex" });
+    const inside = await tool(mo, claudeCode, "remember", { content: "Acme wants weekly updates.", scope: "project", project: "acme", conversation: "sess-a" });
+    expect(inside).toMatchObject({ scope: "project:acme", heldFor: undefined });
+    expect(inside.text).toContain("Remembered in project:acme");
+    expect(mo.listHeld(claudeCode).map((h) => [h.content, h.to, h.via])).toEqual([
+      ["The user charges Acme a day rate of 900 euros.", "profile", "remember"],
+      ["Globex should get the same offer.", "project:globex", "remember"],
+    ]);
+    // A conversation that read no wall writes where it asks to.
+    const clean = await tool(mo, cursor, "remember", { content: "The user likes short offers.", scope: "profile", conversation: "sess-c" });
+    expect(clean.text).toContain("Remembered in profile");
+  });
+});
+
+describe("walls and conversations saved or imported from behind a wall", () => {
+  let mo: MemoryObject;
+  let db: ReturnType<typeof fakeState>["db"];
+  const settle = async () => {
+    for (let i = 0; i < 12; i++) {
+      now += 5_000;
+      await mo.alarm();
+    }
+  };
+  const messages = [
+    { role: "user", content: "RATE: for Acme I bill 900 euros a day, and their Orion launch is fixed for March 3." },
+    { role: "assistant", content: "Noted." },
+  ];
+
+  beforeEach(async () => {
+    now = Date.UTC(2026, 10, 26, 9);
+    const s = fakeState();
+    db = s.db;
+    mo = new MemoryObject(s.state as never, fakeEnv(extract).env as never);
+    await mo.addNote(claudeCode, { scope: "project:acme", content: "Acme's budget for the Orion feature is 60,000 euros.", kind: "fact", trust: "user_confirmed" });
+    await settle();
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    mo.setWall(claudeCode, "globex", ["project:globex"]);
+  });
+
+  it("save a walled conversation inside its wall, and hold what is extracted from it", async () => {
+    await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "sess-a" });
+    const saved = await tool(mo, claudeCode, "save_conversation", { project: "globex", messages, conversation: "sess-a" });
+    expect(saved.scope).toBe("project:acme");
+    expect(saved.text).toContain("instead of project:globex");
+    await settle();
+    expect((db.prepare("SELECT DISTINCT scope FROM items WHERE kind = 'chunk'").all() as { scope: string }[]).map((r) => r.scope)).toEqual(["project:acme"]);
+    expect(mo.listHeld(claudeCode).map((h) => [h.content, h.to, h.via])).toEqual([["The user charges Acme a day rate of 900 euros.", "profile", "extraction"]]);
+    const globex = await tool(mo, cursor, "recall", { query: "day rate euros Orion", project: "globex" });
+    expect(globex.text).not.toContain("900 euros");
+  });
+
+  it("treat a session id that was not used on reads like the connector's last 30 minutes", async () => {
+    await tool(mo, claudeCode, "recall", { query: "budget", project: "acme", conversation: "handle-from-context" });
+    const saved = await tool(mo, claudeCode, "save_conversation", { messages, session_id: "agent-session-1" });
+    expect(saved.scope).toBe("project:acme");
+    // A conversation that read no wall is saved where it asks to be.
+    const other = await tool(mo, cursor, "save_conversation", { messages, session_id: "agent-session-2" });
+    expect(other.scope).toBe("agent:cursor");
+  });
+
+  it("import notes from a walled conversation inside the wall, held", async () => {
+    await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "sess-a" });
+    const res = await tool(mo, claudeCode, "import_memory_file", { content: "- Prefers dark mode.\n- Uses tabs.", format: "markdown", scope: "profile", conversation: "sess-a" });
+    expect(res).toMatchObject({ scope: "project:acme", heldFor: "profile" });
+    expect(mo.listHeld(claudeCode).map((h) => [h.to, h.via])).toEqual([["profile", "import"], ["profile", "import"]]);
   });
 });
