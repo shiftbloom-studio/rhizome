@@ -20,6 +20,7 @@ const EXTRACTIONS: Record<string, unknown> = {
   PNPM: { facts: [{ statement: PNPM, kind: "preference", scope: "profile", trust: "user_explicit", entities: [] }], entities: [] },
   BUN: { facts: [{ statement: BUN, kind: "preference", scope: "profile", trust: "user_explicit", relation: "update", related: 0, entities: [] }], entities: [] },
   ACME: { facts: [{ statement: "Acme deploys on Fridays.", kind: "fact", scope: "project", trust: "user_explicit", entities: [] }], entities: [] },
+  GLOBEX: { facts: [{ statement: "Globex reviews every release.", kind: "fact", scope: "project", trust: "user_explicit", entities: [] }], entities: [] },
   MONDAY: { facts: [{ statement: "Acme deploys on Mondays.", kind: "fact", scope: "project", trust: "user_explicit", relation: "update", related: 0, entities: [] }], entities: [] },
 };
 
@@ -169,6 +170,32 @@ describe("ledger", () => {
     expect((await tool(mo, claudeCode, "get_context", {})).corrections).toBeUndefined();
     const inProject = await tool(mo, claudeCode, "get_context", { project: "acme" });
     expect(inProject.corrections?.join("\n")).toContain("Acme deploys on Mondays.");
+  });
+
+  it("keeps corrections inside their wall", async () => {
+    const { mo } = setup("on");
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    mo.setWall(claudeCode, "globex", ["project:globex"]);
+    await say(mo, claudeCode, "project:acme", "ACME ships its deploys on Fridays");
+    await say(mo, claudeCode, "project:globex", "GLOBEX wants a review for every release");
+    expect((await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "c-acme" })).text).toContain("Acme deploys on Fridays.");
+    await say(mo, claudeCode, "project:acme", "MONDAY is the deploy day for Acme from now on");
+
+    // A conversation behind the other wall, or one that names no project, hears nothing of it.
+    const globex = await tool(mo, claudeCode, "get_context", { project: "globex", conversation: "c-globex" });
+    expect(globex.corrections).toBeUndefined();
+    expect(globex.text).toContain("Globex reviews every release.");
+    expect(globex.text).not.toContain("Acme");
+    expect((await tool(mo, claudeCode, "recall", { query: "deploy day", conversation: "c-plain" })).corrections).toBeUndefined();
+    // The globex conversation naming acme is kept out of the second wall, corrections included.
+    const crossing = await tool(mo, claudeCode, "recall", { query: "deploy day", project: "acme", conversation: "c-globex" });
+    expect(crossing.corrections).toBeUndefined();
+    expect(crossing.text).not.toContain("Mondays");
+
+    // Inside the wall it is told, once.
+    const inside = await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "c-acme" });
+    expect(inside.corrections?.join("\n")).toContain("Acme deploys on Mondays.");
+    expect((await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "c-acme" })).corrections).toBeUndefined();
   });
 
   it("does not record recall as of a past time", async () => {
