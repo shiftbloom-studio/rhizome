@@ -32,7 +32,10 @@
     "OPERATOR_COUNTRY_DE": "<OPERATOR_COUNTRY_DE?>",
     "OPERATOR_EMAIL": "<OPERATOR_EMAIL?>",
     "OPERATOR_PHONE": "<OPERATOR_PHONE?>",
-    "SUPERVISORY_AUTHORITY": "<SUPERVISORY_AUTHORITY?>"
+    "SUPERVISORY_AUTHORITY": "<SUPERVISORY_AUTHORITY?>",
+    // Every optional recall step on (see README), and conversations cut into rounds.
+    "RECALL_FEATURES": "all",
+    "CHUNKING": "rounds"
   },
   "ai": { "binding": "AI" },
   "durable_objects": { "bindings": [{ "name": "MEMORY", "class_name": "MemoryObject" }] },
@@ -49,6 +52,6 @@
   ]
   // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Enables the /v1/admin endpoints.
   // Sign-in without Cloudflare Access: AUTH_MODE=password with LOGIN_EMAIL, plus the secrets LOGIN_PASSWORD and SESSION_SECRET.
-  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT, RECALL_FEATURES, CHUNKING.
+  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT.
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }

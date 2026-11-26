@@ -139,7 +139,7 @@ Recall leaves out superseded and archived notes, and returns disputed ones with 
 
 Set `CHUNKING=rounds` to cut new conversations into rounds (a question with its answers, short rounds joined) instead of fixed 1,200-character excerpts.
 
-Optional recall steps are off until you turn them on, per request with `features` or for every request with the `RECALL_FEATURES` variable (comma separated, or `all`):
+Optional recall steps are chosen per request with `features` or for every request with the `RECALL_FEATURES` variable (comma separated, or `all`). The Cloudflare config in `wrangler.jsonc` turns all of them on, together with `CHUNKING=rounds`; without the variable (for example on Node) they are off. `features: []` runs a single request without them:
 
 * `abstain`: returns nothing (`abstained: true`) when no result shares a keyword with the query and none is semantically close.
 * `diversity`: at most one excerpt per conversation, and near-identical results make room for different ones.
