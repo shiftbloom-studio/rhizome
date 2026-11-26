@@ -67,9 +67,10 @@ Everything runs inside the person's Durable Object, triggered by its alarm, with
    * Importance is recomputed from trust, confirmations, recall count and a decay whose half-life depends on trust (a year for what you said, two months for an agent's guess).
    * Episode chunks that are older than a year, were never recalled and are unimportant are archived. Their raw episode stays in R2.
    * Duplicates the day produced are merged.
+   * With `DISPUTE_RESOLUTION=on`, disputed notes are settled over time. What you said or confirmed wins over a guess, and of two things you said the later one wins. The remaining pairs, at most 20 a night, go to the extraction model in one request, which says whether the newer note replaces the older one (something changed, or an open question got answered), the newer one is wrong, both hold, or it can't tell; a pair it can't tell waits a week. A note replaced over time keeps its history and its validity ends where the newer one starts; a note that was wrong only expires. Every settled pair is in the activity log as `dispute.settle`.
    * GLM 5.3 rewrites the `distilled-profile` block from the profile notes, and a `summary` block for each changed project. It only runs when the notes changed.
 
-Set `EXTRACTION=off` to store episodes without extraction, and `EXTRACTION_MODEL` or `REFLECTION_MODEL` to use other Workers AI models. At most `EXTRACTION_DAILY_LIMIT` episodes (default 200) per person and UTC day go through extraction; the rest are stored and searchable without extracted notes.
+Set `EXTRACTION=off` to store episodes without extraction (disputes are then only settled where trust decides), and `EXTRACTION_MODEL` or `REFLECTION_MODEL` to use other Workers AI models. At most `EXTRACTION_DAILY_LIMIT` episodes (default 200) per person and UTC day go through extraction; the rest are stored and searchable without extracted notes.
 
 ## Memory explorer
 

@@ -30,6 +30,8 @@ export interface BenchOptions {
   vars?: Record<string, string>;
   /** Extract notes from every session. Default off: recall searches the session chunks only. */
   extraction?: boolean;
+  /** Run one reflection after a question's sessions, before recall. Default off. */
+  reflect?: boolean;
   /** Recall steps, sent with every recall (RecallInput.features). Unset: the memory code's default (RECALL_FEATURES); [] turns all off. */
   features?: string[];
   /** Episode chunking, sent with every session (EpisodeInput.chunking). Unset: the memory code's default (CHUNKING). */
@@ -203,7 +205,12 @@ async function runQuestion(q: Question, opts: BenchOptions, runId: string, store
       sessionOf.set(res.id, sessionId);
       chunks += res.chunks;
     }
-    const stats = await waitIdle(stub, client, opts.idleTimeoutMs ?? (opts.extraction ? 3_600_000 : 900_000));
+    const idleMs = opts.idleTimeoutMs ?? (opts.extraction ? 3_600_000 : 900_000);
+    let stats = await waitIdle(stub, client, idleMs);
+    if (opts.reflect) {
+      await stub.requestReflection(client);
+      stats = await waitIdle(stub, client, idleMs);
+    }
     const ingestMs = Date.now() - started;
 
     // The question is asked at its own date: time words resolve against it, and with asOf only what was true then counts.

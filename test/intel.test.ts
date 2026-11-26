@@ -12,11 +12,13 @@ import {
   parseJsonObject,
   relatedNotes,
   relatedSection,
+  settleByTrust,
   shouldArchive,
   targetScope,
   validateExtraction,
   validateNoteEntities,
   validateRelations,
+  validateVerdicts,
 } from "../src/intel";
 
 const DAY = 86_400_000;
@@ -185,5 +187,21 @@ describe("time and related memory", () => {
     expect(closeValidity(500, 300, 900)).toBe(500);
     expect(closeValidity(null, null, 900)).toBe(900);
     expect(closeValidity(100, null, 900)).toBe(900);
+  });
+});
+
+describe("dispute settling", () => {
+  it("lets the person win over a guess, and the later of two things the person said", () => {
+    expect(settleByTrust("user_explicit", "agent_inference")).toBe("older");
+    expect(settleByTrust("agent_inference", "user_confirmed")).toBe("newer");
+    expect(settleByTrust("user_explicit", "user_confirmed")).toBe("newer");
+    expect(settleByTrust("user_confirmed", "user_explicit")).toBe("newer");
+    expect(settleByTrust("agent_inference", "tool")).toBeNull();
+    expect(settleByTrust("agent_inference", "agent_inference")).toBeNull();
+  });
+
+  it("reads verdicts and falls back to unsure", () => {
+    expect(validateVerdicts({ results: [{ pair: 1, verdict: "newer" }, { pair: 0, verdict: "maybe" }, { pair: 7, verdict: "older" }] }, 2)).toEqual(["unsure", "newer"]);
+    expect(() => validateVerdicts({}, 1)).toThrow();
   });
 });

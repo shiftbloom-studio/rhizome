@@ -33,6 +33,7 @@ Run the same command with the same `--out` to continue a stopped run; finished q
 | Option | Effect |
 | --- | --- |
 | `--extraction` | Extracts notes from every session, as in production. Without it, recall searches the session chunks only. |
+| `--reflect` | Runs one nightly reflection per question after its sessions, before recall. Use it with `--extraction`; compare `--set DISPUTE_RESOLUTION=on` against `off` to measure dispute resolution. Each reflection can also call the reflection model once for the profile summary. |
 | `--features <list>` | Recall steps for every recall, or `none`. Default: `RECALL_FEATURES` from the Worker's vars in `wrangler.jsonc`, so a run measures what is deployed. |
 | `--chunking <mode>` | Episode chunking. Default: `CHUNKING` from the Worker's vars. |
 | `--set KEY=VALUE` | Any other variable for the memory code, e.g. `EMBEDDING_MODEL`. |
@@ -77,5 +78,5 @@ The Benchmark workflow (Actions > Benchmark > Run workflow) runs the same comman
 ## How this differs from production
 
 * Vector search is exact, while Vectorize is approximate and makes new vectors searchable after about a minute. A run measures ranking, not Vectorize.
-* A question replays months of sessions within minutes, so the nightly reflection (merging, decay, summaries) does not run between them.
+* A question replays months of sessions within minutes, so the nightly reflection (merging, decay, summaries, disputes) does not run between them. `--reflect` runs it once, after the last session.
 * The dataset's dates have no time zone and are read as UTC.
