@@ -76,7 +76,10 @@ const claude: Client = { id: "c1", userId: "u1", name: "Claude Code", agent: "cl
 function generate(_model: string, system: string, user: string): string {
   if (system === EXTRACTION_PROMPT && user.includes("EDITOR")) {
     return JSON.stringify({
-      facts: [{ statement: "The user's favourite editor is Zed.", kind: "preference", scope: "profile", trust: "user_explicit", entities: [] }],
+      facts: [
+        { statement: "The user's favourite editor is Zed.", kind: "preference", scope: "profile", trust: "user_explicit", entities: [] },
+        { statement: "The user values a fast rust based editor.", kind: "preference", scope: "profile", trust: "user_explicit", entities: [] },
+      ],
       entities: [],
     });
   }
@@ -247,7 +250,7 @@ describe("MemoryObject recall steps", () => {
     for (const n of ["apples", "pears", "plums", "cherries", "grapes", "melons"]) await mo.addNote(claude, { scope: "profile", content: `The user buys ${n}.` });
     await settle();
     const chunk = db.prepare("SELECT id FROM items WHERE kind = 'chunk'").get() as { id: string };
-    expect(db.prepare("SELECT keys FROM chunk_keys").all()).toEqual([{ keys: "The user's favourite editor is Zed." }]);
+    expect(db.prepare("SELECT keys FROM chunk_keys").all()).toEqual([{ keys: "The user's favourite editor is Zed.\nThe user values a fast rust based editor." }]);
 
     const without = await mo.recall(claude, { query: "Zed", scopes: ["profile"], rerank: false });
     expect(without.items.map((i) => i.id)).not.toContain(chunk.id);
@@ -258,11 +261,19 @@ describe("MemoryObject recall steps", () => {
     db.prepare("DELETE FROM chunk_keys").run();
     await mo.requestReflection();
     await settle();
-    expect(db.prepare("SELECT keys FROM chunk_keys").all()).toEqual([{ keys: "The user's favourite editor is Zed." }]);
+    expect(db.prepare("SELECT keys FROM chunk_keys").all()).toEqual([{ keys: "The user's favourite editor is Zed.\nThe user values a fast rust based editor." }]);
+
+    // Forgetting the note removes its wording from the excerpt's keys.
+    const web = { ...claude, id: "web:u1", grants: { read: ["profile"], write: ["profile"] } };
+    const note = db.prepare("SELECT id FROM items WHERE content = ?").get("The user's favourite editor is Zed.") as { id: string };
+    await mo.forget(web, note.id);
+    expect(db.prepare("SELECT keys FROM chunk_keys").all()).toEqual([{ keys: "The user values a fast rust based editor." }]);
+    const gone = await mo.recall(claude, { query: "Zed", scopes: ["profile"], rerank: false, features: ["keys"] });
+    expect(gone.items.map((i) => i.id)).not.toContain(chunk.id);
 
     // Forgetting the episode removes its keys.
     const ep = db.prepare("SELECT id FROM episodes").get() as { id: string };
-    await mo.forget({ ...claude, id: "web:u1", grants: { read: ["profile"], write: ["profile"] } }, ep.id);
+    await mo.forget(web, ep.id);
     expect(db.prepare("SELECT COUNT(*) AS n FROM chunk_keys").get()).toEqual({ n: 0 });
   });
 });

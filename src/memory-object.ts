@@ -832,7 +832,15 @@ export class MemoryObject extends DurableObject<Env> {
     const item = this.sql.exec("SELECT scope FROM items WHERE id = ?", id).toArray()[0];
     if (!item) return { deleted: 0 };
     if (!can(client, "write", String(item.scope))) throw new ForbiddenError(String(item.scope));
+    // Fact keys hold the note's wording on its source excerpts: drop them, then rebuild from the notes that stay.
+    const sources = this.sql
+      .exec("SELECT dst FROM links WHERE src = ? AND kind = 'derived_from'", id)
+      .toArray()
+      .map((r) => String(r.dst));
     this.ctx.storage.transactionSync(() => {
+      for (const ep of sources) {
+        this.sql.exec("DELETE FROM chunk_keys WHERE rowid IN (SELECT rowid FROM items WHERE episode_id = ? AND kind = 'chunk')", ep);
+      }
       this.dropDerived(id);
       // Anything that pointed at the forgotten item as its newer version becomes current again.
       this.sql.exec("UPDATE items SET status = 'active', superseded_by = NULL, valid_to = NULL, expired_at = NULL WHERE superseded_by = ?", id);
@@ -841,6 +849,7 @@ export class MemoryObject extends DurableObject<Env> {
       this.audit(client, "forget.item", { id });
       this.dropOrphanEntities();
     });
+    for (const ep of sources) this.rebuildFactKeys(ep);
     await this.kick();
     return { deleted: 1 };
   }
@@ -1433,24 +1442,26 @@ export class MemoryObject extends DurableObject<Env> {
       )
       .toArray();
     let keyed = 0;
-    for (const ep of episodes) {
-      const notes = this.sql
-        .exec(
-          `SELECT n.content, e.vec FROM links l JOIN items n ON n.id = l.src AND n.kind = 'note'
-           LEFT JOIN embeddings e ON e.item_id = n.id AND e.model = ?
-           WHERE l.dst = ? AND l.kind = 'derived_from' LIMIT 50`,
-          this.embeddingModel,
-          ep.id,
-        )
-        .toArray();
-      if (notes.length === 0) continue;
-      const vectors = notes.map((n) => (n.vec ? Array.from(decodeVector(n.vec as ArrayBuffer)) : undefined));
-      // assignFactKeys uses cosine only when every fact and excerpt has an embedding.
-      const statements = notes.map((n) => String(n.content));
-      this.storeFactKeys(String(ep.id), statements, vectors.every(Boolean) ? (vectors as number[][]) : []);
-      keyed++;
-    }
+    for (const ep of episodes) if (this.rebuildFactKeys(String(ep.id))) keyed++;
     return keyed;
+  }
+
+  /** Fact keys of one episode from the notes currently derived from it. False when it has none. */
+  private rebuildFactKeys(episodeId: string): boolean {
+    const notes = this.sql
+      .exec(
+        `SELECT n.content, e.vec FROM links l JOIN items n ON n.id = l.src AND n.kind = 'note'
+         LEFT JOIN embeddings e ON e.item_id = n.id AND e.model = ?
+         WHERE l.dst = ? AND l.kind = 'derived_from' LIMIT 50`,
+        this.embeddingModel,
+        episodeId,
+      )
+      .toArray();
+    if (notes.length === 0) return false;
+    const vectors = notes.map((n) => (n.vec ? Array.from(decodeVector(n.vec as ArrayBuffer)) : undefined));
+    // assignFactKeys uses cosine only when every fact and excerpt has an embedding.
+    this.storeFactKeys(episodeId, notes.map((n) => String(n.content)), vectors.every(Boolean) ? (vectors as number[][]) : []);
+    return true;
   }
 
   /**
