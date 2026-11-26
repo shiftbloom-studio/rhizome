@@ -16,6 +16,7 @@ import {
   shouldAbstain,
   splitTurns,
   turnUnits,
+  wideWindow,
 } from "../src/recall";
 import { chunk, roundChunks, transcript } from "../src/text";
 import type { Client } from "../src/scopes";
@@ -147,6 +148,20 @@ describe("recall helpers", () => {
     expect(fillCards(units, 1000, 2).map((x) => x.key)).toEqual(["a", "a", "a", "b"]);
     // The first unit always comes, even over the budget.
     expect(fillCards(units, 10, 8).map((x) => x.key)).toEqual(["a"]);
+    // The best three units show their wider text when it fits.
+    const wide = [1, 0.9, 0.8, 0.7].map((score, i) => ({ key: `k${i}`, score, text: "short", wide: "w".repeat(400) }));
+    expect(fillCards(wide, 1000, 8).map((x) => x.text.length)).toEqual([400, 400, 400, 5]);
+    // Wider text only where it fits: the second one would not, so it shows its short text.
+    expect(fillCards(wide, 150, 8).map((x) => x.text.length)).toEqual([400, 5, 5]);
+  });
+
+  it("widens a window of a reply with the sentences that follow it", () => {
+    const reply = "Here are options.\n1. First idea.\n2. Second idea.\n3. Third idea.\n4. Fourth idea.";
+    expect(wideWindow(reply, 0)).toEqual({ text: "Here are options. 1. First idea. 2. Second idea. 3. Third idea. 4. Fourth idea.", last: true });
+    expect(wideWindow(reply, 0, 50)).toEqual({ text: "Here are options. 1. First idea. 2. Second idea.", last: false });
+    const units = turnUnits("e", [{ role: "assistant", content: reply }], [keywordTerms("options")]);
+    expect(units[0]!.text).toBe("[assistant] Here are options. 1. First idea. …");
+    expect(units[0]!.wide).toBe("[assistant] Here are options. 1. First idea. 2. Second idea. 3. Third idea. 4. Fourth idea.");
   });
 });
 

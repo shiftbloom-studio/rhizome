@@ -219,6 +219,9 @@ const MAX_TURN_PIECES = 20;
 const REPLY_CHARS = 200;
 /** Of a reply, one window of two sentences is shown, at most this long. */
 const WINDOW_CHARS = 400;
+/** The best few units of a recall (WIDE_UNITS) show more of a reply: the window and what follows, up to this length. */
+const WIDE_CHARS = 800;
+export const WIDE_UNITS = 3;
 /** Estimated tokens for a card's header line and for each further turn on it. */
 const CARD_TOKENS = 12;
 const PART_TOKENS = 2;
@@ -275,15 +278,29 @@ export function splitTurns(text: string): Turn[] {
   return before ? [{ role: "text", content: before }, ...turns] : turns;
 }
 
-/** Windows of two sentences each (lines count as sentences), at most WINDOW_CHARS long. */
-export function sentenceWindows(text: string): string[] {
-  const sentences = text
-    .split(/(?<=[.!?])\s+|\n+/)
+/** Sentences and lines of a text. The number of a numbered list item ("1. ") stays with its item. */
+function sentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])(?<!(?:^|\n)[ \t]*\d{1,3}\.)\s+|\n+/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/** Windows of two sentences each (lines count as sentences), at most WINDOW_CHARS long. */
+export function sentenceWindows(text: string): string[] {
+  const all = sentences(text);
   const out: string[] = [];
-  for (let i = 0; i < sentences.length; i += 2) out.push(sentences.slice(i, i + 2).join(" ").slice(0, WINDOW_CHARS));
+  for (let i = 0; i < all.length; i += 2) out.push(all.slice(i, i + 2).join(" ").slice(0, WINDOW_CHARS));
   return out;
+}
+
+/** Window `index` of sentenceWindows() and the sentences after it, up to `max` characters. */
+export function wideWindow(text: string, index: number, max = WIDE_CHARS): { text: string; last: boolean } {
+  const all = sentences(text);
+  let end = Math.min(all.length, index * 2 + 2);
+  let out = all.slice(index * 2, end).join(" ");
+  while (end < all.length && out.length + 1 + all[end]!.length <= max) out += ` ${all[end++]}`;
+  return { text: out.slice(0, max), last: end >= all.length && out.length <= max };
 }
 
 /** One candidate piece of a turn card: a user turn (or a piece of a long one), or one window of a reply. */
@@ -296,6 +313,8 @@ export interface CardUnit {
   text: string;
   /** What the reranker scores. */
   rank: string;
+  /** For a window of a reply: more of it, shown when the unit is among the best WIDE_UNITS. */
+  wide?: string;
 }
 
 const coverage = (terms: string[][], text: string) => Math.max(0, ...terms.map((t) => keywordCoverage(t, text)));
@@ -334,7 +353,10 @@ export function turnUnits(key: string, turns: Turn[], terms: string[][]): CardUn
       }
     });
     const text = `[${t.role}] ${best > 0 ? "… " : ""}${windows[best]}${best < windows.length - 1 ? " …" : ""}`;
-    out.push({ key, order: i * 1000 + best, text, rank: text });
+    const wide = wideWindow(body, best);
+    const unit: CardUnit = { key, order: i * 1000 + best, text, rank: text };
+    if (wide.text.length > windows[best]!.length) unit.wide = `[${t.role}] ${best > 0 ? "… " : ""}${wide.text}${wide.last ? "" : " …"}`;
+    out.push(unit);
   });
   return out;
 }
@@ -348,10 +370,12 @@ export function unitScore(rerank: number, maxRerank: number, terms: string[][], 
  * Picks units best first until the token budget is spent, with at most
  * `maxCards` cards (a unit's key is its card). There is no cap per card and no
  * floor relative to the best unit: a conversation can bring several turns, and a
- * question spread over many conversations still gets all of them. The first
- * unit is always taken. Returns the picked units, best first.
+ * question spread over many conversations still gets all of them. The best
+ * WIDE_UNITS units show their wider text when they have one and it fits. The
+ * first unit is always taken. Returns the picked units, best first, with the
+ * text they show.
  */
-export function fillCards<T extends { key: string; text: string; score: number }>(units: T[], budget: number, maxCards: number): T[] {
+export function fillCards<T extends { key: string; text: string; score: number; wide?: string }>(units: T[], budget: number, maxCards: number): T[] {
   const order = [...units].sort((a, b) => b.score - a.score);
   const open = new Set<string>();
   const out: T[] = [];
@@ -359,11 +383,13 @@ export function fillCards<T extends { key: string; text: string; score: number }
   for (const u of order) {
     const fresh = !open.has(u.key);
     if (fresh && open.size >= maxCards) continue;
-    const cost = cardCost(u.text, fresh);
+    const wide = u.wide && out.length < WIDE_UNITS && used + cardCost(u.wide, fresh) <= budget ? u.wide : undefined;
+    const text = wide ?? u.text;
+    const cost = cardCost(text, fresh);
     if (used + cost > budget && out.length > 0) continue;
     used += cost;
     open.add(u.key);
-    out.push(u);
+    out.push(wide ? { ...u, text } : u);
   }
   return out;
 }
