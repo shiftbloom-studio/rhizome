@@ -18,7 +18,7 @@ afterAll(() => vi.restoreAllMocks());
 type Body = { result?: { tools?: { name: string }[]; content: { text: string }[]; isError?: boolean; structuredContent?: Record<string, unknown> }; error?: { message: string } };
 let rpcId = 0;
 async function rpc(memory: MemoryObject, client: Client, method: string, params: Record<string, unknown>, loops: boolean) {
-  const res = await mcpResponse(memory as unknown as MemoryApi, client, { jsonrpc: "2.0", id: ++rpcId, method, params }, "test", { loops });
+  const res = await mcpResponse(memory as unknown as MemoryApi, client, { jsonrpc: "2.0", id: ++rpcId, method, params }, "test", undefined, { loops });
   return (await res.json()) as Body;
 }
 async function tool(memory: MemoryObject, client: Client, name: string, args: Record<string, unknown>, loops = true) {
