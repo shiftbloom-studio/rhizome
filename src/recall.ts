@@ -398,3 +398,46 @@ export function fillCards<T extends { key: string; text: string; score: number; 
 export function cardCost(text: string, opensCard: boolean): number {
   return estimateTokens(text) + (opensCard ? CARD_TOKENS : PART_TOKENS);
 }
+
+/**
+ * Shares `room` reranker slots among the conversations, best conversation first,
+ * so one very long conversation cannot crowd out the others. A conversation that
+ * needs less than its share leaves the rest to the others. When a conversation
+ * gets fewer slots than it has units, it keeps the units with the highest
+ * `priority`, in their order on the card.
+ */
+export function shareUnits<T>(groups: T[][], room: number, priority: (unit: T, group: number) => number): T[] {
+  const take = groups.map(() => 0);
+  let left = Math.max(0, room);
+  let open = groups.map((_, i) => i).filter((i) => groups[i]!.length > 0);
+  while (left > 0 && open.length) {
+    const share = Math.max(1, Math.floor(left / open.length));
+    for (const i of open) {
+      if (left === 0) break;
+      const add = Math.min(share, groups[i]!.length - take[i]!, left);
+      take[i]! += add;
+      left -= add;
+    }
+    open = open.filter((i) => take[i]! < groups[i]!.length);
+  }
+  return groups.flatMap((g, i) =>
+    g.length <= take[i]!
+      ? g
+      : g
+          .map((u, j) => ({ u, j, p: priority(u, i) }))
+          .sort((a, b) => b.p - a.p || a.j - b.j)
+          .slice(0, take[i])
+          .sort((a, b) => a.j - b.j)
+          .map((x) => x.u),
+  );
+}
+
+/**
+ * How much a unit deserves a reranker slot when its conversation is too long for
+ * all of them: it is part of the conversation's best excerpt (1), plus the share
+ * of the query's keywords it holds.
+ */
+export function unitPriority(unit: Pick<CardUnit, "text">, lead: string, terms: string[][]): number {
+  const body = unit.text.replace(/^\[[^\]\n]{1,32}\] /, "").replace(/^… /, "").replace(/ …$/, "").slice(0, 200);
+  return (body && lead.includes(body) ? 1 : 0) + coverage(terms, unit.text);
+}
