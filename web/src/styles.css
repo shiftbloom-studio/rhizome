@@ -131,6 +131,9 @@ code { font: 13px var(--mono); background: var(--blush); padding: 1px 5px; borde
 .tip-text { font-size: 13px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .selected-ring { display: block; width: 34px; height: 34px; border-radius: 50%; border: 1.5px solid var(--bloom); animation: breathe 6s ease-in-out infinite; }
 @keyframes breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.02); } }
+/* Sent out once where a search or selection lands. Invisible without the animation, so reduced motion shows nothing. */
+.ripple { display: block; width: 30px; height: 30px; border-radius: 50%; border: 1.5px solid var(--bloom); opacity: 0; animation: ripple 900ms var(--exit) forwards; }
+@keyframes ripple { from { opacity: 0.7; transform: scale(0.4); } to { opacity: 0; transform: scale(2.6); } }
 
 .empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-width: 420px; text-align: center; padding-left: 280px; }
 .center-message { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; text-align: center; padding: 24px; max-width: 560px; margin: 0 auto; }

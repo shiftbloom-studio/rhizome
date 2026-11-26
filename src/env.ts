@@ -27,6 +27,11 @@ export interface Env {
    * extraction model about the pairs the trust ladder cannot decide (at most 20 a night). Default: off.
    */
   DISPUTE_RESOLUTION?: string;
+  /**
+   * "on": the ledger records which connector was given which memory and tells it once,
+   * on its next get_context or recall, when that memory was replaced or deleted. Default: off.
+   */
+  LEDGER?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
   /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: off. */

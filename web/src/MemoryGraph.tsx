@@ -10,6 +10,9 @@ import { Html, OrbitControls } from "@react-three/drei";
 import { forceCenter, forceLink, forceManyBody, forceSimulation, forceX, forceY, forceZ, type SimNode } from "d3-force-3d";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import type { Graph, GraphEdge, GraphNode, NodeType } from "./types";
 
@@ -22,7 +25,15 @@ export const TRUST_COLOR: Record<string, string> = {
 };
 const EPISODE_COLOR = "#B9AEB2";
 const ENTITY_COLOR = "#1A1216";
-const EDGE_COLOR = "#1A1216";
+// Links are drawn as rose-tinted glass: a thin core inside a wide, faint halo, both translucent.
+// Plain links are Root Red faded far toward the paper, so they read as pale rose threads; stronger
+// similarity fades less. History links (supersedes and so on) keep a deep, nearly unfaded red.
+const EDGE_COLOR = "#C81040";
+const HISTORY_COLOR = "#8A0B2C";
+/** The colour links take on when they belong to the selection or a search hit. */
+const EDGE_ACTIVE = "#FF2E52";
+const EDGE_CORE = { width: 1, opacity: 0.85 };
+const EDGE_HALO = { width: 4.5, opacity: 0.08, tint: "#FF8FAB" };
 const RED_EDGES = new Set(["supersedes", "merged_into", "contradicts"]);
 const SPARK_COLOR = "#FF2E52";
 /** How close (in CSS pixels) the pointer has to be to a node to hover or pick it. */
@@ -109,10 +120,11 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
   const { camera } = useThree();
   const controls = useRef<OrbitControlsImpl>(null);
   const meshes = { note: useRef<THREE.InstancedMesh>(null), episode: useRef<THREE.InstancedMesh>(null), entity: useRef<THREE.InstancedMesh>(null) };
-  const lines = useRef<THREE.LineSegments>(null);
   const [hovered, setHovered] = useState<Node3 | null>(null);
   const born = useRef(performance.now());
-  const fly = useRef<{ from: THREE.Vector3; to: THREE.Vector3; camFrom: THREE.Vector3; camTo: THREE.Vector3; start: number } | null>(null);
+  const fly = useRef<{ from: THREE.Vector3; to: THREE.Vector3; camFrom: THREE.Vector3; camTo: THREE.Vector3; start: number; duration: number; lift: number } | null>(null);
+  /** The nodes a flight lands on, and when: they swell once and send out a ripple. */
+  const [landing, setLanding] = useState<{ ids: string[]; at: number; delay: number } | null>(null);
 
   // Simulation nodes keep their position across graph reloads, so a refresh doesn't scramble the layout.
   const previous = useRef(new Map<string, { x: number; y: number; z: number }>());
@@ -288,22 +300,45 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     for (const n of targets as Node3[]) centre.add(new THREE.Vector3(n.x, n.y, n.z));
     centre.divideScalar(targets.length);
     const extent = Math.max(...(targets as Node3[]).map((n) => centre.distanceTo(new THREE.Vector3(n.x, n.y, n.z))), 0);
-    const distance = selected ? 150 : Math.min(420 * spread, 160 + extent * 2.2);
+    // A selected note is framed close, together with its direct neighbours, so the zoom actually lands on it.
+    let reach = 0;
+    if (selected && focusSet) {
+      for (const id of focusSet) {
+        const n = byId.get(id);
+        if (n) reach = Math.max(reach, centre.distanceTo(new THREE.Vector3(n.x, n.y, n.z)));
+      }
+    }
+    const distance = selected ? Math.min(150, Math.max(70 * Math.cbrt(spread), reach * 1.9)) : Math.min(420 * spread, 160 + extent * 2.2);
     const dir = camera.position.clone().sub(controls.current.target).normalize();
+    const from = controls.current.target.clone();
+    const travel = from.distanceTo(centre);
+    const startDistance = camera.position.distanceTo(from);
+    // Longer hops take a little longer and rise a little on the way, so it reads as a zoom, not a slide.
+    const duration = reducedMotion ? 1 : Math.min(1500, 950 + travel * 1.2);
     fly.current = {
-      from: controls.current.target.clone(),
+      from,
       to: centre,
       camFrom: camera.position.clone(),
       camTo: centre.clone().add(dir.multiplyScalar(distance)),
       start: performance.now(),
+      duration,
+      lift: reducedMotion ? 0 : Math.min(0.35, travel / Math.max(startDistance, 1) * 0.25),
     };
-  }, [selected, highlight, byId, camera, spread]);
+    if (reducedMotion) return void setLanding(null);
+    const at = performance.now() + duration;
+    setLanding({ ids: (targets as Node3[]).slice(0, 8).map((n) => n.id), at, delay: duration });
+    // Once the swell and the ripple are over, their overlays go away.
+    const done = setTimeout(() => setLanding((l) => (l?.at === at ? null : l)), duration + 1000);
+    return () => clearTimeout(done);
+  }, [selected, highlight, byId, camera, spread, focusSet, reducedMotion]);
 
   const temp = useMemo(() => new THREE.Object3D(), []);
   const color = useMemo(() => new THREE.Color(), []);
   const bg = useMemo(() => new THREE.Color(BG), []);
   const edgeBase = useMemo(() => new THREE.Color(EDGE_COLOR), []);
-  const red = useMemo(() => new THREE.Color("#C81040"), []);
+  const red = useMemo(() => new THREE.Color(HISTORY_COLOR), []);
+  const edgeActive = useMemo(() => new THREE.Color(EDGE_ACTIVE), []);
+  const flyDir = useMemo(() => new THREE.Vector3(), []);
 
   // Only "real" relations carry sparks; history edges (supersedes and so on) stay quiet.
   const sparkLinks = useMemo(() => links.map((l, i) => (RED_EDGES.has(l.kind) || !shown[i] ? -1 : i)).filter((i) => i >= 0), [links, shown]);
@@ -328,22 +363,54 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     return g;
   }, [sparks]);
 
+  // Fat lines (instanced quads), so links can have a width and a halo. The buffers are written in
+  // place every frame; only their upload is flagged, nothing is reallocated.
   const edgeGeometry = useMemo(() => {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(links.length * 6), 3));
-    g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(links.length * 6), 3));
+    const g = new LineSegmentsGeometry();
+    g.setPositions(new Float32Array(Math.max(links.length, 1) * 6));
+    g.setColors(new Float32Array(Math.max(links.length, 1) * 6));
+    g.instanceCount = links.length;
     return g;
   }, [links]);
+  useEffect(() => () => edgeGeometry.dispose(), [edgeGeometry]);
+  const edgeCore = useMemo(
+    () => new LineMaterial({ vertexColors: true, linewidth: EDGE_CORE.width, transparent: true, opacity: EDGE_CORE.opacity, depthWrite: false, fog: true }),
+    [],
+  );
+  const edgeHalo = useMemo(
+    () => new LineMaterial({ vertexColors: true, color: EDGE_HALO.tint, linewidth: EDGE_HALO.width, transparent: true, opacity: EDGE_HALO.opacity, depthWrite: false, fog: true }),
+    [],
+  );
+  const edgeObjects = useMemo(() => {
+    const halo = new LineSegments2(edgeGeometry, edgeHalo);
+    const core = new LineSegments2(edgeGeometry, edgeCore);
+    for (const o of [halo, core]) o.frustumCulled = false;
+    // The halo draws first, so the core sits on top of it like the bright line inside a glass rod.
+    halo.renderOrder = 1;
+    core.renderOrder = 2;
+    return { halo, core };
+  }, [edgeGeometry, edgeCore, edgeHalo]);
+  useEffect(() => () => {
+    edgeCore.dispose();
+    edgeHalo.dispose();
+  }, [edgeCore, edgeHalo]);
 
   useFrame(() => {
     const now = performance.now();
     if (sim.alpha() > 0.004) sim.tick(reducedMotion ? 4 : 1);
 
     if (fly.current && controls.current) {
-      const t = Math.min(1, (now - fly.current.start) / (reducedMotion ? 1 : 900));
+      const f = fly.current;
+      const t = Math.min(1, (now - f.start) / f.duration);
       const k = bloomEase(t);
-      controls.current.target.lerpVectors(fly.current.from, fly.current.to, k);
-      camera.position.lerpVectors(fly.current.camFrom, fly.current.camTo, k);
+      controls.current.target.lerpVectors(f.from, f.to, k);
+      // The distance to the target shrinks geometrically, like a real zoom: fast from far away, gentle at the end.
+      flyDir.copy(f.camFrom).sub(f.from);
+      const d0 = Math.max(flyDir.length(), 1e-3);
+      const d1 = Math.max(f.camTo.distanceTo(f.to), 1e-3);
+      flyDir.divideScalar(d0);
+      const d = d0 ** (1 - k) * d1 ** k * (1 + f.lift * Math.sin(Math.PI * Math.min(1, k)));
+      camera.position.copy(controls.current.target).addScaledVector(flyDir, d);
       if (t >= 1) fly.current = null;
     }
 
@@ -351,6 +418,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     const nodeGrow = Math.cbrt(spread);
     // With many links, the plain ones draw lighter, so the nodes stay readable through them.
     const thin = Math.min(0.22, (spread - 1) * 0.15);
+    const landingIds = landing && !reducedMotion ? new Set(landing.ids) : null;
     const dimmed = (id: string) => (focusSet ? !focusSet.has(id) : highlight ? !highlight.has(id) : false);
     for (const type of ["note", "episode", "entity"] as NodeType[]) {
       const mesh = meshes[type].current;
@@ -363,6 +431,12 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         if (n.status === "disputed" && !reducedMotion) scale *= 1 + 0.12 * Math.sin(now / 420);
         if (n.id === selected) scale *= 1.6;
         else if (hovered?.id === n.id) scale *= 1.3;
+        else if (highlight?.has(n.id) && !focusSet) scale *= 1.25;
+        // Where a flight lands, the node swells once and settles, like a bud opening.
+        if (landingIds?.has(n.id)) {
+          const p = (now - landing!.at) / 600;
+          if (p > 0 && p < 1) scale *= 1 + 0.45 * Math.sin(Math.PI * p) * (1 - p * 0.4);
+        }
         temp.position.set(n.x, n.y, n.z);
         temp.scale.setScalar(Math.max(scale, 0.0001));
         temp.updateMatrix();
@@ -375,8 +449,10 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     }
 
-    const pos = edgeGeometry.getAttribute("position") as THREE.BufferAttribute;
-    const col = edgeGeometry.getAttribute("color") as THREE.BufferAttribute;
+    const pos = (edgeGeometry.getAttribute("instanceStart") as THREE.InterleavedBufferAttribute).data;
+    const col = (edgeGeometry.getAttribute("instanceColorStart") as THREE.InterleavedBufferAttribute).data;
+    const pa = pos.array as Float32Array;
+    const ca = col.array as Float32Array;
     links.forEach((l, i) => {
       const s = l.source as unknown as Node3;
       const t = l.target as unknown as Node3;
@@ -384,23 +460,29 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       const active = focusSet ? focusSet.has(s.id) && focusSet.has(t.id) && (s.id === selected || t.id === selected) : highlight ? highlight.has(s.id) || highlight.has(t.id) : true;
       // A hidden link collapses to a point unless it belongs to the selection or a search hit.
       const draw = shown[i] || ((focusSet || highlight) && active);
-      pos.setXYZ(i * 2, s.x, s.y, s.z);
-      pos.setXYZ(i * 2 + 1, draw ? t.x : s.x, draw ? t.y : s.y, draw ? t.z : s.z);
-      color.copy(RED_EDGES.has(l.kind) ? red : edgeBase);
+      const o = i * 6;
+      pa[o] = s.x;
+      pa[o + 1] = s.y;
+      pa[o + 2] = s.z;
+      pa[o + 3] = draw ? t.x : s.x;
+      pa[o + 4] = draw ? t.y : s.y;
+      pa[o + 5] = draw ? t.z : s.z;
+      // Links of the selection or a search hit light up in Bloom Red; history links keep their own red.
+      color.copy(RED_EDGES.has(l.kind) ? red : (focusSet || highlight) && active ? edgeActive : edgeBase);
       // Stronger similarity draws a darker line, like a well-used connection.
       const fade = focusSet || highlight
         ? active ? 0.3 : 0.97
-        : RED_EDGES.has(l.kind) ? 0.45
-        : l.kind === "similar" ? Math.min(0.66, Math.max(0.36, 0.66 - (l.weight - 0.55) * 2)) + thin
-        : l.kind === "mentions" ? 0.62 + thin
-        : 0.7 + thin;
+        : RED_EDGES.has(l.kind) ? 0.12
+        : l.kind === "similar" ? Math.min(0.76, Math.max(0.5, 0.76 - (l.weight - 0.55) * 2)) + thin
+        : l.kind === "mentions" ? 0.74 + thin
+        : 0.8 + thin;
       color.lerp(bg, fade);
-      col.setXYZ(i * 2, color.r, color.g, color.b);
-      col.setXYZ(i * 2 + 1, color.r, color.g, color.b);
+      ca[o] = ca[o + 3] = color.r;
+      ca[o + 1] = ca[o + 4] = color.g;
+      ca[o + 2] = ca[o + 5] = color.b;
     });
     pos.needsUpdate = true;
     col.needsUpdate = true;
-    edgeGeometry.computeBoundingSphere();
 
     // Sparks run along the edges, like signals through a network. With a selection, only along its edges.
     if (reducedMotion || !sparkLinks.length) return;
@@ -471,7 +553,12 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       setHovered((h) => (h?.id === n?.id ? h : n));
       el.style.cursor = n ? "pointer" : "";
     };
-    const press = (e: PointerEvent) => void (down = { x: e.clientX, y: e.clientY });
+    const press = (e: PointerEvent) => {
+      down = { x: e.clientX, y: e.clientY };
+      // Grabbing the camera mid-flight hands control back right away instead of fighting the animation.
+      fly.current = null;
+    };
+    const wheel = () => void (fly.current = null);
     const release = (e: PointerEvent) => {
       // A drag rotates the camera, it is not a click.
       if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return void (down = null);
@@ -486,11 +573,13 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     el.addEventListener("pointerdown", press);
     el.addEventListener("pointerup", release);
     el.addEventListener("pointerleave", leave);
+    el.addEventListener("wheel", wheel, { passive: true });
     return () => {
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerdown", press);
       el.removeEventListener("pointerup", release);
       el.removeEventListener("pointerleave", leave);
+      el.removeEventListener("wheel", wheel);
     };
   }, [gl]);
 
@@ -508,11 +597,10 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         minDistance={20}
         maxDistance={900 * spread}
       />
-      <lineSegments ref={lines} geometry={edgeGeometry} frustumCulled={false}>
-        <lineBasicMaterial vertexColors />
-      </lineSegments>
+      <primitive object={edgeObjects.halo} />
+      <primitive object={edgeObjects.core} />
       {!reducedMotion && sparks.length > 0 && (
-        <points geometry={sparkGeometry} frustumCulled={false}>
+        <points geometry={sparkGeometry} frustumCulled={false} renderOrder={3}>
           <pointsMaterial color={SPARK_COLOR} map={dot} alphaTest={0.4} size={1.6} sizeAttenuation transparent opacity={0.9} depthWrite={false} />
         </points>
       )}
@@ -571,6 +659,15 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
           <span className="selected-ring" />
         </Follow>
       )}
+      {landing &&
+        landing.ids.map((id) => {
+          const n = byId.get(id);
+          return n ? (
+            <Follow key={`${id}-${landing.at}`} node={n}>
+              <span className="ripple" style={{ animationDelay: `${Math.max(0, landing.delay - 120)}ms` }} />
+            </Follow>
+          ) : null;
+        })}
     </>
   );
 }
