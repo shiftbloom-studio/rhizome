@@ -193,9 +193,9 @@ function memory(flag: string | undefined) {
   return { mo: new MemoryObject(s.state as never, env as never), db: s.db };
 }
 
-describe("standing orders off (the default)", () => {
+describe("standing orders off (STANDING_ORDERS=off)", () => {
   it("offer no tools, add nothing to the context and refuse every order call", async () => {
-    const { mo } = memory(undefined);
+    const { mo } = memory("off");
     const list = await rpc(mo, claudeCode, "tools/list", {}, false);
     const names = (list.result as unknown as { tools: { name: string }[] }).tools.map((t) => t.name);
     expect(names).not.toContain("standing_orders");
@@ -308,7 +308,7 @@ describe("REST and the hook endpoint", () => {
   const post = (path: string, body: unknown) => call(path, { method: "POST", body: JSON.stringify(body) });
 
   it("are not there while the feature is off", async () => {
-    await setup(undefined);
+    await setup("off");
     expect((await call("/v1/memory/orders")).status).toBe(404);
     expect((await post("/v1/memory/orders/check", { tool_name: "Bash", tool_input: { command: "ls" } })).status).toBe(404);
   });

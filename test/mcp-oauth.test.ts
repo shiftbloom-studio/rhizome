@@ -171,7 +171,7 @@ describe("MCP tools", () => {
     expect(init.result.serverInfo.name).toBe("rhizome");
     expect((await rpc(token, "notifications/initialized", {}, null)).status).toBe(202);
     const list = (await (await rpc(token, "tools/list")).json()) as { result: { tools: { name: string }[] } };
-    expect(list.result.tools.map((t) => t.name)).toEqual(["get_context", "recall", "remember", "save_conversation", "import_memory_file", "forget"]);
+    expect(list.result.tools.map((t) => t.name)).toEqual(["get_context", "recall", "remember", "save_conversation", "import_memory_file", "forget", "open_loop", "close_loop", "standing_orders", "check_tool_call", "add_standing_order"]);
 
     const saved = await tool(token, "remember", { content: "The person deploys everything with Workers Builds.", kind: "decision", project: "rhizome", said_by_user: true });
     expect(saved.isError).toBeUndefined();

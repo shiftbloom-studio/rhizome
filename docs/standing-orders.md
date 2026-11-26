@@ -5,8 +5,9 @@ issues" or "a force-push needs my approval", kept in rhizome as data. Every agen
 that loads its context sees the active orders, and an agent's harness can ask
 rhizome before each tool call whether an order stops it.
 
-Standing orders are off by default. Turn them on with `STANDING_ORDERS=on`
-(a Worker variable in `wrangler.jsonc`, or in `.env` on Node). While they are off,
+Standing orders are on by default. Turn them off with `STANDING_ORDERS=off`
+(a Worker variable in `wrangler.jsonc`, or in `.env` on Node), or with the PostHog
+flag `rhizome-standing-orders` (see `src/flags.ts`). While they are off,
 rhizome behaves exactly as without them: no extra MCP tools, nothing added to
 `get_context`, and the endpoints below answer 404.
 

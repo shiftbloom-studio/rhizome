@@ -20,6 +20,8 @@ import { cleanupOAuth, oauth, resourceMetadataUrl } from "./oauth";
 import { login } from "./login";
 import { callFromHook, cwdFromHook, HOOK_FORMATS, hookOutput, ordersEnabled, projectFromPath, type HookFormat } from "./orders";
 
+import { FlagCache } from "./flags";
+
 export { MemoryObject } from "./memory-object";
 
 const VERSION = "0.3.0";
@@ -42,6 +44,16 @@ app.onError((err, c) => {
   if (/empty|limit is|must be|unknown user|invalid grant/.test(message)) return c.json({ error: message }, 400);
   console.error(err);
   return c.json({ error: "internal error" }, 500);
+});
+
+// Feature flags from PostHog (POSTHOG_FLAGS=on, src/flags.ts) fill flag vars that are not set in env.
+const flags = new FlagCache();
+app.use("*", async (c, next) => {
+  let bg: { waitUntil(p: Promise<unknown>): void } | undefined;
+  try { bg = c.executionCtx; } catch { /* no execution context (tests) */ }
+  await flags.ready(c.env, bg);
+  c.env = flags.apply(c.env);
+  await next();
 });
 
 app.get("/v1/health", (c) => c.json({ ok: true, version: VERSION }));
@@ -423,7 +435,7 @@ mem.post("/import", async (c) => {
 
 mem.get("/stats", async (c) => c.json(await memory(c).stats(c.get("client"))));
 
-// Standing orders (src/orders.ts, docs/standing-orders.md). Off unless STANDING_ORDERS=on.
+// Standing orders (src/orders.ts, docs/standing-orders.md). On by default; STANDING_ORDERS=off turns them off.
 // Agents may read, check and propose orders; only the person activates, disables or deletes them (explorer).
 mem.use("/orders/*", async (c, next) => {
   if (!ordersEnabled(c.env)) throw new HttpError(404, "standing orders are off");

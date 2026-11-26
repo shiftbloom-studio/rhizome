@@ -7,7 +7,7 @@
 // A loop without a due time is due the next time its scope is loaded.
 //
 // Due is decided when context is read, so nothing runs on the due date itself and
-// no model is called. Off unless OPEN_LOOPS=on.
+// no model is called. On by default; OPEN_LOOPS=off turns them off (src/flags.ts).
 
 /** Loop ids carry a prefix, so forget can tell them from notes and episodes. */
 export const LOOP_PREFIX = "loop_";

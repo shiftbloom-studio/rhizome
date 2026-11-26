@@ -13,7 +13,7 @@
 // conditions on fields of the call. Orders can only restrict (deny, ask, warn),
 // so the worst a wrong order can do is stop a call; it can never let one through.
 //
-// Off unless STANDING_ORDERS=on.
+// On by default; STANDING_ORDERS=off turns them off (src/flags.ts).
 
 import { BudgetError, linearRegex, PatternError, type Budget, type LinearRegex } from "./linear-regex";
 
