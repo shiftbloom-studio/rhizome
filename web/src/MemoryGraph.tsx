@@ -26,10 +26,12 @@ export const TRUST_COLOR: Record<string, string> = {
 const EPISODE_COLOR = "#B9AEB2";
 const ENTITY_COLOR = "#1A1216";
 // Links are drawn as rose-tinted glass: a thin core inside a wide, faint halo, both translucent.
-// Ink with a share of Root Red, so plain links read as warm threads instead of grey wire.
+// Plain links are Root Red faded far toward the paper, so they read as pale rose threads; stronger
+// similarity fades less. History links (supersedes and so on) keep a deep, nearly unfaded red.
 const EDGE_COLOR = "#C81040";
+const HISTORY_COLOR = "#8A0B2C";
 /** The colour links take on when they belong to the selection or a search hit. */
-const EDGE_ACTIVE = "#E0244A";
+const EDGE_ACTIVE = "#FF2E52";
 const EDGE_CORE = { width: 1, opacity: 0.85 };
 const EDGE_HALO = { width: 4.5, opacity: 0.08, tint: "#FF8FAB" };
 const RED_EDGES = new Set(["supersedes", "merged_into", "contradicts"]);
@@ -322,14 +324,19 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       duration,
       lift: reducedMotion ? 0 : Math.min(0.35, travel / Math.max(startDistance, 1) * 0.25),
     };
-    setLanding(reducedMotion ? null : { ids: (targets as Node3[]).slice(0, 8).map((n) => n.id), at: performance.now() + duration, delay: duration });
+    if (reducedMotion) return void setLanding(null);
+    const at = performance.now() + duration;
+    setLanding({ ids: (targets as Node3[]).slice(0, 8).map((n) => n.id), at, delay: duration });
+    // Once the swell and the ripple are over, their overlays go away.
+    const done = setTimeout(() => setLanding((l) => (l?.at === at ? null : l)), duration + 1000);
+    return () => clearTimeout(done);
   }, [selected, highlight, byId, camera, spread, focusSet, reducedMotion]);
 
   const temp = useMemo(() => new THREE.Object3D(), []);
   const color = useMemo(() => new THREE.Color(), []);
   const bg = useMemo(() => new THREE.Color(BG), []);
   const edgeBase = useMemo(() => new THREE.Color(EDGE_COLOR), []);
-  const red = useMemo(() => new THREE.Color("#C81040"), []);
+  const red = useMemo(() => new THREE.Color(HISTORY_COLOR), []);
   const edgeActive = useMemo(() => new THREE.Color(EDGE_ACTIVE), []);
   const flyDir = useMemo(() => new THREE.Vector3(), []);
 
@@ -465,10 +472,10 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       // Stronger similarity draws a darker line, like a well-used connection.
       const fade = focusSet || highlight
         ? active ? 0.3 : 0.97
-        : RED_EDGES.has(l.kind) ? 0.45
-        : l.kind === "similar" ? Math.min(0.66, Math.max(0.36, 0.66 - (l.weight - 0.55) * 2)) + thin
-        : l.kind === "mentions" ? 0.62 + thin
-        : 0.7 + thin;
+        : RED_EDGES.has(l.kind) ? 0.12
+        : l.kind === "similar" ? Math.min(0.76, Math.max(0.5, 0.76 - (l.weight - 0.55) * 2)) + thin
+        : l.kind === "mentions" ? 0.74 + thin
+        : 0.8 + thin;
       color.lerp(bg, fade);
       ca[o] = ca[o + 3] = color.r;
       ca[o + 1] = ca[o + 4] = color.g;
