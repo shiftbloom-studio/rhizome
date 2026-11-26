@@ -6,8 +6,8 @@
 // never saw the old version hear nothing.
 //
 // Only calls from an agent's conversation (MCP) are recorded and corrected. The
-// explorer, the REST API and recall as of a past time are left out. Off unless
-// LEDGER=on.
+// explorer, the REST API and recall as of a past time are left out. On by default;
+// LEDGER=off turns it off (src/flags.ts).
 
 /** Corrections for replaced memories told per call; the rest follow on the next call. */
 export const MAX_REPLACED = 5;

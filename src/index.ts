@@ -435,7 +435,7 @@ mem.post("/import", async (c) => {
 
 mem.get("/stats", async (c) => c.json(await memory(c).stats(c.get("client"))));
 
-// Standing orders (src/orders.ts, docs/standing-orders.md). Off unless STANDING_ORDERS=on.
+// Standing orders (src/orders.ts, docs/standing-orders.md). On by default; STANDING_ORDERS=off turns them off.
 // Agents may read, check and propose orders; only the person activates, disables or deletes them (explorer).
 mem.use("/orders/*", async (c, next) => {
   if (!ordersEnabled(c.env)) throw new HttpError(404, "standing orders are off");

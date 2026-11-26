@@ -1492,7 +1492,7 @@ export class MemoryObject extends DurableObject<Env> {
   }
 
   // ------------------------------------------------------- standing orders
-  // Rules the person stated, checked against tool calls (src/orders.ts). Off unless STANDING_ORDERS=on.
+  // Rules the person stated, checked against tool calls (src/orders.ts). On by default; STANDING_ORDERS=off turns them off.
 
   private requireOrders(): void {
     if (!ordersEnabled(this.flagEnv())) throw new Error("standing orders are off (STANDING_ORDERS is not on)");

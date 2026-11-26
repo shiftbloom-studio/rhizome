@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Feature flags from PostHog, with the env vars as fallback and override. Off unless POSTHOG_FLAGS=on
-// (and POSTHOG_KEY, POSTHOG_HOST are set). Then each flag var below that is NOT set in the environment
-// takes its value from the PostHog flag of the same purpose: enabled -> "on", disabled -> "off".
-// A var that is set ("on" or "off") always wins, so env stays the kill switch. PostHog unreachable,
-// slow (over 1.5 s) or missing a flag: the var stays unset, which means off, as before.
+// The flag vars below (LEDGER, STANDING_ORDERS, OPEN_LOOPS, DISPUTE_RESOLUTION) default to ON.
+// A var that is set ("on" or "off") always wins, so env stays the kill switch. An unset var takes the value
+// of its PostHog flag when POSTHOG_FLAGS=on (with POSTHOG_KEY and POSTHOG_HOST): enabled -> "on",
+// disabled -> "off". Without POSTHOG_FLAGS, or when PostHog is unreachable, slow (over 1.5 s), or the flag
+// is missing or failed to evaluate, the var is "on".
 //
 // Flags are evaluated once for the whole deployment (one fixed distinct_id), not per person: the Worker
 // lists tools and the Durable Object enforces them, and both must agree. Nothing about people is sent.
@@ -48,14 +48,15 @@ export function parseFlags(body: unknown): Values {
   return out;
 }
 
-/** The env with every unset flag var filled from PostHog. Set vars and non-flag fields are untouched. */
+/** The env with every unset flag var resolved: the PostHog value when there is one, otherwise "on".
+ * Set vars and non-flag fields are untouched. */
 export function applyFlags<T extends FlagEnv>(env: T, values: Values | null): T {
-  if (!values || !flagsUrl(env)) return env;
+  const from = flagsUrl(env) ? values : null;
   let out: T | null = null;
   for (const v of Object.keys(FLAGS) as FlagVar[]) {
-    if ((env[v] ?? "").trim() !== "" || values[v] === undefined) continue;
+    if ((env[v] ?? "").trim() !== "") continue;
     out ??= { ...env };
-    (out as FlagEnv)[v] = values[v] ? "on" : "off";
+    (out as FlagEnv)[v] = from?.[v] === false ? "off" : "on";
   }
   return out ?? env;
 }

@@ -70,8 +70,8 @@ describe("ledger", () => {
     now = Date.UTC(2026, 10, 26, 9);
   });
 
-  it("is off by default: nothing is recorded and nobody is told", async () => {
-    const { mo, db } = setup(undefined);
+  it("is off with LEDGER=off: nothing is recorded and nobody is told", async () => {
+    const { mo, db } = setup("off");
     await say(mo, claudeCode, "profile", "PNPM for every project from now on, please");
     expect((await tool(mo, claudeCode, "get_context", {})).text).toContain(PNPM);
     await say(mo, claudeCode, "profile", "switching: BUN for every project from today on");

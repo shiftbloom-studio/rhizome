@@ -28,10 +28,13 @@ describe("flag config", () => {
   it("fills only unset vars, so env stays the override and kill switch", () => {
     const env = { ...ON, LEDGER: "off", STANDING_ORDERS: "" };
     const out = applyFlags(env, { LEDGER: true, STANDING_ORDERS: true, OPEN_LOOPS: false });
-    expect(out).toMatchObject({ LEDGER: "off", STANDING_ORDERS: "on", OPEN_LOOPS: "off" });
-    expect((out as Record<string, unknown>).DISPUTE_RESOLUTION).toBeUndefined();
+    // A missing flag (DISPUTE_RESOLUTION) is on.
+    expect(out).toMatchObject({ LEDGER: "off", STANDING_ORDERS: "on", OPEN_LOOPS: "off", DISPUTE_RESOLUTION: "on" });
     expect(env.STANDING_ORDERS).toBe("");
-    expect(applyFlags({ LEDGER: undefined }, { LEDGER: true })).toEqual({ LEDGER: undefined });
+    // Without POSTHOG_FLAGS every unset var is on, whatever values are passed.
+    expect(applyFlags({ LEDGER: undefined, OPEN_LOOPS: "off" }, { LEDGER: false })).toEqual({ LEDGER: "on", OPEN_LOOPS: "off", STANDING_ORDERS: "on", DISPUTE_RESOLUTION: "on" });
+    const all = { LEDGER: "off", STANDING_ORDERS: "off", OPEN_LOOPS: "off", DISPUTE_RESOLUTION: "off" };
+    expect(applyFlags(all, null)).toBe(all);
   });
 });
 
@@ -53,11 +56,11 @@ describe("flag cache", () => {
     await Promise.all(waits);
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
-  it("keeps flags unset (off) when PostHog fails, and sends nothing when off", async () => {
+  it("turns unset vars on when PostHog fails, and sends nothing when off", async () => {
     const down = vi.fn(async () => { throw new Error("offline"); });
     const cache = new FlagCache(down as never, () => 0);
     await cache.ready(ON);
-    expect((cache.apply(ON) as Record<string, unknown>).OPEN_LOOPS).toBeUndefined();
+    expect(cache.apply(ON)).toMatchObject({ LEDGER: "on", STANDING_ORDERS: "on", OPEN_LOOPS: "on", DISPUTE_RESOLUTION: "on" });
     const off = vi.fn();
     await new FlagCache(off as never).ready({});
     expect(off).not.toHaveBeenCalled();
@@ -65,8 +68,8 @@ describe("flag cache", () => {
 });
 
 describe("in the memory object", () => {
-  it("turns on open loops from PostHog when OPEN_LOOPS is unset, and env off wins", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => answer({ "rhizome-open-loops": { enabled: true } })));
+  it("turns off open loops from PostHog when OPEN_LOOPS is unset, and env on wins", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => answer({ "rhizome-open-loops": { enabled: false } })));
     const client = { id: "c1", userId: "u1", name: "Claude Code", agent: "claude-code", provider: "anthropic", grants: DEFAULT_GRANTS } as never;
     const make = async (vars: Record<string, string>) => {
       const s = fakeState();
@@ -74,9 +77,11 @@ describe("in the memory object", () => {
       await new Promise((r) => setTimeout(r, 0));
       return mo;
     };
-    const on = await make(ON);
-    expect(() => on.openLoop(client, { scope: "profile", content: "Ask about the invoice." })).not.toThrow();
-    const killed = await make({ ...ON, OPEN_LOOPS: "off" });
-    expect(() => killed.openLoop(client, { scope: "profile", content: "Ask about the invoice." })).toThrow(/not allowed/);
+    const flagged = await make(ON);
+    expect(() => flagged.openLoop(client, { scope: "profile", content: "Ask about the invoice." })).toThrow(/not allowed/);
+    const forced = await make({ ...ON, OPEN_LOOPS: "on" });
+    expect(() => forced.openLoop(client, { scope: "profile", content: "Ask about the invoice." })).not.toThrow();
+    const plain = await make({});
+    expect(() => plain.openLoop(client, { scope: "profile", content: "Ask about the invoice." })).not.toThrow();
   });
 });

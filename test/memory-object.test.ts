@@ -415,7 +415,8 @@ describe("MemoryObject pipeline", () => {
       return { older: a.id, newer: b.id };
     }
 
-    it("is off unless DISPUTE_RESOLUTION is on", async () => {
+    it("is off with DISPUTE_RESOLUTION=off", async () => {
+      (fake.env as { DISPUTE_RESOLUTION?: string }).DISPUTE_RESOLUTION = "off";
       const { older, newer } = await agentDispute("It is an open question whether the credit cap applies after Dec 1.", "The credit cap does not apply after Dec 1; free volume only.");
       await reflect();
       expect(row(newer).status).toBe("disputed");

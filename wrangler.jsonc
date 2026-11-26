@@ -58,8 +58,10 @@
   // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Enables the /v1/admin endpoints.
   // Secret: POSTHOG_KEY (wrangler secret put POSTHOG_KEY), the PostHog project API key for MCP_ANALYTICS.
   // Sign-in without Cloudflare Access: AUTH_MODE=password with LOGIN_EMAIL, plus the secrets LOGIN_PASSWORD and SESSION_SECRET.
-  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT, DISPUTE_RESOLUTION ("on"/"off").
-  // Optional var OPEN_LOOPS ("on"): open loops with a due date, shown under Due now in get_context. Off by default.
-  // Optional var STANDING_ORDERS ("on"): rules checked against agents' tool calls, see docs/standing-orders.md. Off by default.
+  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT, DISPUTE_RESOLUTION ("off" turns it off; on by default).
+  // Optional var OPEN_LOOPS ("off"): open loops with a due date, shown under Due now in get_context. On by default.
+  // Optional var STANDING_ORDERS ("off"): rules checked against agents' tool calls, see docs/standing-orders.md. On by default.
+  // Optional var LEDGER ("off"): tells connectors when a memory they were given is replaced. On by default.
+  // LEDGER, OPEN_LOOPS, STANDING_ORDERS and DISPUTE_RESOLUTION, when unset, follow PostHog flags with POSTHOG_FLAGS=on (src/flags.ts).
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }

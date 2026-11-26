@@ -34,9 +34,9 @@ function memory(vars: Record<string, string> = { OPEN_LOOPS: "on" }) {
   return new MemoryObject(s.state as never, env as never);
 }
 
-describe("open loops are off by default", () => {
+describe("open loops turned off (OPEN_LOOPS=off)", () => {
   it("list no loop tools, refuse them and leave get_context as it was", async () => {
-    const mo = memory({});
+    const mo = memory({ OPEN_LOOPS: "off" });
     const list = await rpc(mo, claudeCode, "tools/list", {}, false);
     expect(list.result!.tools!.map((t) => t.name)).not.toContain("open_loop");
     const res = await tool(mo, claudeCode, "open_loop", { content: "Ask about the invoice." }, false);
@@ -52,7 +52,7 @@ describe("open loops are off by default", () => {
     const before = mo.context(claudeCode, ["profile"]);
     mo.openLoop(claudeCode, { scope: "profile", content: "Ask about the invoice." });
     expect(mo.context(claudeCode, ["profile"]).text).toContain("Due now");
-    delete (mo as unknown as { env: Record<string, string> }).env.OPEN_LOOPS;
+    (mo as unknown as { env: Record<string, string> }).env.OPEN_LOOPS = "off";
     const after = mo.context(claudeCode, ["profile"]);
     expect(after.text).toBe(before.text);
     expect(after.version).toBe(before.version);

@@ -24,12 +24,14 @@ export interface Env {
   REFLECTION_MODEL?: string;
   /**
    * "on": nightly reflection settles disputed notes by trust and time, and asks the
-   * extraction model about the pairs the trust ladder cannot decide (at most 20 a night). Default: off.
+   * extraction model about the pairs the trust ladder cannot decide (at most 20 a night). Default: on (unset follows the
+   * PostHog flag, src/flags.ts); "off" turns it off.
    */
   DISPUTE_RESOLUTION?: string;
   /**
    * "on": the ledger records which connector was given which memory and tells it once,
-   * on its next get_context or recall, when that memory was replaced or deleted. Default: off.
+   * on its next get_context or recall, when that memory was replaced or deleted. Default: on (unset follows the
+   * PostHog flag, src/flags.ts); "off" turns it off.
    */
   LEDGER?: string;
   /**
@@ -40,18 +42,19 @@ export interface Env {
   /**
    * "on": feature flags from PostHog (src/flags.ts). Flag vars that are not set (LEDGER, STANDING_ORDERS,
    * OPEN_LOOPS, DISPUTE_RESOLUTION) take the value of rhizome-ledger, rhizome-standing-orders,
-   * rhizome-open-loops and rhizome-dispute-resolution. Needs POSTHOG_KEY and POSTHOG_HOST. Default: off.
+   * rhizome-open-loops and rhizome-dispute-resolution. Needs POSTHOG_KEY and POSTHOG_HOST. Default: off
+   * (then those vars, when unset, are on).
    */
   POSTHOG_FLAGS?: string;
   /** PostHog project API key (phc_...). Set as a secret or deploy variable, never committed. */
   POSTHOG_KEY?: string;
   /** PostHog ingestion host, e.g. https://eu.i.posthog.com or https://us.i.posthog.com. */
   POSTHOG_HOST?: string;
-  /** "on": open loops. Agents can open a loop with a due time, get_context leads with what is due, close_loop ends it. Default: off. */
+  /** "on": open loops. Agents can open a loop with a due time, get_context leads with what is due, close_loop ends it. Default: on (unset follows the PostHog flag, src/flags.ts); "off" turns it off. */
   OPEN_LOOPS?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
-  /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: off. */
+  /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: on (unset follows the PostHog flag, src/flags.ts); "off" turns it off. */
   STANDING_ORDERS?: string;
   /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */
   RECALL_FEATURES?: string;
