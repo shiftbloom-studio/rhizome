@@ -45,6 +45,18 @@ describe("open loops are off by default", () => {
     await mo.addNote(claudeCode, { scope: "profile", content: "The user prefers short replies.", kind: "preference", trust: "user_explicit" });
     expect(mo.context(claudeCode, ["profile"]).text).not.toContain("Due now");
   });
+
+  it("leave get_context byte for byte as it was, even with loops stored before the switch went off", async () => {
+    const mo = memory();
+    await mo.addNote(claudeCode, { scope: "profile", content: "The user prefers short replies.", kind: "preference", trust: "user_explicit" });
+    const before = mo.context(claudeCode, ["profile"]);
+    mo.openLoop(claudeCode, { scope: "profile", content: "Ask about the invoice." });
+    expect(mo.context(claudeCode, ["profile"]).text).toContain("Due now");
+    delete (mo as unknown as { env: Record<string, string> }).env.OPEN_LOOPS;
+    const after = mo.context(claudeCode, ["profile"]);
+    expect(after.text).toBe(before.text);
+    expect(after.version).toBe(before.version);
+  });
 });
 
 describe("open loops", () => {
@@ -121,6 +133,12 @@ describe("open loops", () => {
   it("check write access and the due date", async () => {
     expect((await tool(mo, reader, "open_loop", { content: "Nope." })).text).toBe("this connection may not write to profile");
     expect((await tool(mo, claudeCode, "open_loop", { content: "Later.", due: "next week" })).text).toMatch(/^due must be an ISO 8601/);
+    // Out of Date's range: refused before anything is stored, so get_context keeps working.
+    for (const due of [-1e16, 1e16, "+275760-09-13T00:00:00Z"]) {
+      expect((await tool(mo, claudeCode, "open_loop", { content: "Broken.", due })).text).toMatch(/^due must be an ISO 8601/);
+    }
+    expect(() => mo.openLoop(claudeCode, { scope: "profile", content: "Broken.", dueAt: -1e16 })).toThrow(/due must be/);
+    expect(mo.context(claudeCode, ["profile"]).text).not.toContain("Broken.");
     const id = String((await tool(mo, claudeCode, "open_loop", { content: "Ask Acme." })).sc!.id);
     expect((await tool(mo, reader, "close_loop", { id })).text).toBe("no open loop with this id");
   });
@@ -150,5 +168,15 @@ describe("open loops", () => {
     const opened = await tool(mo, claudeCode, "open_loop", { content: "Tell the user about the Acme budget.", conversation: "s1" });
     expect(opened.sc!.scope).toBe("project:acme");
     expect(mo.context(claudeCode, ["profile"]).text).not.toContain("Acme budget");
+  });
+
+  it("from another wall stay out of a conversation that was given one", async () => {
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    mo.setWall(claudeCode, "globex", ["project:globex"]);
+    await mo.addNote(claudeCode, { scope: "project:acme", content: "Acme's budget is 60,000 euros.", kind: "fact", trust: "user_confirmed" });
+    mo.openLoop(claudeCode, { scope: "project:globex", content: "Chase the Globex contract." });
+    await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "s1" });
+    expect((await tool(mo, claudeCode, "get_context", { project: "globex", conversation: "s1" })).text).not.toContain("Globex contract");
+    expect((await tool(mo, claudeCode, "get_context", { project: "globex", conversation: "s2" })).text).toContain("Globex contract");
   });
 });

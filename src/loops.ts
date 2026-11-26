@@ -20,6 +20,14 @@ export const DUE_SHOWN = 5;
 /** Characters of a loop's text shown in context. */
 export const DUE_LINE_CHARS = 200;
 
+/** Latest due time that can be stored and shown: the end of the year 9999, UTC. */
+export const MAX_DUE_AT = Date.UTC(9999, 11, 31, 23, 59, 59, 999);
+
+/** A due time in ms that Date can render (0 up to MAX_DUE_AT). */
+export function isValidDue(dueAt: number): boolean {
+  return Number.isFinite(dueAt) && dueAt >= 0 && dueAt <= MAX_DUE_AT;
+}
+
 export function loopsEnabled(env: { OPEN_LOOPS?: string }): boolean {
   return env.OPEN_LOOPS === "on";
 }

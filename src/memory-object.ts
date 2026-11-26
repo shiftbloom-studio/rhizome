@@ -10,7 +10,7 @@ import { admitConversation, admitNamed, HANDLE_TTL_MS, heldTarget, isValidWallNa
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
-import { DUE_SHOWN, dueSection, isLoopId, LOOP_PREFIX, loopsEnabled, MAX_OPEN_LOOPS, type DueLoop } from "./loops";
+import { DUE_SHOWN, dueSection, isLoopId, isValidDue, LOOP_PREFIX, loopsEnabled, MAX_OPEN_LOOPS, type DueLoop } from "./loops";
 import { assignFactKeys, confidence, diversify, keywordCoverage, keywordTerms, parseFeatures, shouldAbstain, SIMILARITY_FLOOR } from "./recall";
 import { parseTimeWindow } from "./timewindow";
 import {
@@ -1394,6 +1394,8 @@ export class MemoryObject extends DurableObject<Env> {
     if (!loopsEnabled(this.env)) throw new Error("open loops are not allowed here");
     const content = input.content.trim();
     if (!content) throw new Error("loop is empty");
+    // Out of Date's range a due time would break every later get_context of the scope.
+    if (input.dueAt !== undefined && !isValidDue(input.dueAt)) throw new Error("due must be a time between 1970 and 9999");
     if (!can(client, "write", input.scope)) throw new ForbiddenError(input.scope);
     const now = Date.now();
     const scope = (input.track ? this.writeInside(client, input.track, input.scope, now) : null) ?? input.scope;

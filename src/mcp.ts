@@ -9,7 +9,7 @@ import { IMPORT_FORMATS, MAX_IMPORT_CHARS, parseMemoryFile, type ImportFormat } 
 import type { MemoryItem, NoteKind, Trust } from "./memory-object";
 import { NOTE_KINDS } from "./memory-object";
 import { agentScope, can, isValidSlug, recallScopes, type Client } from "./scopes";
-import { MAX_LOOP_CHARS, MAX_OUTCOME_CHARS } from "./loops";
+import { isValidDue, MAX_LOOP_CHARS, MAX_OUTCOME_CHARS } from "./loops";
 import { parseRangeBound } from "./timewindow";
 import type { Tracked } from "./walls";
 
@@ -201,7 +201,7 @@ export const LOOP_TOOLS = [
       type: "object",
       properties: {
         content: { type: "string", maxLength: MAX_LOOP_CHARS, description: "What to do, in one short sentence that makes sense without the conversation." },
-        due: { type: "string", description: "Optional: from when it is due (ISO 8601, e.g. 2026-12-01; a date means the start of that day, UTC)." },
+        due: { type: "string", description: "Optional: from when it is due (ISO 8601: a date such as 2026-12-01 means the start of that day in UTC; for the person's local time add a time and offset, e.g. 2026-12-01T09:00+01:00)." },
         scope: scopeProp,
         project: projectProp,
         conversation: conversationProp,
@@ -433,6 +433,7 @@ async function loopTool(memory: MemoryApi, client: Client, name: "open_loop" | "
   let dueAt: number | undefined;
   try {
     dueAt = parseRangeBound(args.due, false);
+    if (dueAt !== undefined && !isValidDue(dueAt)) throw new Error("out of range");
   } catch {
     throw new ToolError("due must be an ISO 8601 date or time, e.g. 2026-12-01");
   }
