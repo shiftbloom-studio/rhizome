@@ -352,6 +352,40 @@ export function validateRelations(raw: unknown, pairs: number): Relation[] {
   return out;
 }
 
+export type DisputeVerdict = "newer" | "older" | "both" | "unsure";
+
+export const DISPUTE_PROMPT = `You settle contradictions in a personal memory that all AI agents of one person share. Each pair holds two notes that were flagged as contradicting each other, the older one first, each with the date it was written and who it comes from. Answer for each pair:
+- "newer": the newer note replaces the older one, because something changed over time or because it answers an open question the older note raised. The older note was true until then.
+- "older": the newer note is a mistake or a misreading; the older note still holds.
+- "both": they do not really contradict each other; both can be true.
+- "unsure": the notes do not tell. Prefer this over guessing.
+Output only JSON: {"results":[{"pair":<number>,"verdict":"newer|older|both|unsure"}]}`;
+
+/**
+ * Settles a dispute without a model where the trust ladder decides: what the
+ * person said or confirmed wins over a guess, and between two things the person
+ * said the later one wins. Returns null when only a model can tell.
+ */
+export function settleByTrust(olderTrust: string, newerTrust: string): "newer" | "older" | null {
+  const person = TRUST_RANK.user_confirmed!;
+  if ((TRUST_RANK[newerTrust] ?? 1) >= person) return "newer";
+  if ((TRUST_RANK[olderTrust] ?? 1) >= person) return "older";
+  return null;
+}
+
+export function validateVerdicts(raw: unknown, pairs: number): DisputeVerdict[] {
+  const out: DisputeVerdict[] = Array.from({ length: pairs }, () => "unsure");
+  const results = (raw as { results?: unknown })?.results;
+  if (!Array.isArray(results)) throw new Error("dispute output has no results array");
+  for (const r of results) {
+    const i = Number(r?.pair);
+    if (Number.isInteger(i) && i >= 0 && i < pairs && ["newer", "older", "both", "unsure"].includes(r?.verdict)) {
+      out[i] = r.verdict;
+    }
+  }
+  return out;
+}
+
 /** Which scope an extracted fact lands in, given the scope of its episode. */
 export function targetScope(fact: ExtractedScope, episodeScope: string): string {
   if (fact === "project" && episodeScope.startsWith("project:")) return episodeScope;

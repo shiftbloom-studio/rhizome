@@ -2,7 +2,7 @@
 // Runs the MemoryObject against node:sqlite and fake AI, R2 and Vectorize
 // bindings: extraction, conflict resolution, merging, recall, forgetting and reflection.
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { EXTRACTION_PROMPT, NOTE_ENTITIES_PROMPT, PROFILE_PROMPT, RESOLVER_PROMPT } from "../src/intel";
+import { DISPUTE_PROMPT, EXTRACTION_PROMPT, NOTE_ENTITIES_PROMPT, PROFILE_PROMPT, RESOLVER_PROMPT } from "../src/intel";
 import { MemoryObject } from "../src/memory-object";
 import { MIGRATIONS } from "../src/schema";
 import type { Client } from "../src/scopes";
@@ -33,6 +33,8 @@ const EXTRACTIONS: Record<string, unknown> = {
 };
 
 let resolverAnswer = "update";
+let disputeAnswer = "newer";
+let disputeInputs: string[] = [];
 let tagCalls = 0;
 let resolverCalls = 0;
 let extractionInputs: string[] = [];
@@ -43,6 +45,11 @@ function generate(_model: string, system: string, user: string): string {
     const episode = user.split("\n\nRelated memory:")[0]!;
     const key = Object.keys(EXTRACTIONS).find((k) => episode.includes(k))!;
     return "```json\n" + JSON.stringify(EXTRACTIONS[key]) + "\n```";
+  }
+  if (system === DISPUTE_PROMPT) {
+    disputeInputs.push(user);
+    const pairs = user.split("\n\n").length;
+    return JSON.stringify({ results: Array.from({ length: pairs }, (_, pair) => ({ pair, verdict: disputeAnswer })) });
   }
   if (system === RESOLVER_PROMPT) resolverCalls++;
   if (system === RESOLVER_PROMPT) return JSON.stringify({ results: [{ pair: 0, relation: resolverAnswer }] });
@@ -115,6 +122,8 @@ describe("MemoryObject pipeline", () => {
     resolverAnswer = "update";
     resolverCalls = 0;
     extractionInputs = [];
+    disputeAnswer = "newer";
+    disputeInputs = [];
   });
 
   const notes = () => db.prepare("SELECT id, content, trust, status, confirmations, superseded_by, origin FROM items WHERE kind = 'note' ORDER BY created_at").all() as Record<string, unknown>[];
@@ -342,6 +351,104 @@ describe("MemoryObject pipeline", () => {
     // Already tagged notes are not sent to the model again.
     expect((db.prepare("SELECT mentions FROM entities WHERE name = 'Cloudflare'").get() as { mentions: number }).mentions).toBe(2);
     expect(tagCalls).toBe(before);
+  });
+
+  describe("dispute resolution in reflection", () => {
+    const row = (id: string) => db.prepare("SELECT status, superseded_by, valid_from, valid_to, expired_at FROM items WHERE id = ?").get(id) as Record<string, unknown>;
+    const reflect = async () => {
+      await mo.requestReflection(web);
+      await settle(mo);
+    };
+    /** Two agent notes flagged as contradicting, the newer one disputed, as extraction leaves them. */
+    async function agentDispute(older: string, newer: string) {
+      const a = await mo.addNote(claude, { scope: "project:rhizome", content: older, kind: "fact", trust: "agent_inference", tEvent: Date.UTC(2026, 10, 20) });
+      const b = await mo.addNote(hermes, { scope: "project:rhizome", content: newer, kind: "fact", trust: "agent_inference", tEvent: Date.UTC(2026, 10, 24) });
+      await settle(mo);
+      db.prepare("UPDATE items SET status = 'disputed' WHERE id = ?").run(b.id);
+      db.prepare("INSERT INTO links (src, dst, kind, weight, created_at) VALUES (?, ?, 'contradicts', 0.8, ?)").run(b.id, a.id, now);
+      return { older: a.id, newer: b.id };
+    }
+
+    it("is off unless DISPUTE_RESOLUTION is on", async () => {
+      const { older, newer } = await agentDispute("It is an open question whether the credit cap applies after Dec 1.", "The credit cap does not apply after Dec 1; free volume only.");
+      await reflect();
+      expect(row(newer).status).toBe("disputed");
+      expect(row(older).status).toBe("active");
+      expect(disputeInputs).toHaveLength(0);
+    });
+
+    it("keeps what the person said over a contradicting guess, without a model", async () => {
+      (fake.env as { DISPUTE_RESOLUTION?: string }).DISPUTE_RESOLUTION = "on";
+      await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+      await settle(mo);
+      await mo.addEpisode(hermes, { scope: "profile", messages: [{ role: "assistant", content: "I think APACHE fits better for these repositories overall" }] });
+      await settle(mo);
+      const [said, guess] = notes();
+      expect(guess).toMatchObject({ status: "disputed" });
+      await reflect();
+      // The guess was wrong, not outdated: its record expires, it never gets a time when it was true.
+      expect(row(String(guess!.id))).toMatchObject({ status: "superseded", superseded_by: said!.id, valid_to: null });
+      expect(row(String(said!.id))).toMatchObject({ status: "active", valid_to: null });
+      expect(disputeInputs).toHaveLength(0);
+      const settled = mo.activity(web, 20).find((a) => a.action === "dispute.settle");
+      expect(settled?.detail).toMatchObject({ older: said!.id, newer: guess!.id, verdict: "older", by: "trust" });
+    });
+
+    it("lets a newer confirmed note replace an older guess and closes the old one's validity", async () => {
+      (fake.env as { DISPUTE_RESOLUTION?: string }).DISPUTE_RESOLUTION = "on";
+      const { older, newer } = await agentDispute("It is an open question whether the credit cap applies after Dec 1.", "The credit cap does not apply after Dec 1; free volume only.");
+      db.prepare("UPDATE items SET trust = 'user_confirmed' WHERE id = ?").run(newer);
+      await reflect();
+      expect(row(older)).toMatchObject({ status: "superseded", superseded_by: newer, valid_to: Date.UTC(2026, 10, 24) });
+      expect(row(newer)).toMatchObject({ status: "active", valid_to: null });
+      expect(disputeInputs).toHaveLength(0);
+    });
+
+    it("asks the model about two guesses: an answered open question is replaced over time", async () => {
+      (fake.env as { DISPUTE_RESOLUTION?: string }).DISPUTE_RESOLUTION = "on";
+      const { older, newer } = await agentDispute("It is an open question whether the credit cap applies after Dec 1.", "The credit cap does not apply after Dec 1; free volume only.");
+      await reflect();
+      expect(disputeInputs).toHaveLength(1);
+      expect(disputeInputs[0]).toContain("OLDER (2026-11-20, agent_inference): It is an open question");
+      expect(disputeInputs[0]).toContain("NEWER (2026-11-24, agent_inference): The credit cap");
+      expect(row(older)).toMatchObject({ status: "superseded", superseded_by: newer, valid_to: Date.UTC(2026, 10, 24) });
+      expect(row(newer).status).toBe("active");
+      // The old note is still there for recall as of a past time.
+      const past = await mo.recall(claude, { query: "credit cap after Dec 1", scopes: ["project:rhizome"], asOf: Date.UTC(2026, 10, 22) });
+      expect(past.items.map((i) => i.id)).toContain(older);
+    });
+
+    it("drops the dispute when the model says both hold", async () => {
+      (fake.env as { DISPUTE_RESOLUTION?: string }).DISPUTE_RESOLUTION = "on";
+      disputeAnswer = "both";
+      const { older, newer } = await agentDispute("rhizome stores episodes in R2.", "rhizome stores notes in Durable Object SQLite.");
+      await reflect();
+      expect(row(newer).status).toBe("active");
+      expect(row(older).status).toBe("active");
+      expect(db.prepare("SELECT COUNT(*) AS n FROM links WHERE kind = 'contradicts'").get()).toEqual({ n: 0 });
+    });
+
+    it("leaves an unclear pair disputed and asks again only after a week", async () => {
+      (fake.env as { DISPUTE_RESOLUTION?: string }).DISPUTE_RESOLUTION = "on";
+      disputeAnswer = "unsure";
+      const { newer } = await agentDispute("The homelab runs Proxmox.", "The homelab runs Unraid.");
+      await reflect();
+      await reflect();
+      expect(disputeInputs).toHaveLength(1);
+      expect(row(newer).status).toBe("disputed");
+      now += 8 * 86_400_000;
+      await reflect();
+      expect(disputeInputs).toHaveLength(2);
+    });
+
+    it("makes a disputed note active again when the other side is gone", async () => {
+      (fake.env as { DISPUTE_RESOLUTION?: string }).DISPUTE_RESOLUTION = "on";
+      const { older, newer } = await agentDispute("The homelab runs Proxmox.", "The homelab runs Unraid.");
+      await mo.forget(web, older);
+      await reflect();
+      expect(row(newer).status).toBe("active");
+      expect(disputeInputs).toHaveLength(0);
+    });
   });
 
   it("stops queueing extraction once the daily limit is reached", async () => {

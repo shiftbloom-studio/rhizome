@@ -14,6 +14,7 @@ import { parseTimeWindow } from "./timewindow";
 import {
   DEFAULT_EXTRACTION_MODEL,
   DEFAULT_REFLECTION_MODEL,
+  DISPUTE_PROMPT,
   DUPLICATE_SIMILARITY,
   EXTRACTION_PROMPT,
   LINK_SIMILARITY,
@@ -35,11 +36,14 @@ import {
   parseJsonObject,
   relatedNotes,
   relatedSection,
+  settleByTrust,
   shouldArchive,
   targetScope,
   validateExtraction,
   validateNoteEntities,
   validateRelations,
+  validateVerdicts,
+  type DisputeVerdict,
   type Extraction,
   type Relation,
 } from "./intel";
@@ -188,6 +192,9 @@ const JOBS_PER_ALARM = 3;
 const MAX_JOB_ATTEMPTS = 4;
 /** Notes compared against when resolving a new fact. Personal memories stay far below this. */
 const MAX_CANDIDATES = 5000;
+/** Disputed pairs per reflection run that go to the model, in one request. */
+const MAX_DISPUTES = 20;
+const DAY_MS = 86_400_000;
 const RECALLABLE = "('active', 'disputed')";
 const SYSTEM_EXTRACTION = "system:extraction";
 
@@ -1717,6 +1724,9 @@ export class MemoryObject extends DurableObject<Env> {
     }
     report.merged = merged;
 
+    // 2b. disputed notes, settled by trust and time (feature flag, see settleDisputes)
+    if (this.env.DISPUTE_RESOLUTION === "on") report.disputes = await this.settleDisputes(now);
+
     // 3. "similar" edges for notes that have none yet, e.g. notes written before the threshold fit the embedding model
     const linksBefore = Number(this.sql.exec("SELECT COUNT(*) AS n FROM links WHERE kind = 'similar'").toArray()[0]?.n ?? 0);
     const unlinked = this.sql
@@ -1790,6 +1800,115 @@ export class MemoryObject extends DurableObject<Env> {
 
     this.setMeta("last_reflection_at", String(now));
     this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'reflect', ?)", now, SYSTEM_REFLECTION, JSON.stringify(report));
+  }
+
+  /**
+   * Settles contradicting notes over time. What the person said or confirmed wins
+   * over a guess, and of two things the person said the later one wins. The
+   * extraction model judges the pairs the trust ladder cannot decide, at most
+   * MAX_DISPUTES a run in one request; a pair it was unsure about waits a week.
+   * A note replaced because time moved on (or whose open question got answered)
+   * keeps its history and its validity ends where the newer note's starts; a note
+   * that was simply wrong only expires. Nothing is deleted.
+   */
+  private async settleDisputes(now: number): Promise<Record<string, number>> {
+    const counts: Record<DisputeVerdict | "reopened", number> = { newer: 0, older: 0, both: 0, unsure: 0, reopened: 0 };
+    const live = (id: string) => {
+      const status = this.sql.exec("SELECT status FROM items WHERE id = ?", id).toArray()[0]?.status;
+      return status === "active" || status === "disputed";
+    };
+    const opposite = (id: string) =>
+      this.sql
+        .exec("SELECT dst AS o, weight FROM links WHERE src = ?1 AND kind = 'contradicts' UNION SELECT src AS o, weight FROM links WHERE dst = ?1 AND kind = 'contradicts'", id)
+        .toArray()
+        .map((r) => ({ id: String(r.o), weight: Number(r.weight) }));
+    const disputed = this.sql
+      .exec("SELECT id FROM items WHERE kind = 'note' AND status = 'disputed' ORDER BY importance DESC LIMIT 500")
+      .toArray()
+      .map((r) => String(r.id));
+
+    // Open pairs. When the other side was replaced since, the dispute moves on to its current version.
+    const pairs = new Map<string, [string, string]>();
+    this.ctx.storage.transactionSync(() => {
+      for (const id of disputed) {
+        for (const o of opposite(id)) {
+          const current = this.currentVersion(o.id);
+          if (current === id || !live(current)) continue;
+          if (current !== o.id) this.link(id, current, "contradicts", o.weight, now);
+          pairs.set([id, current].sort().join("|"), [id, current]);
+        }
+      }
+    });
+
+    type Side = { id: string; content: string; trust: string; t: number; created: number };
+    const side = (id: string): Side => {
+      const r = this.sql.exec("SELECT content, trust, t_event, created_at FROM items WHERE id = ?", id).toArray()[0]!;
+      return { id, content: String(r.content), trust: String(r.trust), t: Number(r.t_event), created: Number(r.created_at) };
+    };
+    // Older is what was said first; written at the same time, what was stored first.
+    const before = (x: Side, y: Side) => x.t < y.t || (x.t === y.t && (x.created < y.created || (x.created === y.created && x.id < y.id)));
+    const settle = (older: Side, newer: Side, verdict: DisputeVerdict, by: "trust" | "model") => {
+      if (!live(older.id) || !live(newer.id)) return;
+      if (verdict === "newer") this.supersede(older.id, newer.id, now);
+      else if (verdict === "older") this.supersede(newer.id, older.id, now, false);
+      else if (verdict === "both") {
+        this.sql.exec("DELETE FROM links WHERE kind = 'contradicts' AND ((src = ?1 AND dst = ?2) OR (src = ?2 AND dst = ?1))", older.id, newer.id);
+      } else return;
+      counts[verdict]++;
+      this.sql.exec(
+        "INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'dispute.settle', ?)",
+        now, SYSTEM_REFLECTION, JSON.stringify({ older: older.id, newer: newer.id, verdict, by }),
+      );
+    };
+
+    const ordered = [...pairs.entries()].map(([key, [a, b]]) => {
+      const [x, y] = [side(a), side(b)];
+      return { key, older: before(x, y) ? x : y, newer: before(x, y) ? y : x };
+    });
+    const ask: typeof ordered = [];
+    const unsure: Record<string, number> = JSON.parse(this.meta("dispute_unsure") ?? "{}");
+    this.ctx.storage.transactionSync(() => {
+      for (const p of ordered) {
+        const verdict = settleByTrust(p.older.trust, p.newer.trust);
+        if (verdict) settle(p.older, p.newer, verdict, "trust");
+        else if (now - (unsure[p.key] ?? 0) >= 7 * DAY_MS && ask.length < MAX_DISPUTES) ask.push(p);
+      }
+    });
+
+    if (ask.length && this.extractionEnabled) {
+      const model = this.env.EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
+      const day = (t: number) => new Date(t).toISOString().slice(0, 10);
+      const input = ask
+        .map((p, i) => `Pair ${i}\nOLDER (${day(p.older.t)}, ${p.older.trust}): ${p.older.content.slice(0, 600)}\nNEWER (${day(p.newer.t)}, ${p.newer.trust}): ${p.newer.content.slice(0, 600)}`)
+        .join("\n\n");
+      try {
+        // A short judgement per pair: no thinking, so the flash model answers within the budget.
+        const verdicts = await this.generateJson(model, DISPUTE_PROMPT, input, (r) => validateVerdicts(r, ask.length), 1000, { reasoning_effort: "none" });
+        this.ctx.storage.transactionSync(() => {
+          ask.forEach((p, i) => {
+            if (verdicts[i] === "unsure") {
+              counts.unsure++;
+              unsure[p.key] = now;
+            } else settle(p.older, p.newer, verdicts[i]!, "model");
+          });
+        });
+      } catch (err) {
+        console.error("dispute resolution failed", String(err));
+      }
+    }
+    // Only pairs that are still open keep their "unsure" mark.
+    for (const key of Object.keys(unsure)) if (!pairs.has(key)) delete unsure[key];
+    this.setMeta("dispute_unsure", JSON.stringify(unsure));
+
+    // A disputed note with no open dispute left is active again.
+    this.ctx.storage.transactionSync(() => {
+      for (const id of disputed) {
+        if (!live(id) || opposite(id).some((o) => live(o.id))) continue;
+        this.sql.exec("UPDATE items SET status = 'active', updated_at = ? WHERE id = ? AND status = 'disputed'", now, id);
+        counts.reopened++;
+      }
+    });
+    return counts;
   }
 
   /**
