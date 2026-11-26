@@ -64,6 +64,8 @@ export interface EpisodeInput {
   metadata?: Record<string, unknown>;
   /** How a conversation is cut for search: "fixed" (1,200 characters) or "rounds". Default: the CHUNKING variable, else "fixed". */
   chunking?: "fixed" | "rounds";
+  /** Set for conversations an agent saves itself (MCP save_conversation), see walls rule 3. */
+  track?: Tracked;
 }
 
 export interface NoteInput {
@@ -316,12 +318,17 @@ export class MemoryObject extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- writes
 
-  async addEpisode(client: Client, input: EpisodeInput): Promise<{ id: string; chunks: number }> {
+  async addEpisode(client: Client, input: EpisodeInput): Promise<{ id: string; chunks: number; scope?: string; wanted?: string }> {
     const userId = this.userId(client);
     const text = input.messages?.length ? transcript(input.messages) : (input.text ?? "").trim();
     if (!text) throw new Error("episode is empty");
     const id = newId();
     const now = Date.now();
+    // Walls rule 3: a conversation that was given walled memory is saved inside that wall,
+    // so its transcript and what is extracted from it stay there.
+    const wanted = input.scope;
+    const inside = input.track ? this.writeInside(client, input.track, wanted, now) : null;
+    if (inside) input = { ...input, scope: inside };
     const tEvent = input.tEvent ?? now;
     const r2Key = `users/${userId}/${input.scope}/episodes/${new Date(tEvent).toISOString().slice(0, 7)}/${id}.json`;
     await this.env.EPISODES.put(
@@ -361,7 +368,7 @@ export class MemoryObject extends DurableObject<Env> {
       if (this.extractionEnabled && text.length >= 40 && this.takeExtractionBudget()) this.enqueue("extract", id, 2_000);
     });
     await this.kick();
-    return { id, chunks: parts.length };
+    return inside ? { id, chunks: parts.length, scope: inside, wanted } : { id, chunks: parts.length };
   }
 
   async addNote(client: Client, input: NoteInput): Promise<{ id: string; scope?: string; heldFor?: string }> {
@@ -400,11 +407,15 @@ export class MemoryObject extends DurableObject<Env> {
    */
   async importNotes(
     client: Client,
-    input: { scope: string; notes: string[]; kind?: NoteKind; trust?: Trust; source?: string },
-  ): Promise<{ added: number; skipped: number; ids: string[] }> {
+    input: { scope: string; notes: string[]; kind?: NoteKind; trust?: Trust; source?: string; track?: Tracked },
+  ): Promise<{ added: number; skipped: number; ids: string[]; scope?: string; heldFor?: string }> {
     this.userId(client);
     if (!can(client, "write", input.scope)) throw new ForbiddenError(input.scope);
     const now = Date.now();
+    // Walls rule 3, as for remember: imported notes stay inside the wall, held for the person.
+    const target = input.scope;
+    const inside = input.track ? this.writeInside(client, input.track, target, now) : null;
+    if (inside) input = { ...input, scope: inside };
     const trust = input.trust ?? "user_confirmed";
     const ids: string[] = [];
     let skipped = 0;
@@ -432,12 +443,13 @@ export class MemoryObject extends DurableObject<Env> {
           now,
         );
         this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", id, now);
+        if (inside) this.hold(id, inside, target, "import", now);
         ids.push(id);
       }
       this.audit(client, "notes.import", { scope: input.scope, added: ids.length, skipped, source: input.source ?? null });
     });
     if (ids.length) await this.kick();
-    return { added: ids.length, skipped, ids };
+    return inside ? { added: ids.length, skipped, ids, scope: inside, heldFor: target } : { added: ids.length, skipped, ids };
   }
 
   async putBlock(
@@ -1204,9 +1216,14 @@ export class MemoryObject extends DurableObject<Env> {
   private seenWalls(client: Client, track: Tracked, now: number): Seen {
     const since = track.conversation ? now - HANDLE_TTL_MS : now - WINDOW_MS;
     const seen: Seen = new Map();
-    for (const r of this.sql.exec("SELECT wall, scope, last_at FROM wall_reads WHERE conversation = ? AND last_at > ?", this.conversationKey(client, track), since).toArray()) {
-      seen.set(String(r.wall), { scope: String(r.scope), at: Number(r.last_at) });
-    }
+    const add = (key: string, after: number) => {
+      for (const r of this.sql.exec("SELECT wall, scope, last_at FROM wall_reads WHERE conversation = ? AND last_at > ?", key, after).toArray()) {
+        const prev = seen.get(String(r.wall));
+        if (!prev || Number(r.last_at) > prev.at) seen.set(String(r.wall), { scope: String(r.scope), at: Number(r.last_at) });
+      }
+    };
+    add(this.conversationKey(client, track), since);
+    if (track.conversation && track.window) add(this.conversationKey(client, {}), now - WINDOW_MS);
     return seen;
   }
 
@@ -1251,7 +1268,7 @@ export class MemoryObject extends DurableObject<Env> {
     return last.scope;
   }
 
-  private hold(itemId: string, fromScope: string, toScope: string, via: "extraction" | "remember", now: number): void {
+  private hold(itemId: string, fromScope: string, toScope: string, via: "extraction" | "remember" | "import", now: number): void {
     this.sql.exec(
       "INSERT INTO promotions (item_id, from_scope, to_scope, via, created_at) VALUES (?, ?, ?, ?, ?)",
       itemId, fromScope, toScope, via, now,

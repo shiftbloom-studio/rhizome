@@ -309,3 +309,57 @@ describe("walls and conversations (rule 2)", () => {
     expect(clean.text).toContain("Remembered in profile");
   });
 });
+
+describe("walls and conversations saved or imported from behind a wall", () => {
+  let mo: MemoryObject;
+  let db: ReturnType<typeof fakeState>["db"];
+  const settle = async () => {
+    for (let i = 0; i < 12; i++) {
+      now += 5_000;
+      await mo.alarm();
+    }
+  };
+  const messages = [
+    { role: "user", content: "RATE: for Acme I bill 900 euros a day, and their Orion launch is fixed for March 3." },
+    { role: "assistant", content: "Noted." },
+  ];
+
+  beforeEach(async () => {
+    now = Date.UTC(2026, 10, 26, 9);
+    const s = fakeState();
+    db = s.db;
+    mo = new MemoryObject(s.state as never, fakeEnv(extract).env as never);
+    await mo.addNote(claudeCode, { scope: "project:acme", content: "Acme's budget for the Orion feature is 60,000 euros.", kind: "fact", trust: "user_confirmed" });
+    await settle();
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    mo.setWall(claudeCode, "globex", ["project:globex"]);
+  });
+
+  it("save a walled conversation inside its wall, and hold what is extracted from it", async () => {
+    await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "sess-a" });
+    const saved = await tool(mo, claudeCode, "save_conversation", { project: "globex", messages, conversation: "sess-a" });
+    expect(saved.scope).toBe("project:acme");
+    expect(saved.text).toContain("instead of project:globex");
+    await settle();
+    expect((db.prepare("SELECT DISTINCT scope FROM items WHERE kind = 'chunk'").all() as { scope: string }[]).map((r) => r.scope)).toEqual(["project:acme"]);
+    expect(mo.listHeld(claudeCode).map((h) => [h.content, h.to, h.via])).toEqual([["The user charges Acme a day rate of 900 euros.", "profile", "extraction"]]);
+    const globex = await tool(mo, cursor, "recall", { query: "day rate euros Orion", project: "globex" });
+    expect(globex.text).not.toContain("900 euros");
+  });
+
+  it("treat a session id that was not used on reads like the connector's last 30 minutes", async () => {
+    await tool(mo, claudeCode, "recall", { query: "budget", project: "acme", conversation: "handle-from-context" });
+    const saved = await tool(mo, claudeCode, "save_conversation", { messages, session_id: "agent-session-1" });
+    expect(saved.scope).toBe("project:acme");
+    // A conversation that read no wall is saved where it asks to be.
+    const other = await tool(mo, cursor, "save_conversation", { messages, session_id: "agent-session-2" });
+    expect(other.scope).toBe("agent:cursor");
+  });
+
+  it("import notes from a walled conversation inside the wall, held", async () => {
+    await tool(mo, claudeCode, "get_context", { project: "acme", conversation: "sess-a" });
+    const res = await tool(mo, claudeCode, "import_memory_file", { content: "- Prefers dark mode.\n- Uses tabs.", format: "markdown", scope: "profile", conversation: "sess-a" });
+    expect(res).toMatchObject({ scope: "project:acme", heldFor: "profile" });
+    expect(mo.listHeld(claudeCode).map((h) => [h.to, h.via])).toEqual([["profile", "import"], ["profile", "import"]]);
+  });
+});

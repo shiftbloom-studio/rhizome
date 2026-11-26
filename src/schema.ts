@@ -220,7 +220,7 @@ export const MIGRATIONS: string[] = [
     item_id     TEXT NOT NULL,
     from_scope  TEXT NOT NULL,
     to_scope    TEXT NOT NULL,
-    via         TEXT NOT NULL,             -- extraction | remember
+    via         TEXT NOT NULL,             -- extraction | remember | import
     state       TEXT NOT NULL DEFAULT 'held', -- held | released | dismissed
     created_at  INTEGER NOT NULL,
     decided_at  INTEGER

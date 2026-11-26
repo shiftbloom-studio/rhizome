@@ -28,6 +28,8 @@ export const HANDLE_TTL_MS = 30 * 86_400_000;
 /** Marks a call that comes from an agent's conversation (MCP), optionally with its handle. */
 export interface Tracked {
   conversation?: string;
+  /** Also count what the connector was given within WINDOW_MS (for a handle that may not have been used for reads). */
+  window?: boolean;
 }
 
 /** Wall name -> the scope of that wall this conversation was last given memory from, and when. */

@@ -27,8 +27,14 @@ export interface MemoryApi {
     opts?: { track?: Tracked },
   ): Promise<{ text: string; notices?: string[]; conversation?: string }> | { text: string; notices?: string[]; conversation?: string };
   addNote(client: Client, input: { scope: string; content: string; kind?: NoteKind; trust?: Trust; track?: Tracked }): Promise<{ id: string; scope?: string; heldFor?: string }>;
-  addEpisode(client: Client, input: { scope: string; sessionId?: string; model?: string; messages?: { role: string; content: string }[]; text?: string }): Promise<{ id: string; chunks: number }>;
-  importNotes(client: Client, input: { scope: string; notes: string[]; kind?: NoteKind; trust?: Trust; source?: string }): Promise<{ added: number; skipped: number }>;
+  addEpisode(
+    client: Client,
+    input: { scope: string; sessionId?: string; model?: string; messages?: { role: string; content: string }[]; text?: string; track?: Tracked },
+  ): Promise<{ id: string; chunks: number; scope?: string; wanted?: string }>;
+  importNotes(
+    client: Client,
+    input: { scope: string; notes: string[]; kind?: NoteKind; trust?: Trust; source?: string; track?: Tracked },
+  ): Promise<{ added: number; skipped: number; scope?: string; heldFor?: string }>;
   forget(client: Client, id: string): Promise<{ deleted: number }>;
   scopes(client: Client): Promise<string[]> | string[];
 }
@@ -137,6 +143,7 @@ export const TOOLS = [
         text: { type: "string", description: "Use instead of messages for a summary or log." },
         project: projectProp,
         session_id: { type: "string", maxLength: 200 },
+        conversation: conversationProp,
         model: { type: "string", maxLength: 200 },
       },
       additionalProperties: false,
@@ -155,6 +162,7 @@ export const TOOLS = [
         scope: scopeProp,
         project: projectProp,
         file_name: { type: "string", maxLength: 200 },
+        conversation: conversationProp,
       },
       required: ["content"],
       additionalProperties: false,
@@ -312,7 +320,16 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
         text: messages?.length ? undefined : body,
         sessionId: str(args.session_id, "session_id", 200),
         model: str(args.model, "model", 200),
+        // Without a conversation handle, the session id names the conversation. It may not
+        // have been passed on reads, so what the connector read lately counts too.
+        track: args.conversation === undefined ? { ...track({ conversation: args.session_id }), window: true } : track(args),
       });
+      if (res.scope && res.wanted) {
+        return text(
+          `Saved to ${res.scope} (id ${res.id}) instead of ${res.wanted}: this conversation was given memory from behind a wall. Facts are extracted in the background within a minute and stay there until the person releases them.`,
+          { id: res.id, scope: res.scope, wanted: res.wanted },
+        );
+      }
       return text(`Saved to ${scope} (id ${res.id}). Facts are extracted in the background within a minute.`, { id: res.id, scope });
     }
     case "import_memory_file": {
@@ -327,7 +344,14 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
         notes,
         trust: format === "hermes" ? "agent_inference" : "user_confirmed",
         source: str(args.file_name, "file_name", 200) ?? format,
+        track: track(args),
       });
+      if (res.scope && res.heldFor) {
+        return text(
+          `Imported ${res.added} notes into ${res.scope} instead of ${res.heldFor}, skipped ${res.skipped}: this conversation was given memory from behind a wall. They move once the person releases them.`,
+          { scope: res.scope, heldFor: res.heldFor, added: res.added, skipped: res.skipped },
+        );
+      }
       return text(`Imported ${res.added} notes into ${scope}, skipped ${res.skipped} that already existed.`, { scope, ...res });
     }
     case "forget": {
