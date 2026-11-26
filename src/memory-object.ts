@@ -15,6 +15,7 @@ import {
   DUPLICATE_SIMILARITY,
   EXTRACTION_PROMPT,
   LINK_SIMILARITY,
+  NOTE_ENTITIES_PROMPT,
   PROFILE_PROMPT,
   PROJECT_PROMPT,
   RELATED_SIMILARITY,
@@ -31,6 +32,7 @@ import {
   shouldArchive,
   targetScope,
   validateExtraction,
+  validateNoteEntities,
   validateRelations,
   type Extraction,
   type Relation,
@@ -956,7 +958,7 @@ export class MemoryObject extends DurableObject<Env> {
     return out;
   }
 
-  private async generate(model: string, system: string, user: string, maxTokens: number): Promise<string> {
+  private async generate(model: string, system: string, user: string, maxTokens: number, extra?: Record<string, unknown>): Promise<string> {
     const res = await runAi<unknown>(this.env.AI, model, {
       messages: [
         { role: "system", content: system },
@@ -964,16 +966,24 @@ export class MemoryObject extends DurableObject<Env> {
       ],
       max_tokens: maxTokens,
       temperature: 0,
+      ...extra,
     });
     return aiText(res);
   }
 
   /** Asks a model for JSON, validates it and retries once with the error. */
-  private async generateJson<T>(model: string, system: string, user: string, validate: (raw: unknown) => T, maxTokens = 3000): Promise<T> {
+  private async generateJson<T>(
+    model: string,
+    system: string,
+    user: string,
+    validate: (raw: unknown) => T,
+    maxTokens = 3000,
+    extra?: Record<string, unknown>,
+  ): Promise<T> {
     let prompt = user;
     let lastError = "";
     for (let attempt = 0; attempt < 2; attempt++) {
-      const text = await this.generate(model, system, prompt, maxTokens);
+      const text = await this.generate(model, system, prompt, maxTokens, extra);
       try {
         return validate(parseJsonObject(text));
       } catch (err) {
@@ -1180,13 +1190,18 @@ export class MemoryObject extends DurableObject<Env> {
   }
 
   /** "similar" edges from one note to its closest neighbours in the same scope. */
-  private linkSimilar(id: string, now: number): void {
+  private linkSimilar(id: string, now: number, pools?: Map<string, ReturnType<MemoryObject["candidates"]>>): void {
     const row = this.sql
       .exec("SELECT i.scope, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id WHERE i.id = ?", id)
       .toArray()[0];
     if (!row) return;
     const vec = decodeVector(row.vec as ArrayBuffer);
-    const near = nearest(vec, this.candidates([String(row.scope), "profile"], [id]), 5, LINK_SIMILARITY);
+    const scope = String(row.scope);
+    // A batch (reflection) shares one candidate list per scope instead of reading all vectors per note.
+    let pool = pools?.get(scope);
+    if (pools && !pool) pools.set(scope, (pool = this.candidates([scope, "profile"])));
+    const candidates = pool ? pool.filter((c) => c.id !== id) : this.candidates([scope, "profile"], [id]);
+    const near = nearest(vec, candidates, 5, LINK_SIMILARITY);
     for (const n of near) {
       if (n.similarity >= DUPLICATE_SIMILARITY) continue; // merges handle these
       this.link(id, n.item.id, "similar", n.similarity, now);
@@ -1298,7 +1313,25 @@ export class MemoryObject extends DurableObject<Env> {
     }
     report.merged = merged;
 
-    // 3. distilled profile and project summaries
+    // 3. "similar" edges for notes that have none yet, e.g. notes written before the threshold fit the embedding model
+    const linksBefore = Number(this.sql.exec("SELECT COUNT(*) AS n FROM links WHERE kind = 'similar'").toArray()[0]?.n ?? 0);
+    const unlinked = this.sql
+      .exec(
+        `SELECT id FROM items i WHERE kind = 'note' AND status = 'active'
+           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.src = i.id AND l.kind = 'similar')
+         ORDER BY importance DESC LIMIT 500`,
+      )
+      .toArray();
+    const pools = new Map<string, ReturnType<MemoryObject["candidates"]>>();
+    this.ctx.storage.transactionSync(() => {
+      for (const r of unlinked) this.linkSimilar(String(r.id), now, pools);
+    });
+    report.linked = Number(this.sql.exec("SELECT COUNT(*) AS n FROM links WHERE kind = 'similar'").toArray()[0]?.n ?? 0) - linksBefore;
+
+    // 4. entities for notes that did not come from an episode (remembered, imported, written in the explorer)
+    report.tagged = this.extractionEnabled ? await this.tagNoteEntities() : 0;
+
+    // 5. distilled profile and project summaries
     const model = this.env.REFLECTION_MODEL ?? DEFAULT_REFLECTION_MODEL;
     const fallback = this.env.EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
     const write = async (scope: string, label: string, prompt: string, description: string, charLimit: number) => {
@@ -1350,6 +1383,54 @@ export class MemoryObject extends DurableObject<Env> {
 
     this.setMeta("last_reflection_at", String(now));
     this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'reflect', ?)", now, SYSTEM_REFLECTION, JSON.stringify(report));
+  }
+
+  /**
+   * Asks the extraction model which entities each note is about, in batches of
+   * 20 and at most 100 notes per run. A cursor (created_at, id) remembers how far
+   * it got, so notes without any entity are not sent again.
+   */
+  private async tagNoteEntities(): Promise<number> {
+    const model = this.env.EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
+    const [cursorAt, cursorId] = (this.meta("entity_cursor") ?? "0|").split("|");
+    let at = Number(cursorAt) || 0;
+    let lastId = cursorId ?? "";
+    let tagged = 0;
+    for (let batch = 0; batch < 5; batch++) {
+      const notes = this.sql
+        .exec(
+          `SELECT id, content, t_event, created_at FROM items
+           WHERE kind = 'note' AND origin != 'extracted' AND status IN ('active', 'disputed')
+             AND (created_at > ?1 OR (created_at = ?1 AND id > ?2))
+           ORDER BY created_at, id LIMIT 20`,
+          at,
+          lastId,
+        )
+        .toArray();
+      if (notes.length === 0) break;
+      const input = notes.map((n, i) => `${i}. ${String(n.content).slice(0, 600)}`).join("\n");
+      let entities: Extraction["entities"][];
+      try {
+        // Tagging needs no thinking: with reasoning on, the flash model spends the whole budget before it answers.
+        // Workers AI understands reasoning_effort; the self-hosted AI client only forwards the fields it knows.
+        entities = await this.generateJson(model, NOTE_ENTITIES_PROMPT, input, (r) => validateNoteEntities(r, notes.length), 2000, { reasoning_effort: "none" });
+      } catch (err) {
+        console.error("note tagging failed", String(err));
+        break;
+      }
+      const last = notes[notes.length - 1]!;
+      at = Number(last.created_at);
+      lastId = String(last.id);
+      this.ctx.storage.transactionSync(() => {
+        notes.forEach((n, i) => {
+          if (!entities[i]!.length) return;
+          for (const id of this.upsertEntities(entities[i]!, Number(n.t_event)).values()) this.mention(String(n.id), id);
+          tagged++;
+        });
+        this.setMeta("entity_cursor", `${at}|${lastId}`);
+      });
+    }
+    return tagged;
   }
 
   private meta(key: string): string | null {

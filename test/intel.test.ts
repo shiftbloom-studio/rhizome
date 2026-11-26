@@ -12,6 +12,7 @@ import {
   shouldArchive,
   targetScope,
   validateExtraction,
+  validateNoteEntities,
   validateRelations,
 } from "../src/intel";
 
@@ -122,5 +123,22 @@ describe("scope and trust rules", () => {
     expect(capTrust("user_confirmed", false)).toBe("agent_inference");
     expect(capTrust("user_explicit", true)).toBe("user_explicit");
     expect(capTrust("tool", false)).toBe("tool");
+  });
+});
+
+describe("note tagging", () => {
+  it("keeps valid entities per note and drops the rest", () => {
+    const out = validateNoteEntities(
+      {
+        notes: [
+          { note: 0, entities: [{ name: "Cloudflare", type: "org" }, { name: "cloudflare", type: "org" }, { name: "Vibes", type: "mood" }] },
+          { note: 5, entities: [{ name: "Out of range", type: "tool" }] },
+          { note: 1, entities: [{ name: " ", type: "tool" }] },
+        ],
+      },
+      2,
+    );
+    expect(out).toEqual([[{ name: "Cloudflare", type: "org" }, { name: "Vibes", type: "concept" }], []]);
+    expect(() => validateNoteEntities({}, 1)).toThrow();
   });
 });

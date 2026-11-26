@@ -2,7 +2,7 @@
 // Runs the MemoryObject against node:sqlite and fake AI, R2 and Vectorize
 // bindings: extraction, conflict resolution, merging, recall, forgetting and reflection.
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { EXTRACTION_PROMPT, PROFILE_PROMPT, RESOLVER_PROMPT } from "../src/intel";
+import { EXTRACTION_PROMPT, NOTE_ENTITIES_PROMPT, PROFILE_PROMPT, RESOLVER_PROMPT } from "../src/intel";
 import { MemoryObject } from "../src/memory-object";
 import type { Client } from "../src/scopes";
 import { fakeEnv, fakeState } from "./support/fake-do";
@@ -27,12 +27,19 @@ const EXTRACTIONS: Record<string, unknown> = {
 };
 
 let resolverAnswer = "update";
+let tagCalls = 0;
 function generate(_model: string, system: string, user: string): string {
   if (system === EXTRACTION_PROMPT) {
     const key = Object.keys(EXTRACTIONS).find((k) => user.includes(k))!;
     return "```json\n" + JSON.stringify(EXTRACTIONS[key]) + "\n```";
   }
   if (system === RESOLVER_PROMPT) return JSON.stringify({ results: [{ pair: 0, relation: resolverAnswer }] });
+  if (system === NOTE_ENTITIES_PROMPT) {
+    tagCalls++;
+    // Tags every note that mentions Cloudflare; the rest get nothing.
+    const notes = user.split("\n").map((line) => ({ note: Number(line.split(".")[0]), entities: /cloudflare/i.test(line) ? [{ name: "Cloudflare", type: "org" }] : [] }));
+    return JSON.stringify({ notes });
+  }
   if (system === PROFILE_PROMPT) return "## Rules\n- AGPL for everything.\n- Short replies.";
   return "## Project\n- Workers Builds.";
 }
@@ -190,6 +197,26 @@ describe("MemoryObject pipeline", () => {
     expect(db.prepare("SELECT version FROM blocks WHERE label = 'distilled-profile'").get()).toEqual({ version: 1 });
     expect(mo.stats(web).lastReflection).not.toBeNull();
   });
+  it("reflects: links remembered notes and tags them with entities, once", async () => {
+    await mo.addNote(claude, { scope: "project:rhizome", content: "rhizome runs on Cloudflare Workers with one Durable Object per person.", kind: "fact" });
+    await mo.addNote(claude, { scope: "project:rhizome", content: "rhizome stores raw episodes in R2 on Cloudflare.", kind: "fact" });
+    await mo.addNote(claude, { scope: "profile", content: "The user writes chat messages in German.", kind: "preference", trust: "user_explicit" });
+    await settle(mo);
+    await mo.requestReflection(web);
+    await settle(mo);
+    const mentions = db.prepare("SELECT COUNT(*) AS n FROM mentions m JOIN entities e ON e.id = m.entity_id WHERE e.name = 'Cloudflare'").get() as { n: number };
+    expect(mentions.n).toBe(2);
+    expect((db.prepare("SELECT mentions FROM entities WHERE name = 'Cloudflare'").get() as { mentions: number }).mentions).toBe(2);
+    const g = mo.graph(web, ["profile", "project:rhizome"]);
+    expect(g.edges.filter((e) => e.kind === "mentions")).toHaveLength(2);
+    const before = tagCalls;
+    await mo.requestReflection(web);
+    await settle(mo);
+    // Already tagged notes are not sent to the model again.
+    expect((db.prepare("SELECT mentions FROM entities WHERE name = 'Cloudflare'").get() as { mentions: number }).mentions).toBe(2);
+    expect(tagCalls).toBe(before);
+  });
+
   it("stops queueing extraction once the daily limit is reached", async () => {
     (fake.env as { EXTRACTION_DAILY_LIMIT?: string }).EXTRACTION_DAILY_LIMIT = "1";
     await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
