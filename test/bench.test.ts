@@ -267,5 +267,7 @@ describe("LongMemEval run", () => {
     // With extraction and one reflection per question, dispute resolution on.
     const reflected = await runBenchmark(DATASET, { ...opts, out: join(dir, "reflect"), extraction: true, reflect: true, vars: { DISPUTE_RESOLUTION: "on" } });
     expect(reflected.records.filter((r) => r.error)).toEqual([]);
+    // The reflection runs as of the question's date, so the weeks-old sessions are not archived.
+    for (const id of ["q1", "q2", "q3"]) expect(reflected.records.find((r) => r.id === id)!.metrics?.["recall_any@5"], id).toBe(1);
   }, 60_000);
 });

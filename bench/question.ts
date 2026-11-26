@@ -164,7 +164,8 @@ export async function askQuestion(memory: Memory, client: Client, q: Question, o
   }
   let stats = await waitIdle(memory, client, opts.idleTimeoutMs);
   if (opts.reflect) {
-    await memory.requestReflection(client);
+    // As of the question's date. At today's date every session would be years old, and the reflection would archive its chunks.
+    await memory.requestReflection(client, parseDate(q.question_date));
     stats = await waitIdle(memory, client, opts.idleTimeoutMs);
   }
   await opts.afterIngest?.();

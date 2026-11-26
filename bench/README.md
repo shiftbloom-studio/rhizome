@@ -126,5 +126,5 @@ The Benchmark workflow (Actions > Benchmark > Run workflow) runs the same comman
 ## How this differs from production
 
 * On Node, vector search is exact, while Vectorize is approximate and makes new vectors searchable after about a minute. A Node run measures ranking, not Vectorize. On Cloudflare, a question waits until Vectorize has applied its vectors, as it would have long before an agent asks about months-old chats.
-* A question replays months of sessions within minutes, so the nightly reflection (merging, decay, summaries, disputes) does not run between them. `--reflect` (on Cloudflare: the param `reflect`) runs it once, after the last session.
+* A question replays months of sessions within minutes, so the nightly reflection (merging, decay, summaries, disputes) does not run between them. `--reflect` (on Cloudflare: the param `reflect`) runs it once, after the last session and as of the question's date, so the sessions are as old as they were then.
 * The dataset's dates have no time zone and are read as UTC.
