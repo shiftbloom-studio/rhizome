@@ -9,18 +9,15 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { Env } from "../src/env";
-import { MemoryObject, type EpisodeInput, type MemoryItem, type RecallInput } from "../src/memory-object";
+import { MemoryObject, type EpisodeInput } from "../src/memory-object";
 import { DEFAULT_GRANTS, type Client } from "../src/scopes";
-import { estimateTokens } from "../src/text";
 import { LocalBucket } from "../src/node/blobs";
 import { LocalNamespace } from "../src/node/durable";
 import { LocalVectorIndex } from "../src/node/vectors";
 import { stableJson, type AiRunner } from "./ai";
-import { isAbstention, parseDate, typeKey, type Question, type Turn } from "./longmemeval";
-import { latestRecords, scoreQuestion, sessionOrder, summarize, summaryMarkdown, type Evidence, type ItemRef, type ResultRecord, type Summary } from "./metrics";
-
-/** Scope of every question's history. It has no ":" in it, so the episode files also work on Windows. */
-const SCOPE = "profile";
+import { isAbstention, typeKey, type Question } from "./longmemeval";
+import { latestRecords, parseResults, summarize, summaryMarkdown, type ResultRecord, type Summary } from "./metrics";
+import { askQuestion } from "./question";
 
 export interface BenchOptions {
   /** Run directory with config.json, results.jsonl, summary.json and summary.md. An existing run is resumed. */
@@ -34,7 +31,7 @@ export interface BenchOptions {
   features?: string[];
   /** Episode chunking, sent with every session (EpisodeInput.chunking). Unset: the memory code's default (CHUNKING). */
   chunking?: EpisodeInput["chunking"];
-  /** Send the question date as asOf, besides referenceTime. Default true. */
+  /** Also send the question date as asOf (see QuestionOptions.asOf). Default off. */
   asOf?: boolean;
   /** Questions in parallel. Default 4. */
   concurrency?: number;
@@ -55,102 +52,8 @@ export interface BenchOptions {
   stopped?: () => boolean;
 }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-export interface SessionIndex {
-  /** The transcript with every run of whitespace as one space. Chunks are trimmed, and round chunks rejoin trimmed rounds, so they are matched in this form. */
-  flat: string;
-  /** Where each character of `flat` sits in the transcript. */
-  at: number[];
-  /** Where each turn sits in the transcript. */
-  turns: { start: number; end: number }[];
-}
-
-/** A session as transcript() writes it, and where each turn sits in it. */
-export function indexSession(turns: Turn[]): SessionIndex {
-  let text = "";
-  const spans: SessionIndex["turns"] = [];
-  turns.forEach((t, i) => {
-    if (i > 0) text += "\n";
-    const piece = `[${t.role}] ${t.content}`;
-    spans.push({ start: text.length, end: text.length + piece.length });
-    text += piece;
-  });
-  let flat = "";
-  const at: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    const space = /\s/.test(text[i]!);
-    if (space && (!flat || flat.endsWith(" "))) continue;
-    flat += space ? " " : text[i];
-    at.push(i);
-  }
-  return { flat, at, turns: spans };
-}
-
-/** Turns a chunk covers: half of the turn, or 300 characters of it. */
-export function coveredTurns(index: SessionIndex, content: string): number[] {
-  const needle = content.replace(/\s+/g, " ").trim();
-  const found = needle ? index.flat.indexOf(needle) : -1;
-  if (found < 0) return [];
-  const start = index.at[found]!;
-  const end = index.at[found + needle.length - 1]! + 1;
-  const out: number[] = [];
-  index.turns.forEach((t, i) => {
-    const overlap = Math.min(end, t.end) - Math.max(start, t.start);
-    if (overlap > 0 && overlap >= Math.min(300, Math.ceil((t.end - t.start) / 2))) out.push(i);
-  });
-  return out;
-}
-
-/** Waits until embeddings and jobs are done, looking twice in a row so a finishing alarm can write its last rows. */
-async function waitIdle(stub: MemoryObject, client: Client, timeoutMs: number) {
-  const until = Date.now() + timeoutMs;
-  let quiet = 0;
-  for (;;) {
-    const s = await stub.stats(client);
-    if (s.pendingVectors === 0 && s.pendingJobs === 0) {
-      if (++quiet >= 2) return s;
-    } else quiet = 0;
-    if (Date.now() > until) {
-      throw new Error(`background work not done after ${Math.round(timeoutMs / 1000)} s (${s.pendingVectors} vectors, ${s.pendingJobs} jobs pending)`);
-    }
-    await sleep(250);
-  }
-}
-
-/** Maps recalled items to the sessions and turns they stand for. A note stands for the episodes it was extracted from. */
-function itemRefs(stub: MemoryObject, client: Client, sessionOf: Map<string, string>, indexes: Map<string, SessionIndex>) {
-  const noteSessions = new Map<string, string[]>();
-  const chunkRef = (episodeId: string | null | undefined, content: string): ItemRef => {
-    const session = episodeId ? sessionOf.get(episodeId) : undefined;
-    if (!session) return { sessions: [], turns: [] };
-    return { sessions: [session], turns: coveredTurns(indexes.get(session)!, content).map((n) => `${session}#${n}`) };
-  };
-  return async (items: MemoryItem[]): Promise<ItemRef[]> => {
-    const out: ItemRef[] = [];
-    for (const item of items) {
-      if (item.kind === "chunk") {
-        out.push(chunkRef(item.episodeId, item.content));
-        continue;
-      }
-      let sessions = noteSessions.get(item.id);
-      if (!sessions) {
-        const d = await stub.detail(client, item.id);
-        const neighbours = d && "neighbours" in d ? (d.neighbours ?? []) : [];
-        const episodes = neighbours.filter((n) => n.kind === "derived_from" && n.type === "episode").map((n) => n.id);
-        sessions = [...new Set(episodes.flatMap((e) => sessionOf.get(e) ?? []))];
-        noteSessions.set(item.id, sessions);
-      }
-      // With the evidence recall step a note brings its source excerpt, which can cover turns.
-      const ev = item.evidence;
-      out.push({ sessions, turns: ev ? chunkRef(ev.episodeId, ev.content).turns : [] });
-    }
-    return out;
-  };
-}
-
+/** One question on its own Node stores, removed afterwards unless keepStores is set. */
 async function runQuestion(q: Question, opts: BenchOptions, runId: string, storesDir: string): Promise<ResultRecord> {
-  const abstention = isAbstention(q);
   const dir = join(storesDir, q.question_id.replace(/[^A-Za-z0-9_-]/g, "_"));
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
@@ -177,72 +80,12 @@ async function runQuestion(q: Question, opts: BenchOptions, runId: string, store
       grants: DEFAULT_GRANTS,
     };
     const stub = memory.get(memory.idFromName(`eval:${runId}:${q.question_id}`));
-    const sessionOf = new Map<string, string>();
-    const indexes = new Map<string, SessionIndex>();
-    const evidence: Evidence = { sessions: new Set(), turns: new Set() };
-    const answerSessions = new Set(q.answer_session_ids);
-    let chunks = 0;
-    const started = Date.now();
-    for (let i = 0; i < q.haystack_sessions.length; i++) {
-      const sessionId = q.haystack_session_ids[i]!;
-      const turns = q.haystack_sessions[i]!;
-      indexes.set(sessionId, indexSession(turns));
-      if (answerSessions.has(sessionId)) evidence.sessions.add(sessionId);
-      turns.forEach((t, n) => {
-        if (t.has_answer === true) evidence.turns.add(`${sessionId}#${n}`);
-      });
-      if (turns.length === 0) continue;
-      const input: EpisodeInput = {
-        scope: SCOPE,
-        sessionId,
-        tEvent: parseDate(q.haystack_dates[i]!),
-        messages: turns.map((t) => ({ role: t.role, content: t.content })),
-        ...(opts.chunking ? { chunking: opts.chunking } : {}),
-      };
-      const res = await stub.addEpisode(client, input);
-      sessionOf.set(res.id, sessionId);
-      chunks += res.chunks;
-    }
-    const stats = await waitIdle(stub, client, opts.idleTimeoutMs ?? (opts.extraction ? 3_600_000 : 900_000));
-    const ingestMs = Date.now() - started;
-
-    // The question is asked at its own date: time words resolve against it, and with asOf only what was true then counts.
-    const askedAt = parseDate(q.question_date);
-    const ask: RecallInput = {
-      query: q.question,
-      scopes: [SCOPE],
-      referenceTime: askedAt,
-      ...(opts.asOf !== false ? { asOf: askedAt } : {}),
-      ...(opts.features ? { features: opts.features } : {}),
-    };
-    const deep = await stub.recall(client, { ...ask, limit: 50, budgetTokens: 1_000_000 });
-    const shown = await stub.recall(client, ask);
-
-    const refs = itemRefs(stub, client, sessionOf, indexes);
-    const ranked = await refs(deep.items);
-    const delivered = await refs(shown.items);
-    const deliveredTokens = estimateTokens(shown.text);
-    const abstained = shown.abstained;
-    const confidence = shown.items[0]?.confidence;
-    const record: ResultRecord = {
-      id: q.question_id,
-      type: q.question_type,
-      abstention,
-      sessions: q.haystack_sessions.length,
-      chunks,
-      notes: stats.notes,
-      ingestMs,
-      recallMs: deep.tookMs,
-      deliveredItems: shown.items.length,
-      deliveredTokens,
-      top: sessionOrder(ranked).slice(0, 10),
-      ...(abstained !== undefined ? { abstained } : {}),
-      ...(confidence !== undefined ? { confidence } : {}),
-    };
-    if (!abstention && evidence.sessions.size > 0) {
-      record.metrics = { ...scoreQuestion(ranked, delivered, evidence), delivered_items: shown.items.length, delivered_tokens: deliveredTokens };
-    }
-    return record;
+    return await askQuestion(stub, client, q, {
+      features: opts.features,
+      chunking: opts.chunking,
+      asOf: opts.asOf,
+      idleTimeoutMs: opts.idleTimeoutMs ?? (opts.extraction ? 3_600_000 : 900_000),
+    });
   } finally {
     memory.close();
     vectors.close();
@@ -290,10 +133,7 @@ export function workerVars(jsonc: string): Record<string, string> {
 
 export function readResults(file: string): ResultRecord[] {
   if (!existsSync(file)) return [];
-  return readFileSync(file, "utf8")
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => JSON.parse(line) as ResultRecord);
+  return parseResults(readFileSync(file, "utf8"));
 }
 
 function describe(r: ResultRecord): string {

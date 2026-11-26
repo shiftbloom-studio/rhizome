@@ -12,7 +12,7 @@
     "migrate": "node scripts/render-config.mjs && wrangler d1 migrations apply rhizome-control --remote -c wrangler.deploy.jsonc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "tsc --noEmit && npm run build:web && node scripts/render-config.mjs && wrangler deploy -c wrangler.deploy.jsonc --dry-run --outdir .wrangler/dry-run",
+    "check": "tsc --noEmit && npm run build:web && node scripts/render-config.mjs && wrangler deploy -c wrangler.deploy.jsonc --dry-run --outdir .wrangler/dry-run && wrangler deploy -c wrangler.bench.jsonc --dry-run --outdir .wrangler/dry-run-bench",
     "build:web": "npm --prefix web run build",
     "build:node": "node scripts/build-node.mjs",
     "bench": "node scripts/build-bench.mjs && node --disable-warning=ExperimentalWarning dist/bench/run.mjs",

@@ -103,6 +103,14 @@ export interface ResultRecord {
   error?: string;
 }
 
+/** The records of a results.jsonl file. */
+export function parseResults(text: string): ResultRecord[] {
+  return text
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line) as ResultRecord);
+}
+
 /** The last record per question id wins, so a rerun of a failed question replaces it. */
 export function latestRecords(records: ResultRecord[]): ResultRecord[] {
   const byId = new Map<string, ResultRecord>();
