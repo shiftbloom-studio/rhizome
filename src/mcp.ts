@@ -9,6 +9,7 @@ import { IMPORT_FORMATS, MAX_IMPORT_CHARS, parseMemoryFile, type ImportFormat } 
 import type { MemoryItem, NoteKind, Trust } from "./memory-object";
 import { NOTE_KINDS } from "./memory-object";
 import { agentScope, can, isValidSlug, recallScopes, type Client } from "./scopes";
+import { MAX_LOOP_CHARS, MAX_OUTCOME_CHARS } from "./loops";
 import { parseRangeBound } from "./timewindow";
 import type { Tracked } from "./walls";
 
@@ -40,6 +41,15 @@ export interface MemoryApi {
   ): Promise<{ added: number; skipped: number; scope?: string; heldFor?: string }>;
   forget(client: Client, id: string): Promise<{ deleted: number }>;
   scopes(client: Client): Promise<string[]> | string[];
+  /** Open loops (OPEN_LOOPS=on). */
+  openLoop?(client: Client, input: { scope: string; content: string; dueAt?: number; track?: Tracked }): Promise<{ id: string; scope: string; dueAt: string | null }> | { id: string; scope: string; dueAt: string | null };
+  closeLoop?(client: Client, id: string, outcome?: string): Promise<{ id: string; scope: string } | null> | { id: string; scope: string } | null;
+}
+
+/** Server options that change what the MCP server offers. */
+export interface McpOptions {
+  /** Offer open_loop and close_loop (OPEN_LOOPS=on). */
+  loops?: boolean;
 }
 
 interface JsonRpcRequest {
@@ -181,6 +191,43 @@ export const TOOLS = [
   },
 ] as const;
 
+/** Listed only with OPEN_LOOPS=on. */
+export const LOOP_TOOLS = [
+  {
+    name: "open_loop",
+    title: "Open a loop",
+    description: "Keeps something to come back to, e.g. a follow-up the person asked for. From its due date on, get_context lists it under Due now until close_loop is called. Without due it shows the next time get_context loads it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", maxLength: MAX_LOOP_CHARS, description: "What to do, in one short sentence that makes sense without the conversation." },
+        due: { type: "string", description: "Optional: from when it is due (ISO 8601, e.g. 2026-12-01; a date means the start of that day, UTC)." },
+        scope: scopeProp,
+        project: projectProp,
+        conversation: conversationProp,
+      },
+      required: ["content"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "close_loop",
+    title: "Close a loop",
+    description: "Closes an open loop by its id once it is handled, so it no longer shows under Due now.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        outcome: { type: "string", maxLength: MAX_OUTCOME_CHARS, description: "Optional: what came of it, in one short sentence." },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+] as const;
+
 class ToolError extends Error {}
 class RpcError extends Error {
   constructor(public code: number, message: string) {
@@ -244,7 +291,8 @@ const text = (t: string, structured?: Record<string, unknown>): ToolResult => ({
   ...(structured ? { structuredContent: structured } : {}),
 });
 
-async function callTool(memory: MemoryApi, client: Client, name: string, args: Record<string, unknown>): Promise<ToolResult> {
+async function callTool(memory: MemoryApi, client: Client, name: string, args: Record<string, unknown>, opts: McpOptions): Promise<ToolResult> {
+  if ((name === "open_loop" || name === "close_loop") && opts.loops && memory.openLoop && memory.closeLoop) return loopTool(memory, client, name, args);
   switch (name) {
     case "get_context": {
       const proj = project(args.project);
@@ -373,6 +421,27 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
   }
 }
 
+async function loopTool(memory: MemoryApi, client: Client, name: "open_loop" | "close_loop", args: Record<string, unknown>): Promise<ToolResult> {
+  if (name === "close_loop") {
+    const id = str(args.id, "id", 64, true)!;
+    const res = await memory.closeLoop!(client, id, str(args.outcome, "outcome", MAX_OUTCOME_CHARS));
+    if (!res) throw new ToolError("no open loop with this id");
+    return text(`Closed ${id}.`, { id, scope: res.scope });
+  }
+  const content = str(args.content, "content", MAX_LOOP_CHARS, true)!.trim();
+  if (!content) throw new ToolError("content is empty");
+  let dueAt: number | undefined;
+  try {
+    dueAt = parseRangeBound(args.due, false);
+  } catch {
+    throw new ToolError("due must be an ISO 8601 date or time, e.g. 2026-12-01");
+  }
+  const scope = writeScope(client, args.scope, project(args.project));
+  const res = await memory.openLoop!(client, { scope, content, dueAt, track: track(args) });
+  const when = res.dueAt ? `due ${res.dueAt.slice(0, 16).replace("T", " ")} UTC` : "due the next time get_context loads it";
+  return text(`Opened ${res.id} in ${res.scope}, ${when}.`, { id: res.id, scope: res.scope, due: res.dueAt });
+}
+
 /** Marks a call as coming from an agent's conversation, with its handle when it passed one. */
 function track(args: Record<string, unknown>): Tracked {
   const conversation = str(args.conversation, "conversation", 200)?.trim();
@@ -385,7 +454,7 @@ async function readableScopes(memory: MemoryApi, client: Client): Promise<string
   return [...new Set([...recallScopes(client), ...all.filter((s) => s.startsWith("project:") && can(client, "read", s))])];
 }
 
-async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, version: string): Promise<unknown> {
+async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, version: string, opts: McpOptions): Promise<unknown> {
   const params = req.params ?? {};
   switch (req.method) {
     case "initialize": {
@@ -400,12 +469,12 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
     case "ping":
       return {};
     case "tools/list":
-      return { tools: TOOLS };
+      return { tools: opts.loops ? [...TOOLS, ...LOOP_TOOLS] : TOOLS };
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
       const args = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
       try {
-        return await callTool(memory, client, name, args);
+        return await callTool(memory, client, name, args, opts);
       } catch (e) {
         if (e instanceof RpcError) throw e;
         const message = e instanceof ToolError ? e.message : e instanceof Error && /must be|empty|limit is|not allowed|may not/.test(e.message) ? e.message : "the memory service failed, try again";
@@ -423,7 +492,7 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
 }
 
 /** Answers one Streamable HTTP POST body (a single message or a batch). */
-export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknown, version: string): Promise<Response> {
+export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknown, version: string, opts: McpOptions = {}): Promise<Response> {
   const messages = Array.isArray(raw) ? raw : [raw];
   if (!messages.length) return rpcError(null, -32600, "empty batch");
   const out: JsonRpcResponse[] = [];
@@ -437,7 +506,7 @@ export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknow
     }
     const isNotification = msg.id === undefined;
     try {
-      const result = await handle(memory, client, msg as JsonRpcRequest, version);
+      const result = await handle(memory, client, msg as JsonRpcRequest, version, opts);
       if (!isNotification) out.push({ jsonrpc: "2.0", id: msg.id ?? null, result });
     } catch (e) {
       if (isNotification) continue;

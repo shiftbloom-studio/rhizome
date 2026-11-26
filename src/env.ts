@@ -27,6 +27,8 @@ export interface Env {
    * extraction model about the pairs the trust ladder cannot decide (at most 20 a night). Default: off.
    */
   DISPUTE_RESOLUTION?: string;
+  /** "on": open loops. Agents can open a loop with a due time, get_context leads with what is due, close_loop ends it. Default: off. */
+  OPEN_LOOPS?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
   /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */
