@@ -100,6 +100,8 @@ export interface ResultRecord {
   confidence?: number;
   /** The first ten sessions of the deep ranking. */
   top?: string[];
+  /** LongMemEval's own session-level scores (bench/official.ts), for the questions its averages count. */
+  official?: Record<string, number>;
   error?: string;
 }
 
@@ -145,6 +147,8 @@ export interface Summary {
   byType: Record<string, { n: number; metrics: Record<string, number> }>;
   /** Only when the abstain step ran: how often recall returned nothing, on abstention and on answerable questions. */
   abstention?: { questions: number; abstained: number; answerable: number; abstainedOnAnswerable: number };
+  /** LongMemEval's own session-level retrieval scores, averaged over the questions run_retrieval.py counts. */
+  official?: { questions: number; scores: Record<string, number> };
   timing: { ingestMsMedian: number; recallMsMedian: number };
 }
 
@@ -168,6 +172,12 @@ export function summarize(all: ResultRecord[]): Summary {
       recallMsMedian: median(ok.flatMap((r) => (r.recallMs === undefined ? [] : [r.recallMs]))),
     },
   };
+  const official = ok.filter((r) => r.official);
+  if (official.length) {
+    const values = new Map<string, number[]>();
+    for (const r of official) for (const [k, v] of Object.entries(r.official!)) values.set(k, [...(values.get(k) ?? []), v]);
+    summary.official = { questions: official.length, scores: Object.fromEntries([...values.entries()].map(([k, v]) => [k, mean(v)])) };
+  }
   if (ok.some((r) => r.abstained !== undefined)) {
     const abs = ok.filter((r) => r.abstention);
     summary.abstention = {
@@ -223,6 +233,17 @@ export function summaryMarkdown(s: Summary, title = "LongMemEval retrieval"): st
     lines.push(
       "",
       `Abstention: recall returned nothing for ${a.abstained} of ${a.questions} abstention questions, and for ${a.abstainedOnAnswerable} of ${a.answerable} answerable ones.`,
+    );
+  }
+  if (s.official) {
+    const keys = ["recall_any@5", "recall_all@5", "ndcg_any@5", "recall_any@10", "recall_all@10", "ndcg_any@10"];
+    lines.push(
+      "",
+      `LongMemEval's own session-level scores (src/retrieval/run_retrieval.py), over the ${s.official.questions} questions it counts: abstention questions and those without an evidence turn on the user side are left out.`,
+      "",
+      `| ${keys.join(" | ")} |`,
+      `| ${keys.map(() => "---:").join(" | ")} |`,
+      `| ${keys.map((k) => fmt(k, s.official!.scores[k])).join(" | ")} |`,
     );
   }
   lines.push("", `Median ingest per question ${(s.timing.ingestMsMedian / 1000).toFixed(1)} s, median recall ${Math.round(s.timing.recallMsMedian)} ms.`);

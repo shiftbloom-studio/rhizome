@@ -109,6 +109,7 @@ The first run copies LongMemEval-S from Hugging Face into the bucket (`data/`), 
 | `concurrency` | Questions at a time: 8 (at most 32), or 4 with extraction (at most 8). |
 | `paidRpm` | Requests a minute to each paid model, for all questions together. Default 15: the account allows 20, and the deployed rhizome needs some of them. |
 | `baseline` | The id of an earlier run, compared with this one in `comparison.md`. |
+| `reader` | An OpenAI model, e.g. `"gpt-4o-2024-08-06"`: LongMemEval's own evaluation, see below. Needs the Worker secret `OPENAI_API_KEY`. |
 
 The instance's output is the summary. The files go to `runs/<id>/` in the bucket: `config.json`, `results.jsonl`, `summary.json`, `summary.md` and, with `baseline`, `comparison.md`.
 
@@ -116,6 +117,31 @@ The instance's output is the summary. The files go to `runs/<id>/` in the bucket
 npx wrangler workflows instances describe rhizome-bench deployed
 npx wrangler r2 object get rhizome-bench/runs/deployed/summary.md --remote --pipe
 ```
+
+Every run also writes LongMemEval's own session-level retrieval scores (`recall_any`, `recall_all` and `ndcg_any` at 1, 3, 5, 10, 30 and 50) to `results.jsonl` and `summary.md`. They count what `src/retrieval/run_retrieval.py` counts: a session is evidence when its id has `answer` in it and one of its user turns has `has_answer`, and questions without such a turn (most single-session-assistant ones) and abstention questions are left out. rhizome ranks only what it recalls (50 items), so the sessions it did not recall follow in history order.
+
+### LongMemEval's own evaluation
+
+With `reader`, every question is also answered and judged the way LongMemEval's own scripts do it ([xiaowu0162/LongMemEval](https://github.com/xiaowu0162/LongMemEval) at commit `9e0b455`), so the score compares with published LongMemEval results:
+
+1. rhizome recalls as its recall tool does for an agent (8 items in 4,000 tokens) and the reader gets that text in the prompt of `src/generation/run_generation.py` with its default reading method (`con`: answer step by step, at most 800 tokens, temperature 0), with the question's date as the current date.
+2. GPT-4o (`gpt-4o-2024-08-06`) judges the answer with the prompt of `src/evaluation/evaluate_qa.py` for the question's type, temperature 0, at most 10 tokens. A reply with "yes" in it counts as correct.
+3. `official.md` and `official.json` hold the averages of `src/evaluation/print_qa_metrics.py`: accuracy per question type, task-averaged, overall and on abstention questions.
+
+```sh
+npx wrangler secret put OPENAI_API_KEY -c wrangler.bench.jsonc
+npx wrangler workflows trigger rhizome-bench '{"sample": 20, "reader": "gpt-4o-2024-08-06"}' --id official-smoke
+npx wrangler workflows trigger rhizome-bench '{"reader": "gpt-4o-2024-08-06", "concurrency": 32}' --id official
+```
+
+The run directory then also holds the files the upstream scripts write and read, byte for byte: `hypotheses.jsonl` (the answers, as `run_generation.py` writes them) and `hypotheses.jsonl.eval-results-gpt-4o` (the verdicts, as `evaluate_qa.py` writes them). Anyone can judge the answers again with the upstream scripts:
+
+```sh
+python3 src/evaluation/evaluate_qa.py gpt-4o hypotheses.jsonl longmemeval_s_cleaned.json
+python3 src/evaluation/print_qa_metrics.py hypotheses.jsonl.eval-results-gpt-4o longmemeval_s_cleaned.json
+```
+
+`qa.jsonl` has every question's answer, verdict, the models OpenAI named and the tokens; `contexts.jsonl` has what the reader got. A full run of 500 questions with GPT-4o as reader and judge sends about 2 million tokens to OpenAI. The prompts and scores are checked against the upstream code in `test/bench-official.test.ts`; `bench/official-fixture.py` writes its fixture from an upstream checkout.
 
 A question gets three tries, each on a fresh memory; one that fails every time is recorded with its error, and the run goes on. Nothing is cached here, so every run pays for its own Workers AI calls. A question takes about three minutes without extraction, most of it waiting for Vectorize to make its vectors searchable, so all 500 questions take about three hours at the default concurrency of 8; more at a time (up to 32) shortens that. With extraction, the paid-model limit sets the pace: about 10 hours for 150 questions. Deploy before a run, not during one: a deploy resets the Durable Objects of the questions in progress, and they start over.
 

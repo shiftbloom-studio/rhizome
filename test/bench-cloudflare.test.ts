@@ -12,6 +12,7 @@ import { FakeAi } from "../bench/ai";
 import { workerVars } from "../bench/harness";
 import { JsonArraySplitter, type Question, type Turn } from "../bench/longmemeval";
 import { parseResults } from "../bench/metrics";
+import { evalResultLine, hypothesisLine, judgePrompt, type QaRecord } from "../bench/official";
 import {
   AiGate,
   BenchMemory,
@@ -212,6 +213,12 @@ describe("run params", () => {
     expect(() => runSettings({ extraction: true, concurrency: 16 }, env)).toThrow(/with extraction/);
     expect(() => runSettings({ asOf: "yes" }, env)).toThrow(/asOf/);
     expect(() => runSettings({ baseline: "../other" }, env)).toThrow(/baseline/);
+    expect(() => runSettings({ reader: "gpt 4o" }, env)).toThrow(/reader must be an OpenAI model id/);
+  });
+
+  it("take a reader for LongMemEval's own evaluation", () => {
+    expect(runSettings(undefined, env).reader).toBeNull();
+    expect(runSettings({ reader: "gpt-4o-2024-08-06" }, env).reader).toBe("gpt-4o-2024-08-06");
   });
 });
 
@@ -373,6 +380,83 @@ describe("benchmark Worker", () => {
       // A replayed run takes every finished step from its results.
       const replay = (await workflow.run(event("deployed", { baseline: "base" }), second.step)) as RunOutput;
       expect(replay).toEqual(next);
+    } finally {
+      close();
+    }
+  }, 60_000);
+
+  it("has a reader answer from the recall tool's text and GPT-4o judge it, writing LongMemEval's files", async () => {
+    const answers = ["Luna", "Globex", "You never mentioned a dog."];
+    const data = DATASET.map((q, i) => ({ ...q, answer: answers[i]! }));
+    const calls: { model: string; max_tokens: number; content: string }[] = [];
+    const fetches = vi.fn(async (url: string, init?: RequestInit) => {
+      if (!String(url).startsWith("https://openai.test/v1/")) return datasetResponse(JSON.stringify(data));
+      expect(url).toBe("https://openai.test/v1/chat/completions");
+      expect((init!.headers as Record<string, string>).authorization).toBe("Bearer sk-test");
+      const body = JSON.parse(String(init!.body)) as { model: string; max_tokens: number; messages: { content: string }[] };
+      const content = body.messages[0]!.content;
+      calls.push({ model: body.model, max_tokens: body.max_tokens, content });
+      const reply = (text: string, model: string) =>
+        new Response(JSON.stringify({ model, choices: [{ message: { content: text }, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 5 } }), { status: 200 });
+      if (body.max_tokens === 800) {
+        if (content.includes("Which company")) return new Response(JSON.stringify({ error: { code: "context_length_exceeded", message: "too long" } }), { status: 400 });
+        return reply(content.includes("name of my cat") ? "  Her name is Luna.\n" : "I don't know about a dog.", "gpt-4o-2024-08-06");
+      }
+      return reply(content.includes("Model Response: Her name is Luna.") || content.includes("unanswerable") ? "Yes" : "No", "gpt-4o-2024-08-06");
+    });
+    vi.stubGlobal("fetch", fetches);
+    const { env, close } = benchEnv(dir);
+    try {
+      const workflow = new BenchWorkflow({} as ExecutionContext, env);
+      await expect(workflow.run(event("no-key", { reader: "gpt-4o-2024-08-06" }), fakeStep().step)).rejects.toThrow(/OPENAI_API_KEY/);
+
+      Object.assign(env, { OPENAI_API_KEY: "sk-test", OPENAI_BASE_URL: "https://openai.test/v1" });
+      const run = fakeStep();
+      const out = (await workflow.run(event("official", { reader: "gpt-4o-2024-08-06" }), run.step)) as RunOutput;
+      expect(out.failed).toBe(0);
+      expect(run.ran).toEqual(expect.arrayContaining(["answer c1", "judge c1", "answer c2", "answer c3_abs", "judge c3_abs"]));
+      expect(run.ran).not.toContain("judge c2");
+      expect(out.official).toMatchObject({ reader: "gpt-4o-2024-08-06", judged: 2, failed: 1 });
+      expect(out.official!.metrics.byType["single-session-user"]).toEqual({ n: 2, accuracy: 1 });
+      expect(out.official!.metrics.abstention).toEqual({ n: 1, accuracy: 1 });
+
+      // The reader got the recall tool's text and the question as LongMemEval states it.
+      const read = calls.find((c) => c.max_tokens === 800 && c.content.includes("name of my cat"))!;
+      expect(read.model).toBe("gpt-4o-2024-08-06");
+      expect(read.content).toMatch(/^I will give you several history chats between you and a user\./);
+      expect(read.content).toContain("(profile · conversation · ");
+      expect(read.content).toContain("Luna");
+      expect(read.content).toMatch(/\n\nCurrent Date: 2023\/06\/01 \(Thu\) 10:00\nQuestion: What is the name of my cat\?\nAnswer \(step by step\):$/);
+      // The judge got evaluate_qa.py's prompt for the trimmed answer; the 400 was not tried again.
+      const judged = calls.filter((c) => c.max_tokens === 10);
+      expect(judged.map((c) => c.model)).toEqual(["gpt-4o-2024-08-06", "gpt-4o-2024-08-06"]);
+      expect(judged.map((c) => c.content)).toContain(judgePrompt("single-session-user", "What is the name of my cat?", "Luna", "Her name is Luna.", false));
+      expect(calls.filter((c) => c.max_tokens === 800 && c.content.includes("Which company"))).toHaveLength(1);
+
+      expect(await text(env, "runs/official/hypotheses.jsonl")).toBe(
+        [hypothesisLine("c1", "Her name is Luna."), hypothesisLine("c3_abs", "I don't know about a dog.")].join("\n") + "\n",
+      );
+      expect(await text(env, "runs/official/hypotheses.jsonl.eval-results-gpt-4o")).toBe(
+        [evalResultLine("c1", "Her name is Luna.", true), evalResultLine("c3_abs", "I don't know about a dog.", true)].join("\n") + "\n",
+      );
+      const qa = (await text(env, "runs/official/qa.jsonl")).trim().split("\n").map((l) => JSON.parse(l) as QaRecord);
+      expect(qa.map((r) => r.id)).toEqual(["c1", "c2", "c3_abs"]);
+      expect(qa[1]!.error).toMatch(/^reader: OpenAI answered HTTP 400 \(context_length_exceeded\)/);
+      expect(qa[0]).toMatchObject({ label: true, judgeReply: "Yes", readerModel: "gpt-4o-2024-08-06", judgeModel: "gpt-4o-2024-08-06", readerTokens: { prompt: 100, completion: 5 } });
+      expect(qa[0]!.contextItems).toBeGreaterThan(0);
+      const contexts = (await text(env, "runs/official/contexts.jsonl")).trim().split("\n").map((l) => JSON.parse(l));
+      expect(contexts.map((c) => c.question_id)).toEqual(["c1", "c2", "c3_abs"]);
+      expect(read.content).toContain(contexts[0].text);
+      const md = await text(env, "runs/official/official.md");
+      expect(md).toContain("2 of 3 questions answered and judged, **1 failed**");
+      expect(md).toContain("Overall accuracy");
+      expect(JSON.parse(await text(env, "runs/official/config.json")).official).toMatchObject({ reader: "gpt-4o-2024-08-06", judge: "gpt-4o-2024-08-06" });
+      // results.jsonl keeps its shape: no recall text in it, LongMemEval's own retrieval scores for the questions they count.
+      const results = parseResults(await text(env, "runs/official/results.jsonl"));
+      expect(results.every((r) => !("view" in r))).toBe(true);
+      expect(results.find((r) => r.id === "c1")!.official).toMatchObject({ "recall_any@1": expect.any(Number), "ndcg_any@50": expect.any(Number) });
+      expect(results.find((r) => r.id === "c3_abs")!.official).toBeUndefined();
+      expect(out.summary.official?.questions).toBe(2);
     } finally {
       close();
     }

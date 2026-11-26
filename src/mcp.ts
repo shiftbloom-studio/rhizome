@@ -14,6 +14,9 @@ import type { Tracked } from "./walls";
 
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
+/** What one recall tool call returns unless the agent asks for more items: the benchmark recalls the same way. */
+export const RECALL_TOOL = { limit: 8, budgetTokens: 4000 } as const;
+
 /** The part of the MemoryObject the MCP tools use. A Durable Object stub fits. */
 export interface MemoryApi {
   recall(
@@ -90,7 +93,7 @@ export const TOOLS = [
         query: { type: "string", description: "What you want to know, in plain words." },
         project: projectProp,
         conversation: conversationProp,
-        limit: { type: "integer", minimum: 1, maximum: 20, default: 8 },
+        limit: { type: "integer", minimum: 1, maximum: 20, default: RECALL_TOOL.limit },
         queries: {
           type: "array",
           items: { type: "string", maxLength: 500 },
@@ -222,6 +225,12 @@ function line(i: MemoryItem): string {
   return i.evidence ? `${head}\n  source (${i.evidence.tEvent.slice(0, 10)}): ${i.evidence.content}` : head;
 }
 
+/** The text the recall tool hands an agent: notices first, then one line per item. The benchmark reads the same text. */
+export function recallText(res: { items: MemoryItem[]; notices?: string[] }): string {
+  const head = res.notices?.length ? res.notices.join("\n") + "\n\n" : "";
+  return head + (res.items.length ? res.items.map(line).join("\n") : "No matching memories.");
+}
+
 function subQueries(v: unknown): string[] {
   if (!Array.isArray(v) || v.length > 4 || v.some((q) => typeof q !== "string" || q.length > 500)) {
     throw new ToolError("queries must be at most 4 strings of up to 500 characters");
@@ -249,7 +258,7 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
     case "recall": {
       const query = str(args.query, "query", 2000, true)!.trim();
       const proj = project(args.project);
-      const limit = typeof args.limit === "number" ? Math.min(Math.max(Math.round(args.limit), 1), 20) : 8;
+      const limit = typeof args.limit === "number" ? Math.min(Math.max(Math.round(args.limit), 1), 20) : RECALL_TOOL.limit;
       // Recall sees the profile, this agent's own notes and the project. Without a
       // project it also looks into every project the client may read, except walled ones.
       const scopes = proj ? recallScopes(client, undefined, proj) : await readableScopes(memory, client);
@@ -268,11 +277,10 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       if (asOf !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(String(args.as_of).trim())) asOf -= 1;
       // Walled projects are only searched when the call names them (see walls.ts).
       const named = proj ? [`project:${proj}`] : [];
-      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to, asOf, named, track: track(args) });
-      const head = res.notices?.length ? res.notices.join("\n") + "\n\n" : "";
+      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: RECALL_TOOL.budgetTokens, queries, from, to, asOf, named, track: track(args) });
       const notices = res.notices?.length ? { notices: res.notices } : {};
-      if (!res.items.length) return text(head + "No matching memories.", res.notices?.length ? { results: [], ...notices } : undefined);
-      return text(head + res.items.map(line).join("\n"), {
+      if (!res.items.length) return text(recallText(res), res.notices?.length ? { results: [], ...notices } : undefined);
+      return text(recallText(res), {
         ...notices,
         results: res.items.map((i) => ({
           id: i.id,
