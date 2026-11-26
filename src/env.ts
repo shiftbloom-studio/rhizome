@@ -41,6 +41,8 @@ export interface Env {
   POSTHOG_KEY?: string;
   /** PostHog ingestion host, e.g. https://eu.i.posthog.com or https://us.i.posthog.com. */
   POSTHOG_HOST?: string;
+  /** "on": open loops. Agents can open a loop with a due time, get_context leads with what is due, close_loop ends it. Default: off. */
+  OPEN_LOOPS?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
   /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */

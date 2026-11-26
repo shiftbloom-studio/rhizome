@@ -59,5 +59,6 @@
   // Secret: POSTHOG_KEY (wrangler secret put POSTHOG_KEY), the PostHog project API key for MCP_ANALYTICS.
   // Sign-in without Cloudflare Access: AUTH_MODE=password with LOGIN_EMAIL, plus the secrets LOGIN_PASSWORD and SESSION_SECRET.
   // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT, DISPUTE_RESOLUTION ("on"/"off").
+  // Optional var OPEN_LOOPS ("on"): open loops with a due date, shown under Due now in get_context. Off by default.
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }
