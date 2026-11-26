@@ -55,10 +55,12 @@ recall: bge-m3 + Vectorize ─┐
 
 Everything runs inside the person's Durable Object, triggered by its alarm, with Workers AI models by default.
 
-1. **Extraction.** A few seconds after an episode arrives, DeepSeek V4.1 Flash turns it into short English notes (preference, decision, fact, learning) with a scope, a trust level and the people, projects and tools it mentions. An episode without user messages can never produce a note that claims the user said something.
-2. **Resolution.** Each new fact is compared with the notes of its scope using the embeddings stored next to them, so nothing waits for the vector index.
+1. **Extraction.** A few seconds after an episode arrives, DeepSeek V4.1 Flash turns it into short English notes (preference, decision, fact, learning) with a scope, a trust level, when the fact started and ended if the episode says so, and the people, projects and tools it mentions. An episode without user messages can never produce a note that claims the user said something.
+   * Memory comes first: the up to 12 stored notes most related to the episode (full-text search plus the stored embeddings) go into the same prompt, and the model labels each fact *new*, *same*, *update* or *contradiction* against them.
+2. **Resolution.** A labelled fact is applied directly. A *same* label only merges when the two notes really overlap, since a merge drops the new wording. Facts without a usable label are compared with the notes of their scope using the embeddings stored next to them, so nothing waits for the vector index.
    * At a similarity of 0.93 or more it is the same fact: the existing note gains a confirmation, and keeps the higher of both trust levels.
-   * Between 0.78 and 0.93 the model decides between *same*, *update*, *contradicts* and *new*. An update replaces the old note (`superseded`), and recall follows the chain to the current version.
+   * Between 0.78 and 0.93 a second model call decides between *same*, *update*, *contradicts* and *new*.
+   * An update replaces the old note (`superseded`), and recall follows the chain to the current version. The old note is never overwritten: its validity ends where the new one starts (`valid_from` / `valid_to`), and `expired_at` records when rhizome stopped treating it as current, so the history of how a memory changed stays readable.
    * A guess never replaces what the person said. Such a conflict is stored as `disputed` and shown in the explorer for review, where confirming one side settles it.
 3. **Linking.** New notes get `similar` edges to their nearest neighbours. Notes written directly through the API are merged with an existing equal note, or linked.
 4. **Reflection**, nightly at 03:17 UTC and on demand:

@@ -158,4 +158,38 @@ export const MIGRATIONS: string[] = [
   );
   CREATE INDEX jobs_due ON jobs (not_before);
   `,
+  // 3: time-aware notes. valid_from/valid_to say when a fact was true in the
+  // world, created_at/expired_at say when rhizome held the row as current. An
+  // update closes the old note's interval; the old note itself stays.
+  `
+  ALTER TABLE items ADD COLUMN valid_from INTEGER; -- when the fact became true (defaults to t_event); NULL = unknown start
+  ALTER TABLE items ADD COLUMN valid_to INTEGER;   -- when it stopped being true; NULL = still true
+  ALTER TABLE items ADD COLUMN expired_at INTEGER; -- when rhizome stopped treating the row as current; NULL = current
+  CREATE INDEX items_valid ON items (kind, valid_from);
+  CREATE INDEX items_expired ON items (expired_at);
+
+  -- Inserts that leave valid_from empty take the event time. A fact that came with
+  -- only an end date ("until March") keeps an open, unknown start.
+  CREATE TRIGGER items_valid_from AFTER INSERT ON items WHEN new.valid_from IS NULL AND new.valid_to IS NULL BEGIN
+    UPDATE items SET valid_from = new.t_event WHERE rowid = new.rowid;
+  END;
+
+  -- Backfill, without a model: every row became true at its event time.
+  UPDATE items SET valid_from = t_event WHERE valid_from IS NULL;
+  -- Replaced and merged rows stopped being current when they were last touched.
+  UPDATE items SET expired_at = COALESCE(updated_at, created_at) WHERE status = 'superseded' AND expired_at IS NULL;
+  -- Only a real update (a supersedes edge) ends the old fact's validity. A merged
+  -- duplicate is still true, it just lives on in its survivor, and the losing side
+  -- of a dispute the person settled was never true, so both keep valid_to empty.
+  UPDATE items SET valid_to = MAX(
+      valid_from,
+      COALESCE((SELECT n.valid_from FROM items n WHERE n.id = items.superseded_by), COALESCE(updated_at, created_at))
+    )
+    WHERE status = 'superseded' AND valid_to IS NULL
+      AND EXISTS (SELECT 1 FROM links l WHERE l.kind = 'supersedes' AND l.dst = items.id AND l.src = items.superseded_by)
+      AND NOT EXISTS (
+        SELECT 1 FROM links c WHERE c.kind = 'contradicts'
+          AND ((c.src = items.id AND c.dst = items.superseded_by) OR (c.dst = items.id AND c.src = items.superseded_by))
+      );
+  `,
 ];
