@@ -212,4 +212,20 @@ export const MIGRATIONS: string[] = [
   ) WITHOUT ROWID;
   CREATE INDEX walls_wall ON walls (wall);
   `,
+  // 6: held promotions. A fact from a walled conversation that would have left the
+  // wall (usually for the profile) stays in its project until the person releases it.
+  `
+  CREATE TABLE promotions (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id     TEXT NOT NULL,
+    from_scope  TEXT NOT NULL,
+    to_scope    TEXT NOT NULL,
+    via         TEXT NOT NULL,             -- extraction | remember
+    state       TEXT NOT NULL DEFAULT 'held', -- held | released | dismissed
+    created_at  INTEGER NOT NULL,
+    decided_at  INTEGER
+  );
+  CREATE INDEX promotions_state ON promotions (state, seq);
+  CREATE INDEX promotions_item ON promotions (item_id);
+  `,
 ];

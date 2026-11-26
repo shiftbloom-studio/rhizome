@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import type { Block, Detail, Graph, Me, SearchResult, Wall } from "./types";
+import type { Block, Detail, Graph, Me, SearchResult, Held, Wall } from "./types";
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/ui/api${path}`, {
@@ -34,4 +34,6 @@ export const api = {
   walls: () => call<{ walls: Wall[] }>("GET", "/walls"),
   setWall: (name: string, scopes: string[]) => call<Wall>("PUT", `/walls/${encodeURIComponent(name)}`, { scopes }),
   removeWall: (name: string) => call<Wall>("DELETE", `/walls/${encodeURIComponent(name)}`),
+  held: () => call<{ held: Held[] }>("GET", "/held"),
+  decideHeld: (id: number, decision: "release" | "dismiss") => call<{ id: number; scope: string }>("POST", `/held/${id}/${decision}`),
 };

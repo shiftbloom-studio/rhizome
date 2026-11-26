@@ -6,6 +6,9 @@
 //
 // Rule 1: a walled project is searched only when the call names it. A recall
 // that names no project leaves walled projects out and says so.
+// Rule 3: a fact from a walled conversation stays in its project. Where it wanted
+// to go (usually the profile) is kept as a held promotion until the person
+// releases or dismisses it in the explorer.
 
 import { isValidSlug } from "./scopes";
 
@@ -39,4 +42,14 @@ export function admitNamed(scopes: string[], named: string[] | undefined, walls:
   if (named === undefined || Object.keys(walls).length === 0) return { scopes, notices: [] };
   const out = scopes.filter((s) => wallOf(s, walls) === null || named.includes(s));
   return { scopes: out, notices: out.length < scopes.length ? [LEFT_OUT_NOTICE] : [] };
+}
+
+/**
+ * Rule 3: a fact said in a walled conversation stays inside that wall. Returns the
+ * scope the fact wanted to go to when it has to be held instead, else null.
+ */
+export function heldTarget(episodeScope: string, target: string, walls: Walls): string | null {
+  const from = wallOf(episodeScope, walls);
+  if (from === null || target === episodeScope || wallOf(target, walls) === from) return null;
+  return target;
 }
