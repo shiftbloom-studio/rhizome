@@ -6,11 +6,13 @@
 // Runs on Node (bench/harness.ts) and inside a Durable Object on Cloudflare
 // (bench/worker.ts).
 
+import { RECALL_TOOL, recallText } from "../src/mcp";
 import type { EpisodeInput, MemoryItem, MemoryObject, RecallInput } from "../src/memory-object";
 import type { Client } from "../src/scopes";
 import { estimateTokens } from "../src/text";
 import { isAbstention, parseDate, type Question, type Turn } from "./longmemeval";
 import { scoreQuestion, sessionOrder, type Evidence, type ItemRef, type ResultRecord } from "./metrics";
+import { officialRetrieval } from "./official";
 
 /** Scope of every question's history. It has no ":" in it, so the episode files also work on Windows. */
 export const SCOPE = "profile";
@@ -37,6 +39,21 @@ export interface QuestionOptions {
   idleTimeoutMs: number;
   /** Runs once the background work is done, before the question is asked (on Cloudflare: until the vector index has caught up). */
   afterIngest?: () => Promise<void>;
+  /** Also recall as the recall tool does for an agent, for a reader to answer from (bench/official.ts). */
+  agentView?: boolean;
+}
+
+/** What a reader answers from: the recall tool's text for the question, and the question as LongMemEval states it. */
+export interface AgentView {
+  /** The recall tool's text (src/mcp.ts): up to 8 items in 4,000 tokens. */
+  text: string;
+  items: number;
+  tokens: number;
+  question: string;
+  questionDate: string;
+  type: string;
+  /** LongMemEval's answers are strings and whole numbers. */
+  answer: string | number;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -134,7 +151,7 @@ function itemRefs(memory: Memory, client: Client, sessionOf: Map<string, string>
 }
 
 /** Saves the question's sessions, asks it and scores the answer. The memory must be empty and belong to `client`. */
-export async function askQuestion(memory: Memory, client: Client, q: Question, opts: QuestionOptions): Promise<ResultRecord> {
+export async function askQuestion(memory: Memory, client: Client, q: Question, opts: QuestionOptions): Promise<ResultRecord & { view?: AgentView }> {
   const abstention = isAbstention(q);
   const sessionOf = new Map<string, string>();
   const indexes = new Map<string, SessionIndex>();
@@ -182,6 +199,7 @@ export async function askQuestion(memory: Memory, client: Client, q: Question, o
   };
   const deep = await memory.recall(client, { ...ask, limit: 50, budgetTokens: 1_000_000 });
   const shown = await memory.recall(client, ask);
+  const tool = opts.agentView ? await memory.recall(client, { ...ask, ...RECALL_TOOL }) : undefined;
 
   const refs = itemRefs(memory, client, sessionOf, indexes);
   const ranked = await refs(deep.items);
@@ -207,5 +225,10 @@ export async function askQuestion(memory: Memory, client: Client, q: Question, o
   if (!abstention && evidence.sessions.size > 0) {
     record.metrics = { ...scoreQuestion(ranked, delivered, evidence), delivered_items: shown.items.length, delivered_tokens: deliveredTokens };
   }
-  return record;
+  const official = officialRetrieval(q, sessionOrder(ranked));
+  if (official) record.official = official;
+  if (!tool) return record;
+  const text = recallText(tool);
+  const view: AgentView = { text, items: tool.items.length, tokens: estimateTokens(text), question: q.question, questionDate: q.question_date, type: q.question_type, answer: q.answer as string | number };
+  return { ...record, view };
 }

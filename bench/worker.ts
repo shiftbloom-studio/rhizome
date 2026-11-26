@@ -16,7 +16,29 @@ import { DEFAULT_GRANTS, type Client } from "../src/scopes";
 import { PAID_MODELS, isRetryableAiError } from "./limits";
 import { DATASET_URL, JsonArraySplitter, isAbstention, select, validateQuestion, type Question, type Selection } from "./longmemeval";
 import { compareRuns, comparisonMarkdown, parseResults, summarize, summaryMarkdown, type ResultRecord, type Summary } from "./metrics";
-import { MEMORY_VARS, askQuestion } from "./question";
+import {
+  EVAL_RESULTS_SUFFIX,
+  JUDGE_MODEL,
+  OpenAiError,
+  UPSTREAM,
+  chatCompletion,
+  evalResultLine,
+  hypothesisLine,
+  isAbstentionId,
+  judgePrompt,
+  judgeRequest,
+  judgedCorrect,
+  officialMarkdown,
+  qaMetrics,
+  readerPrompt,
+  readerRequest,
+  type ChatReply,
+  type ChatRequest,
+  type OpenAiOptions,
+  type QaMetrics,
+  type QaRecord,
+} from "./official";
+import { MEMORY_VARS, askQuestion, type AgentView } from "./question";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -35,6 +57,10 @@ export interface BenchEnv extends Partial<Record<MemoryVar, string>> {
   /** The benchmark's own index, never the deployed one. */
   VECTORS: Vectorize;
   CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
+  /** Secret, only for runs with a reader (the official evaluation, bench/official.ts). */
+  OPENAI_API_KEY?: string;
+  /** Default https://api.openai.com/v1. */
+  OPENAI_BASE_URL?: string;
 }
 
 // ------------------------------------------------------------------ dataset
@@ -123,6 +149,12 @@ export interface RunParams {
   baseline?: string;
   /** Requests a minute to each paid model, all questions together. Default 15 of the account's 20. */
   paidRpm?: number;
+  /**
+   * An OpenAI model, e.g. gpt-4o-2024-08-06: it answers every question from what the recall
+   * tool returns, and GPT-4o judges the answer, as LongMemEval's own scripts do (bench/official.ts).
+   * Needs the Worker secret OPENAI_API_KEY.
+   */
+  reader?: string;
 }
 
 export interface RunSettings {
@@ -139,6 +171,8 @@ export interface RunSettings {
   vars: Record<string, string>;
   baseline: string | null;
   paidRpm: number;
+  /** null: no answers, retrieval scores only. */
+  reader: string | null;
 }
 
 export const MAX_CONCURRENCY = 32;
@@ -148,7 +182,8 @@ export const MAX_CONCURRENCY = 32;
  */
 export const MAX_EXTRACTION_CONCURRENCY = 8;
 const RUN_ID = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
-const PARAMS = new Set(["questions", "types", "sample", "seed", "limit", "features", "chunking", "extraction", "reflect", "asOf", "concurrency", "vars", "baseline", "paidRpm"]);
+const PARAMS = new Set(["questions", "types", "sample", "seed", "limit", "features", "chunking", "extraction", "reflect", "asOf", "concurrency", "vars", "baseline", "paidRpm", "reader"]);
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
 
 function bad(message: string): never {
   throw new Error(`bad run params: ${message}`);
@@ -219,6 +254,8 @@ export function runSettings(raw: unknown, env: Partial<Record<MemoryVar, string>
   if (baseline !== null && (typeof baseline !== "string" || !RUN_ID.test(baseline))) bad("baseline must be the id of an earlier run");
   const paidRpm = p.paidRpm ?? 15;
   if (typeof paidRpm !== "number" || !(paidRpm > 0) || !Number.isFinite(paidRpm)) bad("paidRpm must be a positive number");
+  const reader = (p.reader ?? null) as string | null;
+  if (reader !== null && (typeof reader !== "string" || !MODEL_ID.test(reader))) bad("reader must be an OpenAI model id, e.g. gpt-4o-2024-08-06");
 
   const extraction = flag("extraction", p.extraction);
   const concurrency = wholeNumber("concurrency", p.concurrency, 1, MAX_CONCURRENCY) ?? (extraction ? 4 : 8);
@@ -240,6 +277,7 @@ export function runSettings(raw: unknown, env: Partial<Record<MemoryVar, string>
     vars,
     baseline,
     paidRpm,
+    reader,
   };
 }
 
@@ -374,6 +412,8 @@ export interface QuestionJob {
   idleTimeoutMs: number;
   /** Longest wait for Vectorize to apply the question's vectors. */
   vectorTimeoutMs: number;
+  /** Also recall as the recall tool does, for the reader. */
+  agentView?: boolean;
 }
 
 function benchClient(userId: string): Client {
@@ -391,7 +431,7 @@ export class BenchMemory extends MemoryObject {
   }
 
   /** Runs one question on this empty memory, then deletes everything it stored, also when it fails. */
-  async benchRun(job: QuestionJob): Promise<ResultRecord> {
+  async benchRun(job: QuestionJob): Promise<ResultRecord & { view?: AgentView }> {
     if (this.running) throw new Error("this memory is already running a question");
     this.running = true;
     const vectors = new TrackedVectors(this.bench.VECTORS);
@@ -416,6 +456,7 @@ export class BenchMemory extends MemoryObject {
         reflect: job.reflect,
         idleTimeoutMs: job.idleTimeoutMs,
         afterIngest: () => vectors.searchable(job.vectorTimeoutMs),
+        agentView: job.agentView,
       });
     } finally {
       await this.wipe();
@@ -470,16 +511,36 @@ export interface RunOutput {
   summary: Summary;
   markdown: string;
   comparison?: string;
+  /** Runs with a reader: LongMemEval's own scores (official.md). */
+  official?: { reader: string; judged: number; failed: number; metrics: QaMetrics };
 }
 
 const DATASET_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "1 minute", backoff: "exponential" }, timeout: "30 minutes" };
 const FILES_STEP: WorkflowStepConfig = { retries: { limit: 5, delay: "10 seconds", backoff: "exponential" }, timeout: "5 minutes" };
+/** An answer or a verdict: chatCompletion already tries again on rate limits, these tries come on top. */
+const QA_STEP: WorkflowStepConfig = { retries: { limit: 3, delay: "1 minute", backoff: "exponential" }, timeout: "15 minutes" };
+
+type StepReply = ChatReply | { error: string };
+
+/** One OpenAI call in a step. An error no later try can fix comes back as the result, so the step is not tried again. */
+async function openAiStep(request: ChatRequest, opts: OpenAiOptions): Promise<StepReply> {
+  try {
+    return await chatCompletion(request, opts);
+  } catch (err) {
+    if (err instanceof OpenAiError && !err.retryable) return { error: err.message.slice(0, 500) };
+    throw err;
+  }
+}
+
+const lines = (rows: string[]) => (rows.length ? rows.join("\n") + "\n" : "");
 
 /** A run: the instance id names it, and its files go to runs/<id>/ in the BENCH bucket. */
 export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
   async run(event: Readonly<WorkflowEvent<RunParams>>, step: WorkflowStep): Promise<RunOutput> {
     const runId = event.instanceId;
     const settings = runSettings(event.payload, this.env);
+    if (settings.reader && !this.env.OPENAI_API_KEY) bad("reader needs the Worker secret OPENAI_API_KEY");
+    const openai: OpenAiOptions = { apiKey: this.env.OPENAI_API_KEY ?? "", ...(this.env.OPENAI_BASE_URL ? { baseUrl: this.env.OPENAI_BASE_URL } : {}) };
     const dataset = await step.do("dataset", DATASET_STEP, () => importDataset(this.env.BENCH));
     const questions = select(dataset.questions, settings.selection);
     if (!questions.length) throw new Error("no question matches the selection");
@@ -505,6 +566,7 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
         concurrency: settings.concurrency,
         paidRpm: settings.paidRpm,
         baseline: settings.baseline,
+        ...(settings.reader ? { official: { reader: settings.reader, judge: JUDGE_MODEL, upstream: UPSTREAM } } : {}),
         meta: { worker: this.env.CF_VERSION_METADATA ?? null, dataset: { source: dataset.source, bytes: dataset.bytes, stored: dataset.stored } },
       };
       await put("config.json", JSON.stringify(config, null, 2) + "\n", "application/json");
@@ -519,7 +581,7 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
       retries: { limit: 2, delay: "1 minute", backoff: "exponential" },
       timeout: idleTimeoutMs + vectorTimeoutMs + 900_000,
     };
-    const ask = async (q: (typeof questions)[number]): Promise<ResultRecord> => {
+    const ask = async (q: (typeof questions)[number]): Promise<ResultRecord & { view?: AgentView }> => {
       try {
         return await step.do(`question ${q.question_id}`, questionStep, async (ctx) => {
           // A fresh memory and namespace per attempt: a given-up attempt can never mix into the next.
@@ -537,8 +599,9 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
             paidRpm: settings.paidRpm,
             idleTimeoutMs,
             vectorTimeoutMs,
+            ...(settings.reader ? { agentView: true } : {}),
           };
-          return (await memory.benchRun(job)) as ResultRecord;
+          return (await memory.benchRun(job)) as ResultRecord & { view?: AgentView };
         });
       } catch (err) {
         // Every attempt failed: the question counts as failed and the run goes on.
@@ -546,10 +609,46 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
       }
     };
 
+    // The official evaluation: the reader answers from the recall tool's text, GPT-4o judges the answer.
+    const answer = async (q: (typeof questions)[number], view: AgentView | undefined, failed: string | undefined): Promise<QaRecord> => {
+      const base: QaRecord = { id: q.question_id, type: q.question_type, abstention: isAbstention(q) };
+      if (!view) return { ...base, error: failed ? `no recall: ${failed}` : "no recall" };
+      const context = { contextItems: view.items, contextTokens: view.tokens };
+      try {
+        const read = await step.do(`answer ${q.question_id}`, QA_STEP, () =>
+          openAiStep(readerRequest(settings.reader!, readerPrompt(view.text, view.questionDate, view.question)), openai),
+        );
+        if ("error" in read) return { ...base, ...context, error: `reader: ${read.error}` };
+        const hypothesis = read.content.trim();
+        const reader = { hypothesis, readerModel: read.model, readerFinish: read.finishReason, readerTokens: { prompt: read.promptTokens, completion: read.completionTokens } };
+        const prompt = judgePrompt(view.type, view.question, view.answer, hypothesis, isAbstentionId(q.question_id));
+        const verdict = await step.do(`judge ${q.question_id}`, QA_STEP, () => openAiStep(judgeRequest(prompt), openai));
+        if ("error" in verdict) return { ...base, ...context, ...reader, error: `judge: ${verdict.error}` };
+        return {
+          ...base,
+          ...context,
+          ...reader,
+          label: judgedCorrect(verdict.content),
+          judgeReply: verdict.content.trim(),
+          judgeModel: verdict.model,
+          judgeTokens: { prompt: verdict.promptTokens, completion: verdict.completionTokens },
+        };
+      } catch (err) {
+        return { ...base, ...context, error: String((err as Error)?.message ?? err).slice(0, 500) };
+      }
+    };
+
     const records: ResultRecord[] = new Array(questions.length);
+    const views: (AgentView | undefined)[] = new Array(questions.length);
+    const answers: QaRecord[] = new Array(questions.length);
     let next = 0;
     const lane = async () => {
-      for (let i = next++; i < questions.length; i = next++) records[i] = await ask(questions[i]!);
+      for (let i = next++; i < questions.length; i = next++) {
+        const { view, ...record } = await ask(questions[i]!);
+        records[i] = record;
+        views[i] = view;
+        if (settings.reader) answers[i] = await answer(questions[i]!, view, record.error);
+      }
     };
     await Promise.all(Array.from({ length: Math.min(settings.concurrency, questions.length) }, lane));
 
@@ -568,6 +667,20 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
           : compared.questions === 0 ? `The runs ${settings.baseline} and ${runId} have no scored question in common.\n`
           : comparisonMarkdown(compared, settings.baseline, runId);
         await put("comparison.md", output.comparison, "text/markdown; charset=utf-8");
+      }
+      if (settings.reader) {
+        // The files LongMemEval's scripts write and read, in the run's question order.
+        const answered = answers.filter((a) => a.hypothesis !== undefined);
+        const judged = answers.filter((a): a is QaRecord & { hypothesis: string; label: boolean } => a.hypothesis !== undefined && a.label !== undefined);
+        const metrics = qaMetrics(judged.map((a) => ({ id: a.id, type: a.type, label: a.label })));
+        await put("hypotheses.jsonl", lines(answered.map((a) => hypothesisLine(a.id, a.hypothesis!))), "application/x-ndjson");
+        await put(`hypotheses.jsonl${EVAL_RESULTS_SUFFIX}`, lines(judged.map((a) => evalResultLine(a.id, a.hypothesis, a.label))), "application/x-ndjson");
+        await put("qa.jsonl", lines(answers.map((a) => JSON.stringify(a))), "application/x-ndjson");
+        await put("contexts.jsonl", lines(questions.flatMap((q, i) => (views[i] ? [JSON.stringify({ question_id: q.question_id, items: views[i]!.items, tokens: views[i]!.tokens, text: views[i]!.text })] : []))), "application/x-ndjson");
+        const report = { runId, reader: settings.reader, dataset: dataset.sha256, records: answers, metrics, ...(summary.official ? { retrieval: summary.official } : {}) };
+        await put("official.md", officialMarkdown(report), "text/markdown; charset=utf-8");
+        await put("official.json", JSON.stringify({ reader: settings.reader, judge: JUDGE_MODEL, upstream: UPSTREAM, metrics, retrieval: summary.official ?? null }, null, 2) + "\n", "application/json");
+        output.official = { reader: settings.reader, judged: judged.length, failed: answers.length - judged.length, metrics };
       }
       return output;
     });
