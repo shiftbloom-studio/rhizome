@@ -6,6 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, runAi, type Env } from "./env";
 import { MIGRATIONS } from "./schema";
+import { admitNamed, isValidWallName, isWallableScope, wallOf, WALL_LIMIT, type Walls } from "./walls";
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
@@ -94,6 +95,11 @@ export interface RecallInput {
    * including ones replaced since, and excerpts from before it.
    */
   asOf?: number;
+  /**
+   * Scopes the call named. Walled projects not in this list are left out (see walls.ts).
+   * Leave it out when every requested scope was asked for explicitly.
+   */
+  named?: string[];
 }
 
 export interface RecallEvidence {
@@ -121,6 +127,8 @@ export interface RecallResult {
   window?: { from: string; to: string | null; source: "agent" | "query"; text?: string };
   /** Set when recall ran as of a past time. */
   asOf?: string;
+  /** What was left out and why, for the calling agent (walls). */
+  notices?: string[];
 }
 
 export interface MemoryItem {
@@ -505,8 +513,10 @@ export class MemoryObject extends DurableObject<Env> {
   async recall(client: Client, input: RecallInput): Promise<RecallResult> {
     const userId = this.userId(client);
     const started = Date.now();
-    const scopes = input.scopes;
-    if (scopes.length === 0) return { items: [], text: "", tookMs: 0, sources: {} };
+    const gate = admitNamed(input.scopes, input.named, this.walls());
+    const scopes = gate.scopes;
+    const notices = gate.notices.length ? { notices: gate.notices } : {};
+    if (scopes.length === 0) return { items: [], text: "", tookMs: 0, sources: {}, ...notices };
     const limit = Math.min(Math.max(input.limit ?? 10, 1), 50);
     const budget = input.budgetTokens ?? 2000;
     const features = input.features ? parseFeatures(input.features) : parseFeatures(this.env.RECALL_FEATURES);
@@ -707,6 +717,7 @@ export class MemoryObject extends DurableObject<Env> {
       ...(features.has("abstain") ? { abstained: false } : {}),
       ...(windowOut ? { window: windowOut } : {}),
       ...asOfOut,
+      ...notices,
     };
   }
 
@@ -1084,6 +1095,45 @@ export class MemoryObject extends DurableObject<Env> {
       this.audit(client, "note.confirm", { id });
     });
     return toItem(this.sql.exec("SELECT * FROM items WHERE id = ?", id).toArray()[0]!);
+  }
+
+  /** The person's walls, name -> project scopes. Empty when walls are off. */
+  walls(): Walls {
+    const out: Walls = {};
+    for (const r of this.sql.exec("SELECT wall, scope FROM walls ORDER BY wall, scope").toArray()) {
+      (out[String(r.wall)] ??= []).push(String(r.scope));
+    }
+    return out;
+  }
+
+  listWalls(client: Client): { name: string; scopes: string[] }[] {
+    this.userId(client);
+    return Object.entries(this.walls()).map(([name, scopes]) => ({ name, scopes }));
+  }
+
+  /**
+   * Puts exactly these project scopes behind the wall `name`. An empty list removes
+   * the wall. A scope that is behind another wall has to leave that one first.
+   */
+  setWall(client: Client, name: string, scopes: string[]): { name: string; scopes: string[] } {
+    this.userId(client);
+    if (!isValidWallName(name)) throw new Error("wall name must be a lowercase slug");
+    const wanted = [...new Set(scopes)];
+    const bad = wanted.find((s) => !isWallableScope(s));
+    if (bad !== undefined) throw new Error(`only projects can be walled, not ${bad}`);
+    const walls = this.walls();
+    for (const s of wanted) {
+      const other = wallOf(s, walls);
+      if (other !== null && other !== name) throw new Error(`${s} is already behind the wall ${other}`);
+    }
+    if (!walls[name] && wanted.length && Object.keys(walls).length >= WALL_LIMIT) throw new Error(`the limit is ${WALL_LIMIT} walls`);
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM walls WHERE wall = ?", name);
+      for (const s of wanted) this.sql.exec("INSERT INTO walls (scope, wall, created_at) VALUES (?, ?, ?)", s, name, now);
+    });
+    this.audit(client, "wall", { name, scopes: wanted });
+    return { name, scopes: wanted.sort() };
   }
 
   /** Every scope that holds something, for the explorer's filters. */

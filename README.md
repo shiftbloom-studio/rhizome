@@ -46,6 +46,7 @@ recall: bge-m3 + Vectorize ─┐
   * `profile`: working style, preferences, values. Every agent reads it.
   * `project:<slug>`: decisions and conventions of one project.
   * `agent:<slug>`: private notes of one agent, invisible to the others.
+* **Walls** keep one client's projects apart from another's. A wall is a name and a list of projects, set in the explorer. A walled project is searched only when the agent names it; a recall without a project leaves it out and tells the agent so. Walls are off until you set one, and a project outside every wall behaves as before.
 * **Clients** are agents of a provider (`claude-code` by `anthropic`, `hermes` by `nous`). Each has its own API key and grants that say which scopes it may read and write. Every memory records which agent, provider and model wrote it.
 * **Lossless at the bottom.** Episodes are stored verbatim in R2. Chunks, notes and vectors are derived and can be rebuilt, for example after switching the embedding model.
 * **Cheap reads.** Recall uses no generative model: an embedding, a vector query, SQLite full-text search and a small reranker.

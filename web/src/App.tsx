@@ -5,6 +5,7 @@ import { DetailPanel } from "./DetailPanel";
 import { MemoryGraph, TRUST_COLOR } from "./MemoryGraph";
 import type { Graph, Me, SearchResult } from "./types";
 import { Bloom } from "./Bloom";
+import { Walls } from "./Walls";
 
 const reducedMotion = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -213,6 +214,7 @@ export function App() {
             </dl>
           </section>
         )}
+        <Walls scopes={me.scopes ?? []} onNotice={setNotice} />
         <Remember scopes={me.scopes ?? []} onSaved={() => { setNotice("Saved. It shows up in the graph after a short moment."); setTimeout(load, 2500); }} />
         <Footer signOut={me.signOut} />
       </aside>
