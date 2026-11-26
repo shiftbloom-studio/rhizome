@@ -117,7 +117,7 @@ npx wrangler workflows instances describe rhizome-bench deployed
 npx wrangler r2 object get rhizome-bench/runs/deployed/summary.md --remote --pipe
 ```
 
-A question gets three tries, each on a fresh memory; one that fails every time is recorded with its error, and the run goes on. Nothing is cached here, so every run pays for its own Workers AI calls. A question waits for Vectorize to make its vectors searchable, usually within a minute or two, so a run over all 500 questions without extraction takes roughly an hour. With extraction, the paid-model limit sets the pace: about 10 hours for 150 questions.
+A question gets three tries, each on a fresh memory; one that fails every time is recorded with its error, and the run goes on. Nothing is cached here, so every run pays for its own Workers AI calls. A question takes about three minutes without extraction, most of it waiting for Vectorize to make its vectors searchable, so all 500 questions take about three hours at the default concurrency of 8; more at a time (up to 32) shortens that. With extraction, the paid-model limit sets the pace: about 10 hours for 150 questions. Deploy before a run, not during one: a deploy resets the Durable Objects of the questions in progress, and they start over.
 
 ## On GitHub
 

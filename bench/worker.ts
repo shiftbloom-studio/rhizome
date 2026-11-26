@@ -441,10 +441,15 @@ export class BenchMemory extends MemoryObject {
     const ids = rows("SELECT id FROM items").map((r) => String(r.id));
     const keys = rows("SELECT r2_key FROM episodes").map((r) => String(r.r2_key));
     try {
-      for (let i = 0; i < ids.length; i += 1000) await this.bench.VECTORS.deleteByIds(ids.slice(i, i + 1000));
+      // Vectorize deletes at most 100 ids at a time.
+      for (let i = 0; i < ids.length; i += 100) await this.bench.VECTORS.deleteByIds(ids.slice(i, i + 100));
+    } catch (err) {
+      console.error("bench: could not delete a question's vectors", String(err));
+    }
+    try {
       for (let i = 0; i < keys.length; i += 1000) await this.bench.EPISODES.delete(keys.slice(i, i + 1000));
     } catch (err) {
-      console.error("bench: could not delete a question's vectors or episodes", String(err));
+      console.error("bench: could not delete a question's raw episodes", String(err));
     }
     try {
       await this.ctx.storage.deleteAlarm();
