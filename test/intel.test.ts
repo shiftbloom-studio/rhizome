@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import {
   capTrust,
+  closeValidity,
   cosine,
   decodeVector,
   encodeVector,
@@ -9,6 +10,8 @@ import {
   importance,
   nearest,
   parseJsonObject,
+  relatedNotes,
+  relatedSection,
   shouldArchive,
   targetScope,
   validateExtraction,
@@ -140,5 +143,47 @@ describe("note tagging", () => {
     );
     expect(out).toEqual([[{ name: "Cloudflare", type: "org" }, { name: "Vibes", type: "concept" }], []]);
     expect(() => validateNoteEntities({}, 1)).toThrow();
+  });
+});
+
+describe("time and related memory", () => {
+  it("reads end dates and relation labels from an extraction", () => {
+    const x = validateExtraction({
+      facts: [
+        { statement: "The user hosted the homepage on Vercel.", valid_to: "2026-11-01", relation: "update", related: 2 },
+        { statement: "The user disputes something stored earlier.", relation: "contradiction", related: 0 },
+        { statement: "The user has a brand new preference here.", relation: "nonsense", related: -1, valid_to: "soon" },
+      ],
+    });
+    expect(x.facts.map((f) => [f.relation, f.related, f.validTo])).toEqual([
+      ["update", 2, Date.parse("2026-11-01")],
+      ["contradicts", 0, null],
+      [null, null, null],
+    ]);
+  });
+
+  it("ranks related notes by full text and embeddings together", () => {
+    const pool = [
+      { id: "a", vec: [1, 0, 0] },
+      { id: "b", vec: [0, 1, 0] },
+      { id: "c", vec: [0.9, 0.1, 0] },
+    ];
+    expect(relatedNotes([1, 0, 0], pool, ["c", "x"]).map((n) => n.id)).toEqual(["c", "a"]);
+    expect(relatedNotes(null, pool, ["b"]).map((n) => n.id)).toEqual(["b"]);
+    expect(relatedNotes([1, 0, 0], pool, [], 1).map((n) => n.id)).toEqual(["a"]);
+  });
+
+  it("numbers related notes with their start date", () => {
+    expect(relatedSection([])).toBe("");
+    expect(relatedSection([{ content: "Uses  Node 26\nnow", validFrom: Date.parse("2026-11-25") }, { content: "Short replies", validFrom: null }])).toBe(
+      "\n\nRelated memory:\n0. Uses Node 26 now (since 2026-11-25)\n1. Short replies",
+    );
+  });
+
+  it("ends an old fact where the new one starts, never before it began", () => {
+    expect(closeValidity(100, 300, 900)).toBe(300);
+    expect(closeValidity(500, 300, 900)).toBe(500);
+    expect(closeValidity(null, null, 900)).toBe(900);
+    expect(closeValidity(100, null, 900)).toBe(900);
   });
 });

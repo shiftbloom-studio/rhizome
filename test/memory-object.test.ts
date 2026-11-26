@@ -4,6 +4,7 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { EXTRACTION_PROMPT, NOTE_ENTITIES_PROMPT, PROFILE_PROMPT, RESOLVER_PROMPT } from "../src/intel";
 import { MemoryObject } from "../src/memory-object";
+import { MIGRATIONS } from "../src/schema";
 import type { Client } from "../src/scopes";
 import { fakeEnv, fakeState } from "./support/fake-do";
 
@@ -24,15 +25,26 @@ const EXTRACTIONS: Record<string, unknown> = {
     entities: [{ name: "Workers Builds", type: "tool" }, { name: "GitHub", type: "org" }],
   },
   SMALLTALK: { facts: [], entities: [] },
+  // Labelled by the extraction model against the notes shown under "Related memory".
+  MOVED: { facts: [{ statement: "The user wants the Apache license for every project.", kind: "preference", scope: "profile", trust: "user_explicit", valid_from: "2026-11-27", relation: "update", related: 0, entities: [] }], entities: [] },
+  TEA: { facts: [{ statement: "The user drinks green tea every morning.", kind: "preference", scope: "profile", trust: "user_explicit", relation: "same", related: 0, entities: [] }], entities: [] },
+  COFFEE: { facts: [{ statement: "The user drinks black coffee after lunch.", kind: "preference", scope: "profile", trust: "user_explicit", relation: "update", related: 0, entities: [] }], entities: [] },
+  VERCEL: { facts: [{ statement: "The user hosted the homepage on Vercel.", kind: "fact", scope: "profile", trust: "user_explicit", valid_to: "2026-11-01", entities: [] }], entities: [] },
 };
 
 let resolverAnswer = "update";
 let tagCalls = 0;
+let resolverCalls = 0;
+let extractionInputs: string[] = [];
 function generate(_model: string, system: string, user: string): string {
   if (system === EXTRACTION_PROMPT) {
-    const key = Object.keys(EXTRACTIONS).find((k) => user.includes(k))!;
+    extractionInputs.push(user);
+    // Markers count only in the episode itself, not in the related memory appended to it.
+    const episode = user.split("\n\nRelated memory:")[0]!;
+    const key = Object.keys(EXTRACTIONS).find((k) => episode.includes(k))!;
     return "```json\n" + JSON.stringify(EXTRACTIONS[key]) + "\n```";
   }
+  if (system === RESOLVER_PROMPT) resolverCalls++;
   if (system === RESOLVER_PROMPT) return JSON.stringify({ results: [{ pair: 0, relation: resolverAnswer }] });
   if (system === NOTE_ENTITIES_PROMPT) {
     tagCalls++;
@@ -55,6 +67,41 @@ async function settle(mo: MemoryObject) {
   }
 }
 
+describe("schema migration 3", () => {
+  it("backfills validity from event times and supersede edges, without a model", () => {
+    const { db, state } = fakeState();
+    db.exec(MIGRATIONS[0]!);
+    db.exec(MIGRATIONS[1]!);
+    db.exec("INSERT INTO meta (key, value) VALUES ('schema_version', '2')");
+    const add = (id: string, t: number, status = "active", by: string | null = null, updated: number | null = null) =>
+      db
+        .prepare(
+          `INSERT INTO items (id, kind, scope, content, trust, client_id, agent, provider, t_event, created_at, status, superseded_by, updated_at)
+           VALUES (?, 'note', 'profile', ?, 'user_explicit', 'c1', 'a', 'p', ?, ?, ?, ?, ?)`,
+        )
+        .run(id, `note ${id}`, t, t, status, by, updated);
+    add("old", 100, "superseded", "new", 500);
+    add("new", 300);
+    add("dup", 150, "superseded", "new", 600);
+    add("wrong", 120, "superseded", "new", 700);
+    const link = db.prepare("INSERT INTO links (src, dst, kind, weight, created_at) VALUES (?, ?, ?, 1, 0)");
+    link.run("new", "old", "supersedes");
+    link.run("dup", "new", "merged_into");
+    link.run("new", "wrong", "supersedes");
+    link.run("wrong", "new", "contradicts");
+
+    new MemoryObject(state as never, fakeEnv(() => "").env as never);
+    const rows = Object.fromEntries(
+      (db.prepare("SELECT id, valid_from, valid_to, expired_at FROM items").all() as { id: string }[]).map((r) => [r.id, r]),
+    );
+    expect(rows.old).toEqual({ id: "old", valid_from: 100, valid_to: 300, expired_at: 500 });
+    expect(rows.new).toEqual({ id: "new", valid_from: 300, valid_to: null, expired_at: null });
+    expect(rows.dup).toEqual({ id: "dup", valid_from: 150, valid_to: null, expired_at: 600 });
+    expect(rows.wrong).toEqual({ id: "wrong", valid_from: 120, valid_to: null, expired_at: 700 });
+    expect(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()).toEqual({ value: String(MIGRATIONS.length) });
+  });
+});
+
 describe("MemoryObject pipeline", () => {
   let mo: MemoryObject;
   let fake: ReturnType<typeof fakeEnv>;
@@ -66,6 +113,8 @@ describe("MemoryObject pipeline", () => {
     fake = fakeEnv(generate);
     mo = new MemoryObject(s.state as never, fake.env as never);
     resolverAnswer = "update";
+    resolverCalls = 0;
+    extractionInputs = [];
   });
 
   const notes = () => db.prepare("SELECT id, content, trust, status, confirmations, superseded_by, origin FROM items WHERE kind = 'note' ORDER BY created_at").all() as Record<string, unknown>[];
@@ -132,6 +181,84 @@ describe("MemoryObject pipeline", () => {
     const res = await mo.recall(claude, { query: "AGPL license", scopes: ["profile"], rerank: false });
     expect(res.items.map((i) => i.content)).toContain("The user wants the Apache license for every project.");
     expect(res.items.map((i) => i.content)).not.toContain("The user wants the AGPL license for every project.");
+  });
+
+  it("closes the old note's validity on an update and keeps the old note", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "change of plan: APACHE for every repository from today on" }] });
+    await settle(mo);
+    const rows = db.prepare("SELECT id, content, status, t_event, valid_from, valid_to, expired_at, updated_at FROM items WHERE kind = 'note' ORDER BY created_at").all() as Record<string, number | string | null>[];
+    expect(rows).toHaveLength(2);
+    const [old, next] = rows as [Record<string, number | string | null>, Record<string, number | string | null>];
+    expect(old.content).toBe("The user wants the AGPL license for every project.");
+    expect(old.valid_from).toBe(old.t_event);
+    expect(old.valid_to).toBe(next.valid_from);
+    expect(old.expired_at).toBe(old.updated_at);
+    expect(next).toMatchObject({ status: "active", valid_to: null, expired_at: null });
+    expect(db.prepare("SELECT kind FROM links WHERE src = ? AND dst = ? AND kind = 'supersedes'").get(String(next.id), String(old.id))).toBeTruthy();
+    const item = (await mo.recall(claude, { query: "Apache license", scopes: ["profile"], rerank: false })).items[0]!;
+    expect(item).toMatchObject({ validTo: null, expiredAt: null });
+    expect(item.validFrom).toBe(new Date(Number(next.valid_from)).toISOString());
+  });
+
+  it("puts related notes into the extraction prompt and uses the model's label instead of the resolver", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    expect(extractionInputs[0]).not.toContain("Related memory:");
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "MOVED: from tomorrow on we license every repository under Apache" }] });
+    await settle(mo);
+    expect(extractionInputs[1]).toContain("Related memory:\n0. The user wants the AGPL license for every project. (since 2026-11-25)");
+    expect(resolverCalls).toBe(0);
+    const n = db.prepare("SELECT id, status, superseded_by, valid_from, valid_to FROM items WHERE kind = 'note' ORDER BY created_at").all() as Record<string, unknown>[];
+    expect(n[0]).toMatchObject({ status: "superseded", superseded_by: n[1]!.id, valid_to: Date.parse("2026-11-27") });
+    expect(n[1]).toMatchObject({ status: "active", valid_from: Date.parse("2026-11-27"), valid_to: null });
+    const audit = db.prepare("SELECT detail FROM audit WHERE action = 'extract' ORDER BY seq DESC LIMIT 1").get() as { detail: string };
+    expect(JSON.parse(audit.detail)).toMatchObject({ update: 1, labelled: 1, resolved: 0, related: 1 });
+  });
+
+  it("does not merge on a 'same' label when the notes have little in common", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "TEA every morning, green, before anything else happens" }] });
+    await settle(mo);
+    const n = notes();
+    expect(n).toHaveLength(2);
+    expect(n.map((x) => x.status)).toEqual(["active", "active"]);
+    expect(n[0]!.confirmations).toBe(1);
+  });
+
+  it("does not supersede an unrelated note the model labelled as updated", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "COFFEE after lunch, black, every single day" }] });
+    await settle(mo);
+    const n = notes();
+    expect(n).toHaveLength(2);
+    expect(n.map((x) => x.status)).toEqual(["active", "active"]);
+    expect(n[0]!.superseded_by).toBeNull();
+  });
+
+  it("stores an end date from the episode and leaves an unknown start open", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "VERCEL hosted the homepage until the first of November" }] });
+    await settle(mo);
+    const row = db.prepare("SELECT status, valid_from, valid_to FROM items WHERE kind = 'note'").get();
+    expect(row).toEqual({ status: "active", valid_from: null, valid_to: Date.parse("2026-11-01") });
+  });
+
+  it("expires the losing side of a dispute the person settles without giving it a validity end", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    await mo.addEpisode(hermes, { scope: "profile", messages: [{ role: "assistant", content: "I think APACHE fits better for these repositories overall" }] });
+    await settle(mo);
+    const [first, second] = notes() as [Record<string, unknown>, Record<string, unknown>];
+    mo.confirm(web, String(second.id));
+    const loser = db.prepare("SELECT status, valid_to, expired_at FROM items WHERE id = ?").get(String(first.id)) as Record<string, unknown>;
+    expect(loser).toMatchObject({ status: "superseded", valid_to: null });
+    expect(loser.expired_at).toBeTypeOf("number");
+    // Forgetting the winner makes the old note current again.
+    await mo.forget(web, String(second.id));
+    expect(db.prepare("SELECT status, valid_to, expired_at FROM items WHERE id = ?").get(String(first.id))).toEqual({ status: "active", valid_to: null, expired_at: null });
   });
 
   it("skips small talk and merges a note an agent writes twice", async () => {

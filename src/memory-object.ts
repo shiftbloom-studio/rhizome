@@ -23,12 +23,16 @@ import {
   TRUST_RANK,
   aiText,
   capTrust,
+  closeValidity,
+  cosine,
   decodeVector,
   encodeVector,
   entityKey,
   importance,
   nearest,
   parseJsonObject,
+  relatedNotes,
+  relatedSection,
   shouldArchive,
   targetScope,
   validateExtraction,
@@ -86,6 +90,12 @@ export interface MemoryItem {
   importance: number;
   confirmations: number;
   supersededBy: string | null;
+  /** When the fact became true. */
+  validFrom: string | null;
+  /** When it stopped being true; null while it still holds. */
+  validTo: string | null;
+  /** When rhizome stopped treating this row as current (replaced or merged); null while current. */
+  expiredAt: string | null;
   score?: number;
 }
 
@@ -586,7 +596,7 @@ export class MemoryObject extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       this.dropDerived(id);
       // Anything that pointed at the forgotten item as its newer version becomes current again.
-      this.sql.exec("UPDATE items SET status = 'active', superseded_by = NULL WHERE superseded_by = ?", id);
+      this.sql.exec("UPDATE items SET status = 'active', superseded_by = NULL, valid_to = NULL, expired_at = NULL WHERE superseded_by = ?", id);
       this.sql.exec("DELETE FROM items WHERE id = ?", id);
       this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('delete', ?, ?)", id, now);
       this.audit(client, "forget.item", { id });
@@ -801,13 +811,19 @@ export class MemoryObject extends DurableObject<Env> {
       if (TRUST_RANK[String(row.trust)]! < TRUST_RANK.user_confirmed!) {
         this.sql.exec("UPDATE items SET trust = 'user_confirmed' WHERE id = ?", id);
       }
-      this.sql.exec("UPDATE items SET status = 'active', superseded_by = NULL, updated_at = ?, confirmations = confirmations + 1 WHERE id = ?", now, id);
-      // A confirmed side of a dispute supersedes the other side.
+      // A replaced note the person confirms is current again; an end date the fact had on its own stays.
+      this.sql.exec(
+        `UPDATE items SET valid_to = CASE WHEN status = 'superseded' THEN NULL ELSE valid_to END, expired_at = NULL,
+           status = 'active', superseded_by = NULL, updated_at = ?, confirmations = confirmations + 1 WHERE id = ?`,
+        now, id,
+      );
+      // A confirmed side of a dispute supersedes the other side. The other side was wrong, not outdated,
+      // so only its record expires; it never had a time when it was true.
       for (const l of this.sql.exec("SELECT dst FROM links WHERE src = ? AND kind = 'contradicts'", id).toArray()) {
-        this.supersede(String(l.dst), id, now);
+        this.supersede(String(l.dst), id, now, false);
       }
       for (const l of this.sql.exec("SELECT src FROM links WHERE dst = ? AND kind = 'contradicts'", id).toArray()) {
-        this.supersede(String(l.src), id, now);
+        this.supersede(String(l.src), id, now, false);
       }
       this.rescore(id, now);
       this.audit(client, "note.confirm", { id });
@@ -1000,7 +1016,7 @@ export class MemoryObject extends DurableObject<Env> {
   private candidates(scopes: string[], excludeIds: string[] = []) {
     return this.sql
       .exec(
-        `SELECT i.id, i.scope, i.content, i.trust, i.status, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id AND e.model = ?
+        `SELECT i.id, i.scope, i.content, i.trust, i.status, i.valid_from, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id AND e.model = ?
          WHERE i.kind = 'note' AND i.status IN ${RECALLABLE} AND i.scope IN (SELECT value FROM json_each(?))
            AND i.id NOT IN (SELECT value FROM json_each(?))
          ORDER BY i.importance DESC LIMIT ?`,
@@ -1010,7 +1026,10 @@ export class MemoryObject extends DurableObject<Env> {
         MAX_CANDIDATES,
       )
       .toArray()
-      .map((r) => ({ id: String(r.id), scope: String(r.scope), content: String(r.content), trust: String(r.trust), vec: decodeVector(r.vec as ArrayBuffer) }));
+      .map((r) => ({
+        id: String(r.id), scope: String(r.scope), content: String(r.content), trust: String(r.trust),
+        validFrom: r.valid_from == null ? null : Number(r.valid_from), vec: decodeVector(r.vec as ArrayBuffer),
+      }));
   }
 
   /**
@@ -1030,9 +1049,13 @@ export class MemoryObject extends DurableObject<Env> {
     const when = new Date(tEvent);
     let body = messages.map((m) => `[${m.role}] ${m.content}`).join("\n");
     if (body.length > 30_000) body = `${body.slice(0, 15_000)}\n[…]\n${body.slice(-15_000)}`;
+    // Memory first: the notes most related to this episode go into the same
+    // prompt, so the model can say which of them a fact repeats, updates or contradicts.
+    const related = await this.relatedToEpisode(String(ep.scope), messages, body);
     const user =
       `Episode time: ${when.toISOString()} (${when.toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" })})\n` +
-      `Agent: ${ep.agent} (provider ${ep.provider})\nEpisode scope: ${ep.scope}\nMessages:\n${body}`;
+      `Agent: ${ep.agent} (provider ${ep.provider})\nEpisode scope: ${ep.scope}\nMessages:\n${body}` +
+      relatedSection(related);
     const model = this.env.EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
     const extraction = await this.generateJson<Extraction>(model, EXTRACTION_PROMPT, user, validateExtraction);
     const now = Date.now();
@@ -1052,13 +1075,29 @@ export class MemoryObject extends DurableObject<Env> {
     type Plan = { fact: (typeof facts)[number]; vec: number[]; relation: Relation; target?: (typeof pool)[number]; similarity: number };
     const plans: Plan[] = [];
     const ask: Plan[] = [];
+    let labelled = 0;
     facts.forEach((fact, n) => {
       const vec = vectors[n]!;
       // The same fact twice in one episode counts once.
       if (plans.some((p) => p.fact.scope === fact.scope && nearest(vec, [{ vec: p.vec }], 1, DUPLICATE_SIMILARITY).length)) return;
+      // The extraction model labelled the fact against a related note of the same scope.
+      const shown = fact.related !== null ? related[fact.related] : undefined;
+      if (fact.relation && fact.relation !== "new" && shown && shown.scope === fact.scope) {
+        const similarity = cosine(vec, shown.vec);
+        // The label needs real overlap: "same" drops the new wording, and an update
+        // or contradiction against a wrongly numbered note would hide or dispute an
+        // unrelated one. Below that the fallback decides.
+        if (similarity >= LINK_SIMILARITY) {
+          labelled++;
+          plans.push({ fact, vec, relation: fact.relation, target: shown, similarity });
+          return;
+        }
+      }
+      // Fallback: cosine thresholds and the separate resolver, as before.
       const best = nearest(vec, pool.filter((c) => c.scope === fact.scope), 1, RELATED_SIMILARITY)[0];
       const plan: Plan = { fact, vec, relation: "new", target: best?.item, similarity: best?.similarity ?? 0 };
       if (best && best.similarity >= DUPLICATE_SIMILARITY) plan.relation = "same";
+      else if (best && fact.relation === "new" && related.some((r) => r.id === best.item.id)) labelled++; // already compared, nothing to resolve
       else if (best) ask.push(plan);
       plans.push(plan);
     });
@@ -1106,14 +1145,20 @@ export class MemoryObject extends DurableObject<Env> {
         }
         const id = newId();
         created.push(id);
+        // A fact that already ended before the episode ("used X until March") has an unknown start.
+        const endedBefore = p.fact.validFrom === null && p.fact.validTo !== null && p.fact.validTo <= tEvent;
+        const validFrom = endedBefore ? null : (p.fact.validFrom ?? tEvent);
+        const validTo = p.fact.validTo !== null && (validFrom === null || p.fact.validTo > validFrom) ? p.fact.validTo : null;
+        const tFact = p.fact.validFrom ?? tEvent;
         this.sql.exec(
           `INSERT INTO items (id, kind, episode_id, scope, content, note_kind, trust, client_id, agent, provider, model, t_event, created_at,
-                              origin, importance, updated_at, status)
-           VALUES (?, 'note', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'extracted', ?, ?, ?)`,
+                              origin, importance, updated_at, status, valid_from, valid_to)
+           VALUES (?, 'note', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'extracted', ?, ?, ?, ?, ?)`,
           id, p.fact.scope, p.fact.statement, p.fact.kind, p.fact.trust, ep.client_id, ep.agent, ep.provider, model,
-          p.fact.validFrom ?? tEvent, now,
-          importance({ trust: p.fact.trust, kind: "note", confirmations: 1, accessCount: 0, lastTouched: p.fact.validFrom ?? tEvent }, now),
+          tFact, now,
+          importance({ trust: p.fact.trust, kind: "note", confirmations: 1, accessCount: 0, lastTouched: tFact }, now),
           now, relation === "contradicts" ? "disputed" : "active",
+          validFrom, validTo,
         );
         this.sql.exec(
           "INSERT INTO embeddings (item_id, model, vec) VALUES (?, ?, ?)",
@@ -1131,10 +1176,43 @@ export class MemoryObject extends DurableObject<Env> {
       for (const id of created) this.linkSimilar(id, now);
       this.sql.exec(
         "INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'extract', ?)",
-        now, SYSTEM_EXTRACTION, JSON.stringify({ episodeId, model, ...counts, entities: extraction.entities.length }),
+        now, SYSTEM_EXTRACTION, JSON.stringify({ episodeId, model, ...counts, labelled, resolved: ask.length, related: related.length, entities: extraction.entities.length }),
       );
     });
     if (created.length) await this.kick(100);
+  }
+
+  /**
+   * Up to 12 current notes most related to an episode, from full-text search and
+   * the stored embeddings (one embedding call for the episode, no vector index).
+   */
+  private async relatedToEpisode(scope: string, messages: { role: string; content: string }[], body: string) {
+    const scopes = [...new Set([scope, "profile"])];
+    const pool = this.candidates(scopes);
+    if (pool.length === 0) return [];
+    const said = messages.filter((m) => m.role === "user").map((m) => m.content).join("\n") || body;
+    const match = ftsQuery(said.slice(-4000));
+    const ftsIds = match
+      ? this.sql
+          .exec(
+            `SELECT items.id AS id FROM items_fts JOIN items ON items.rowid = items_fts.rowid
+             WHERE items_fts MATCH ? AND items.kind = 'note' AND items.status IN ${RECALLABLE}
+               AND items.scope IN (SELECT value FROM json_each(?))
+             ORDER BY bm25(items_fts) LIMIT 24`,
+            match,
+            JSON.stringify(scopes),
+          )
+          .toArray()
+          .map((r) => String(r.id))
+      : [];
+    let episodeVec: number[] | null = null;
+    try {
+      const text = said.length > 2000 ? `${said.slice(0, 1000)}\n${said.slice(-1000)}` : said;
+      episodeVec = (await this.embed([text]))[0] ?? null;
+    } catch (err) {
+      console.error("episode embedding failed, related notes from full text only", String(err));
+    }
+    return relatedNotes(episodeVec, pool, ftsIds);
   }
 
   /** Inserts or bumps entities, returns entity ids by key. */
@@ -1173,8 +1251,24 @@ export class MemoryObject extends DurableObject<Env> {
     );
   }
 
-  private supersede(oldId: string, newId_: string, now: number): void {
-    this.sql.exec("UPDATE items SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE id = ?", newId_, now, oldId);
+  /**
+   * Replaces a note with a newer one. The old note stays, so the history of how a
+   * memory changed can still be read: it gets status superseded, its record
+   * expires now and, for an update over time (`endValidity`), its validity
+   * interval closes where the new note's starts.
+   */
+  private supersede(oldId: string, newId_: string, now: number, endValidity = true): void {
+    const old = this.sql.exec("SELECT valid_from FROM items WHERE id = ?", oldId).toArray()[0];
+    const next = this.sql.exec("SELECT valid_from FROM items WHERE id = ?", newId_).toArray()[0];
+    const validTo = endValidity
+      ? closeValidity(old?.valid_from == null ? null : Number(old.valid_from), next?.valid_from == null ? null : Number(next.valid_from), now)
+      : null;
+    this.sql.exec(
+      `UPDATE items SET status = 'superseded', superseded_by = ?, updated_at = ?, expired_at = COALESCE(expired_at, ?),
+         valid_to = CASE WHEN ? IS NULL THEN valid_to ELSE COALESCE(valid_to, ?) END
+       WHERE id = ?`,
+      newId_, now, now, validTo, validTo, oldId,
+    );
     this.link(newId_, oldId, "supersedes", 1, now);
   }
 
@@ -1233,7 +1327,8 @@ export class MemoryObject extends DurableObject<Env> {
       "UPDATE items SET trust = ?, confirmations = confirmations + ?, updated_at = ? WHERE id = ?",
       trust, Number(l.confirmations), now, survivor,
     );
-    this.sql.exec("UPDATE items SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE id = ?", survivor, now, loser);
+    // A merged duplicate is still true (it lives on in the survivor); only its record expires.
+    this.sql.exec("UPDATE items SET status = 'superseded', superseded_by = ?, updated_at = ?, expired_at = COALESCE(expired_at, ?) WHERE id = ?", survivor, now, now, loser);
     this.sql.exec("UPDATE OR IGNORE mentions SET ref = ? WHERE ref = ?", survivor, loser);
     this.sql.exec("UPDATE OR IGNORE links SET src = ? WHERE src = ? AND kind IN ('derived_from', 'similar')", survivor, loser);
     this.link(loser, survivor, "merged_into", 1, now);
@@ -1471,6 +1566,9 @@ function toItem(r: Row): MemoryItem {
     importance: Number(r.importance ?? 0.5),
     confirmations: Number(r.confirmations ?? 1),
     supersededBy: (r.superseded_by as string | null) ?? null,
+    validFrom: r.valid_from == null ? null : iso(r.valid_from),
+    validTo: r.valid_to == null ? null : iso(r.valid_to),
+    expiredAt: r.expired_at == null ? null : iso(r.expired_at),
   };
 }
 
