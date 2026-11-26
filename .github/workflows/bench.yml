@@ -35,6 +35,8 @@ concurrency:
 jobs:
   longmemeval:
     runs-on: ubuntu-latest
+    # Cloudflare credentials live in the main-only production environment.
+    environment: production
     timeout-minutes: 355
     steps:
       - name: Check the secrets
