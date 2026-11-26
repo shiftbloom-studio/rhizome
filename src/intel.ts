@@ -126,7 +126,13 @@ export interface ExtractedFact {
   scope: ExtractedScope;
   trust: ExtractedTrust;
   validFrom: number | null;
+  /** When the fact stopped being true ("until March", "no longer"), if the episode says so. */
+  validTo: number | null;
   entities: string[];
+  /** How the fact relates to a note shown under "Related memory", if the model said so. */
+  relation: Relation | null;
+  /** Index of that related note. */
+  related: number | null;
 }
 
 export interface Extraction {
@@ -135,11 +141,17 @@ export interface Extraction {
 }
 
 export const EXTRACTION_PROMPT = `You extract long-term memory for a personal memory that all AI agents of one person share (Claude, ChatGPT, Hermes and others). Input: one episode with its time, agent, provider and messages. Output only a JSON object, no prose:
-{"facts":[{"statement":"one self-contained English sentence","kind":"preference|decision|fact|learning","scope":"profile|project|agent","trust":"user_explicit|user_confirmed|agent_inference|tool","valid_from":"YYYY-MM-DD or null","entities":["names of entities this fact is about"]}],"entities":[{"name":"string","type":"person|project|tool|device|org|place|concept"}]}
+{"facts":[{"statement":"one self-contained English sentence","kind":"preference|decision|fact|learning","scope":"profile|project|agent","trust":"user_explicit|user_confirmed|agent_inference|tool","valid_from":"YYYY-MM-DD or null","valid_to":"YYYY-MM-DD or null","relation":"new|same|update|contradiction","related":<number of the related memory or null>,"entities":["names of entities this fact is about"]}],"entities":[{"name":"string","type":"person|project|tool|device|org|place|concept"}]}
 Rules:
 - Keep only durable information that helps in future sessions: preferences, working style, values, decisions, conventions, facts about the person's world. Small talk, greetings and one-off task details give {"facts":[],"entities":[]}.
 - Write every statement in English, about "the user", self-contained without the conversation.
-- Resolve relative dates against the episode time.
+- Resolve relative dates against the episode time. valid_from is when the fact became true, valid_to when it stopped ("until March", "no longer since Monday"); null when the episode does not say.
+- The input may list "Related memory": numbered notes that are already stored. Compare every fact with them and set relation and related:
+  - "same": a related note already says this (wording may differ). related = its number.
+  - "update": the fact changes or refines a related note because something changed over time; that note is now outdated. related = its number.
+  - "contradiction": the fact and a related note cannot both be true and it is unclear which one is right. related = its number.
+  - "new": no related note covers it. related = null.
+  Still output facts that are "same", so they count as a confirmation. Never copy a related note as a new fact. Without related memory, use "new".
 - trust: user_explicit only for what the user said; an assistant proposal the user accepted is user_confirmed; observations of the assistant are agent_inference; tool output is tool.
 - scope: profile for preferences and working style that hold across projects; project for one project; agent for quirks of one tool or agent.
 - kind: preference (likes, dislikes, style), decision (something chosen), fact (state of the world), learning (a lesson or pitfall).
@@ -239,13 +251,16 @@ export function validateExtraction(raw: unknown): Extraction {
   for (const f of r.facts.slice(0, 12)) {
     const statement = typeof f?.statement === "string" ? f.statement.trim() : "";
     if (statement.length < 8 || statement.length > 600) continue;
-    const validFrom = typeof f.valid_from === "string" && /^\d{4}-\d{2}-\d{2}/.test(f.valid_from) ? Date.parse(f.valid_from) : NaN;
+    const validFrom = parseDay(f.valid_from) ?? NaN;
     facts.push({
       statement,
       kind: KINDS.includes(f.kind) ? f.kind : "fact",
       scope: SCOPES.includes(f.scope) ? f.scope : "profile",
       trust: TRUSTS.includes(f.trust) ? f.trust : "agent_inference",
       validFrom: Number.isFinite(validFrom) ? validFrom : null,
+      validTo: parseDay(f.valid_to),
+      relation: RELATION_ALIASES[String(f.relation ?? "").toLowerCase()] ?? null,
+      related: Number.isInteger(f.related) && f.related >= 0 ? (f.related as number) : null,
       entities: Array.isArray(f.entities)
         ? f.entities.filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0).map((x: string) => x.trim().slice(0, 80)).slice(0, 8)
         : [],
@@ -264,6 +279,65 @@ export function validateExtraction(raw: unknown): Extraction {
 }
 
 export type Relation = "same" | "update" | "contradicts" | "new";
+
+const RELATION_ALIASES: Record<string, Relation> = {
+  same: "same",
+  update: "update",
+  contradiction: "contradicts",
+  contradicts: "contradicts",
+  new: "new",
+};
+
+/** A "YYYY-MM-DD..." string as epoch milliseconds, else null. */
+function parseDay(v: unknown): number | null {
+  if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}/.test(v)) return null;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+}
+
+/** Most related notes put into the extraction prompt. */
+export const MAX_RELATED = 12;
+
+/**
+ * Notes most related to an episode, best first: reciprocal rank fusion of a
+ * full-text ranking and an embedding ranking, both computed from stored data.
+ */
+export function relatedNotes<T extends { id: string; vec: ArrayLike<number> }>(
+  episodeVec: ArrayLike<number> | null,
+  pool: T[],
+  ftsIds: string[],
+  k = MAX_RELATED,
+  minSimilarity = 0.35,
+): T[] {
+  const byId = new Map(pool.map((c) => [c.id, c]));
+  const score = new Map<string, number>();
+  const add = (ids: string[]) => ids.forEach((id, rank) => byId.has(id) && score.set(id, (score.get(id) ?? 0) + 1 / (60 + rank)));
+  add(ftsIds);
+  if (episodeVec) add(nearest(episodeVec, pool, k * 2, minSimilarity).map((n) => n.item.id));
+  return [...score.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([id]) => byId.get(id)!);
+}
+
+/**
+ * The "Related memory" section of the extraction input. Times are dates only and
+ * content is cut, so the prompt grows by about 2,000 tokens at most.
+ */
+export function relatedSection(notes: { content: string; validFrom?: number | null }[]): string {
+  if (!notes.length) return "";
+  const lines = notes.map((n, i) => {
+    const since = n.validFrom ? ` (since ${new Date(n.validFrom).toISOString().slice(0, 10)})` : "";
+    return `${i}. ${n.content.replace(/\s+/g, " ").slice(0, 400)}${since}`;
+  });
+  return `\n\nRelated memory:\n${lines.join("\n")}`;
+}
+
+/**
+ * When an update replaces a note, the old fact ends where the new one starts,
+ * but never before it began itself.
+ */
+export function closeValidity(oldValidFrom: number | null, newValidFrom: number | null, now: number): number {
+  const end = newValidFrom ?? now;
+  return oldValidFrom === null ? end : Math.max(oldValidFrom, end);
+}
 
 export function validateRelations(raw: unknown, pairs: number): Relation[] {
   const out: Relation[] = Array.from({ length: pairs }, () => "new");
