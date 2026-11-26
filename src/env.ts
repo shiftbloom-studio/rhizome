@@ -45,7 +45,7 @@ export interface Env {
   OPEN_LOOPS?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
-  /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */
+  /** Recall steps, comma separated: abstain, diversity, evidence, time, keys, turns, "all" or "none". Default: all. */
   RECALL_FEATURES?: string;
   /** How conversations are cut for search: "fixed" (1,200 characters, default) or "rounds" (one question and its answers). */
   CHUNKING?: string;

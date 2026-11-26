@@ -1,27 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Pure helpers for recall: confidence per result, abstention, diversity (one hit
-// per episode plus MMR) and the switches that turn these steps on. Deterministic
-// and unit tested; the Durable Object wires them to storage.
+// per episode plus MMR), turn cards and the switches for these steps.
+// Deterministic and unit tested; the Durable Object wires them to storage.
 
 import { cosine } from "./intel";
+import { chunk, estimateTokens } from "./text";
 
 /**
- * Optional recall steps. Each one is off unless the request or the
- * RECALL_FEATURES variable turns it on, so default recall stays as it was until
- * a benchmark shows the step helps.
+ * Recall steps. All of them run unless the request (`features`) or the
+ * RECALL_FEATURES variable names fewer; "none" turns them all off.
  * - abstain: return nothing when no result is relevant enough.
  * - diversity: at most one excerpt per episode, then MMR on the stored embeddings.
  * - evidence: a note brings its best source excerpt when the token budget allows.
  * - time: English and German time expressions in the query become a time window.
  * - keys: excerpts are also found through the facts extracted from them.
+ * - turns: conversations come back as turn cards: the turns of the best
+ *   conversations are scored one by one and the best of them fill the budget.
  */
-export const RECALL_FEATURES = ["abstain", "diversity", "evidence", "time", "keys"] as const;
+export const RECALL_FEATURES = ["abstain", "diversity", "evidence", "time", "keys", "turns"] as const;
 export type RecallFeature = (typeof RECALL_FEATURES)[number];
 
-/** Parses a comma list such as "abstain,diversity" or "all". Unknown names are ignored. */
+/**
+ * Parses a comma list such as "abstain,diversity", "all" or "none". Unknown
+ * names are ignored. Unset (undefined or null) means all steps; an empty list
+ * or string means none.
+ */
 export function parseFeatures(value: string | string[] | undefined | null): Set<RecallFeature> {
-  const list = Array.isArray(value) ? value : (value ?? "").split(",");
+  if (value === undefined || value === null) return new Set(RECALL_FEATURES);
+  const list = Array.isArray(value) ? value : value.split(",");
   const out = new Set<RecallFeature>();
   for (const raw of list) {
     const name = String(raw).trim().toLowerCase();
@@ -193,4 +200,175 @@ export function assignFactKeys<K>(
     out.set(best.rid, list);
   });
   return out;
+}
+
+// ----------------------------------------------------------- turn cards
+
+/** Roles that open a turn in a transcript line "[role] text" (see transcript() in text.ts). */
+const TURN_LINE = /^\[(user|assistant|system|tool|developer|human|ai|model|bot|agent|function)\] ?/i;
+const USER_ROLES = new Set(["user", "human"]);
+
+/** Conversations whose turns compete for a recall's budget: the best ones by their best excerpt. */
+export const CARD_EPISODES = 10;
+/** Most turns and notes scored in one recall (one reranker call). */
+export const MAX_CARD_UNITS = 200;
+/** A user turn is shown up to this length; longer ones are cut into pieces of it, at most MAX_TURN_PIECES. */
+export const CARD_TURN_CHARS = 1500;
+const MAX_TURN_PIECES = 20;
+/** The reranker also sees this much of the reply to a user turn, so a question finds its answer. */
+const REPLY_CHARS = 200;
+/** Of a reply, one window of two sentences is shown, at most this long. */
+const WINDOW_CHARS = 400;
+/** Estimated tokens for a card's header line and for each further turn on it. */
+const CARD_TOKENS = 12;
+const PART_TOKENS = 2;
+
+export interface Turn {
+  role: string;
+  content: string;
+}
+
+/**
+ * Rebuilds an episode's text from its excerpts in stored order. Excerpts of one
+ * long passage overlap (chunk() repeats up to `overlap` characters), and the
+ * repeat is dropped; excerpts that do not overlap are joined by a line break.
+ */
+export function joinExcerpts(parts: string[], overlap = 150): string {
+  let out = "";
+  for (const part of parts) {
+    if (!part) continue;
+    if (!out) {
+      out = part;
+      continue;
+    }
+    out += afterOverlap(out, part, overlap);
+  }
+  return out;
+}
+
+/** The rest of `next` after the longest end of `text`, at most `overlap` long, that it starts with. */
+function afterOverlap(text: string, next: string, overlap: number): string {
+  const probe = next.slice(0, 24);
+  if (probe.length >= 16) {
+    for (let at = text.indexOf(probe, Math.max(0, text.length - overlap)); at >= 0; at = text.indexOf(probe, at + 1)) {
+      if (next.startsWith(text.slice(at))) return next.slice(text.length - at);
+    }
+  }
+  return `\n${next}`;
+}
+
+/**
+ * Splits a transcript into its turns. Text before the first role line becomes a
+ * turn of role "text"; a text without any role line has no turns.
+ */
+export function splitTurns(text: string): Turn[] {
+  const turns: Turn[] = [];
+  let lead: string[] = [];
+  for (const line of text.split("\n")) {
+    const m = TURN_LINE.exec(line);
+    if (m) turns.push({ role: m[1]!.toLowerCase(), content: line.slice(m[0].length) });
+    else if (turns.length) turns[turns.length - 1]!.content += `\n${line}`;
+    else lead.push(line);
+  }
+  if (!turns.length) return [];
+  const before = lead.join("\n").trim();
+  return before ? [{ role: "text", content: before }, ...turns] : turns;
+}
+
+/** Windows of two sentences each (lines count as sentences), at most WINDOW_CHARS long. */
+export function sentenceWindows(text: string): string[] {
+  const sentences = text
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const out: string[] = [];
+  for (let i = 0; i < sentences.length; i += 2) out.push(sentences.slice(i, i + 2).join(" ").slice(0, WINDOW_CHARS));
+  return out;
+}
+
+/** One candidate piece of a turn card: a user turn (or a piece of a long one), or one window of a reply. */
+export interface CardUnit {
+  /** The card it belongs to: its episode. */
+  key: string;
+  /** Position on the card. */
+  order: number;
+  /** What the card shows. */
+  text: string;
+  /** What the reranker scores. */
+  rank: string;
+}
+
+const coverage = (terms: string[][], text: string) => Math.max(0, ...terms.map((t) => keywordCoverage(t, text)));
+
+/**
+ * The units of one conversation. A user turn is a unit of its own (pieces of
+ * CARD_TURN_CHARS when longer) and is scored together with the start of its
+ * reply; of every other turn, the window of two sentences that shares the most
+ * keywords with the query (the first one on a tie).
+ */
+export function turnUnits(key: string, turns: Turn[], terms: string[][]): CardUnit[] {
+  const out: CardUnit[] = [];
+  turns.forEach((t, i) => {
+    const body = t.content.trim();
+    if (!body) return;
+    if (USER_ROLES.has(t.role) || t.role === "text") {
+      const next = turns[i + 1];
+      const reply = next && !USER_ROLES.has(next.role) ? ` [${next.role}] ${next.content.trim().slice(0, REPLY_CHARS)}` : "";
+      const pieces = body.length <= CARD_TURN_CHARS ? [body] : chunk(body.slice(0, CARD_TURN_CHARS * MAX_TURN_PIECES), CARD_TURN_CHARS, 100).slice(0, MAX_TURN_PIECES);
+      const head = t.role === "text" ? "" : `[${t.role}] `;
+      pieces.forEach((p, j) => {
+        const text = `${head}${j > 0 ? "… " : ""}${p}${j < pieces.length - 1 ? " …" : ""}`;
+        out.push({ key, order: i * 1000 + j, text, rank: text + reply });
+      });
+      return;
+    }
+    const windows = sentenceWindows(body);
+    if (!windows.length) return;
+    let best = 0;
+    let bestCoverage = -1;
+    windows.forEach((w, j) => {
+      const c = coverage(terms, w);
+      if (c > bestCoverage) {
+        bestCoverage = c;
+        best = j;
+      }
+    });
+    const text = `[${t.role}] ${best > 0 ? "… " : ""}${windows[best]}${best < windows.length - 1 ? " …" : ""}`;
+    out.push({ key, order: i * 1000 + best, text, rank: text });
+  });
+  return out;
+}
+
+/** Score of a unit: the reranker's score against the best unit's, and the share of the query's keywords it holds. */
+export function unitScore(rerank: number, maxRerank: number, terms: string[][], text: string): number {
+  return 0.7 * (rerank / (maxRerank || 1e-9)) + 0.3 * coverage(terms, text);
+}
+
+/**
+ * Picks units best first until the token budget is spent, with at most
+ * `maxCards` cards (a unit's key is its card). There is no cap per card and no
+ * floor relative to the best unit: a conversation can bring several turns, and a
+ * question spread over many conversations still gets all of them. The first
+ * unit is always taken. Returns the picked units, best first.
+ */
+export function fillCards<T extends { key: string; text: string; score: number }>(units: T[], budget: number, maxCards: number): T[] {
+  const order = [...units].sort((a, b) => b.score - a.score);
+  const open = new Set<string>();
+  const out: T[] = [];
+  let used = 0;
+  for (const u of order) {
+    const fresh = !open.has(u.key);
+    if (fresh && open.size >= maxCards) continue;
+    const cost = cardCost(u.text, fresh);
+    if (used + cost > budget && out.length > 0) continue;
+    used += cost;
+    open.add(u.key);
+    out.push(u);
+  }
+  return out;
+}
+
+/** Estimated tokens a unit adds: its text, and a header when it opens a card. */
+export function cardCost(text: string, opensCard: boolean): number {
+  return estimateTokens(text) + (opensCard ? CARD_TOKENS : PART_TOKENS);
 }
