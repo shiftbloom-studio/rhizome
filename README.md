@@ -98,7 +98,7 @@ Until the chosen mode is fully configured, the explorer API answers 404 and nobo
 | Tool | What it does |
 | --- | --- |
 | `get_context` | Profile, working style and, with a `project`, its summary and most trusted notes. For the start of a task |
-| `recall` | Hybrid search across the profile, the agent's own notes and every project it may read, or one `project` |
+| `recall` | Hybrid search across the profile, the agent's own notes and every project it may read, or one `project`. Optional `queries` (other wordings or parts of the question) and a `from`/`to` time range |
 | `remember` | Stores one note. `said_by_user: true` marks it as something the person said, which wins conflicts |
 | `save_conversation` | Stores a conversation verbatim; notes are extracted from it in the background |
 | `import_memory_file` | Imports a `CLAUDE.md`, `AGENTS.md`, Hermes `MEMORY.md` or `USER.md`, or any Markdown notes. Each bullet or paragraph becomes a note, and a second import of the same file adds nothing |
@@ -121,7 +121,7 @@ All memory endpoints take `Authorization: Bearer <client api key>`.
 | --- | --- | --- |
 | `POST` | `/v1/memory/episodes` | Store a conversation turn or any text (`messages` or `text`, optional `scope`, `sessionId`, `model`, `tEvent`) |
 | `POST` | `/v1/memory/notes` | Store a note (`content`, `kind`: preference, decision, fact, learning, note; `trust`) |
-| `POST` | `/v1/memory/recall` | Hybrid search (`query`, optional `scopes`, `project`, `limit`, `budgetTokens`) |
+| `POST` | `/v1/memory/recall` | Hybrid search (`query`, optional `scopes`, `project`, `limit`, `budgetTokens`, `queries`, `from`, `to`, `features`) |
 | `GET` | `/v1/memory/context` | Cache-friendly core for a system prompt: blocks plus the most trusted notes. Supports `ETag` |
 | `GET` | `/v1/memory/blocks` | List working-memory blocks |
 | `PUT` | `/v1/memory/blocks/:label` | Create or replace a block (`scope`, `value`, `charLimit`) |
@@ -133,7 +133,14 @@ All memory endpoints take `Authorization: Bearer <client api key>`.
 | `GET` | `/v1/memory/stats` | Counts and database size |
 | `GET` | `/v1/memory/me` | The calling client and its grants |
 
-Recall leaves out superseded and archived notes, and returns disputed ones with a lower score.
+Recall leaves out superseded and archived notes, and returns disputed ones with a lower score. Every result carries a `confidence` between 0 and 1. A `from`/`to` range (ISO dates; a date as `to` includes that day) limits recall to memories from that time and scores their stored embeddings exactly.
+
+Optional recall steps are off until you turn them on, per request with `features` or for every request with the `RECALL_FEATURES` variable (comma separated, or `all`):
+
+* `abstain`: returns nothing (`abstained: true`) when no result shares a keyword with the query and none is semantically close.
+* `diversity`: at most one excerpt per conversation, and near-identical results make room for different ones.
+* `evidence`: a note brings the conversation excerpt it was extracted from, when the token budget allows.
+* `time`: English and German time words in the query ("last week", "letzten Monat", "im März", "vor 3 Tagen", "since Monday") become a time window. When nothing falls inside it, recall runs without it.
 
 ```sh
 # remember something about yourself

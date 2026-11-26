@@ -24,6 +24,8 @@ export interface Env {
   REFLECTION_MODEL?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
+  /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */
+  RECALL_FEATURES?: string;
   /** Maximum episodes per person and UTC day that go through fact extraction. Default: 200. */
   EXTRACTION_DAILY_LIMIT?: string;
 
