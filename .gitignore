@@ -9,3 +9,5 @@ wrangler.deploy.jsonc
 web/node_modules
 web/dist
 data/
+bench/cache/
+bench/runs/
