@@ -6,6 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, runAi, type Env } from "./env";
 import { MIGRATIONS } from "./schema";
+import { correctionLines, ledgerEnabled, MAX_DELETED, MAX_REPLACED, needsCorrection, TOLD_TTL_MS, UNTOLD_TTL_MS, type Corrections, type Step } from "./ledger";
 import { admitConversation, admitNamed, HANDLE_TTL_MS, heldTarget, isValidWallName, isWallableScope, latestWall, wallOf, WALL_LIMIT, WINDOW_MS, type Seen, type Tracked, type Walls } from "./walls";
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
@@ -136,6 +137,8 @@ export interface RecallResult {
   asOf?: string;
   /** What was left out and why, for the calling agent (walls). */
   notices?: string[];
+  /** Ledger: what changed in memory this connector was given earlier, told once. */
+  corrections?: string[];
 }
 
 export interface MemoryItem {
@@ -504,7 +507,7 @@ export class MemoryObject extends DurableObject<Env> {
     requested: string[],
     budgetTokens = 1500,
     opts: { track?: Tracked } = {},
-  ): { text: string; blocks: Block[]; notes: MemoryItem[]; version: string; notices?: string[]; conversation?: string } {
+  ): { text: string; blocks: Block[]; notes: MemoryItem[]; version: string; notices?: string[]; conversation?: string; corrections?: string[] } {
     // Walls rule 2. With walls set, a conversation without a handle gets one here.
     const now = Date.now();
     let track = opts.track;
@@ -559,7 +562,10 @@ export class MemoryObject extends DurableObject<Env> {
       for (const n of notes) lines.push(`- [${n.scope}, ${n.noteKind}, ${n.trust}] ${n.content}`);
     }
     const text = lines.join("\n\n");
-    if (track) this.recordReads(client, track, [...notes.map((n) => n.scope), ...blocks.map((b) => b.scope), ...due.loops.map((l) => l.scope)], now);
+    // Ledger: corrections first, then this call's notes count as given.
+    const fixes = track && this.ledgerOn ? this.takeCorrections(client, scopes, now) : null;
+    if (track && this.ledgerOn) this.recordDeliveries(client, notes, now);
+    if (track) this.recordReads(client, track, [...notes.map((n) => n.scope), ...blocks.map((b) => b.scope), ...(fixes?.scopes ?? []), ...due.loops.map((l) => l.scope)], now);
     return {
       text,
       blocks,
@@ -567,6 +573,7 @@ export class MemoryObject extends DurableObject<Env> {
       version: fnv1a(text),
       ...(notices.length ? { notices } : {}),
       ...(minted ? { conversation: minted } : {}),
+      ...(fixes?.lines.length ? { corrections: fixes.lines } : {}),
     };
   }
 
@@ -578,8 +585,15 @@ export class MemoryObject extends DurableObject<Env> {
     // Walls rule 2: nothing from a second wall for a conversation that was given one.
     const second = input.track && Object.keys(walls).length ? admitConversation(gate.scopes, this.seenWalls(client, input.track, started), walls) : null;
     const scopes = second ? second.scopes : gate.scopes;
-    const notices = gate.notices.length || second?.notices.length ? { notices: [...gate.notices, ...(second?.notices ?? [])] } : {};
-    if (scopes.length === 0) return { items: [], text: "", tookMs: 0, sources: {}, ...notices };
+    if (scopes.length === 0) {
+      const notices = gate.notices.length || second?.notices.length ? { notices: [...gate.notices, ...(second?.notices ?? [])] } : {};
+      return { items: [], text: "", tookMs: 0, sources: {}, ...notices };
+    }
+    // Ledger: told once, for calls from an agent's conversation about the present (not as of a past time).
+    const fixes = input.track && input.asOf === undefined && this.ledgerOn ? this.takeCorrections(client, scopes, started) : null;
+    if (fixes?.scopes.length && input.track) this.recordReads(client, input.track, fixes.scopes, started);
+    const told = fixes?.lines.length ? { corrections: fixes.lines } : {};
+    const notices = { ...(gate.notices.length || second?.notices.length ? { notices: [...gate.notices, ...(second?.notices ?? [])] } : {}), ...told };
     const limit = Math.min(Math.max(input.limit ?? 10, 1), 50);
     const budget = input.budgetTokens ?? 2000;
     const features = input.features ? parseFeatures(input.features) : parseFeatures(this.env.RECALL_FEATURES);
@@ -673,7 +687,7 @@ export class MemoryObject extends DurableObject<Env> {
     const asOfOut = asOf !== undefined ? { asOf: iso(asOf) } : {};
     const windowOut = window && { from: iso(window.from), to: window.to >= Number.MAX_SAFE_INTEGER ? null : iso(window.to), source: window.source, ...(window.text ? { text: window.text } : {}) };
     if (ranked.length === 0) {
-      return { items: [], text: "", tookMs: Date.now() - started, sources, ...(features.has("abstain") ? { abstained: true } : {}), ...(windowOut ? { window: windowOut } : {}), ...asOfOut };
+      return { items: [], text: "", tookMs: Date.now() - started, sources, ...(features.has("abstain") ? { abstained: true } : {}), ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...told };
     }
 
     const idMarks = ranked.map(() => "?").join(", ");
@@ -701,7 +715,7 @@ export class MemoryObject extends DurableObject<Env> {
 
     if (features.has("abstain") && shouldAbstain(candidates)) {
       this.audit(client, "recall", { scopes, results: 0, abstained: true });
-      return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}), ...asOfOut };
+      return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...told };
     }
 
     const maxRrf = Math.max(...candidates.map((c) => c.score ?? 0), 1e-9);
@@ -772,6 +786,14 @@ export class MemoryObject extends DurableObject<Env> {
         if (source) given.push(source);
       }
       this.recordReads(client, input.track, given, now);
+    }
+    if (input.track && asOf === undefined && this.ledgerOn) {
+      const given = [...items];
+      for (const i of items) {
+        const source = i.evidence ? this.scopeOf(i.evidence.id) : null;
+        if (source) given.push({ ...i, id: i.evidence!.id, scope: source });
+      }
+      this.recordDeliveries(client, given, now);
     }
 
     const text = items
@@ -1114,7 +1136,10 @@ export class MemoryObject extends DurableObject<Env> {
     const item = this.sql.exec("SELECT * FROM items WHERE id = ?", id).toArray()[0];
     if (item) {
       if (!can(client, "read", String(item.scope))) return null;
-      return { type: (item.kind === "note" ? "note" : "chunk") as "note" | "chunk", item: toItem(item), neighbours: neighbours(), entities: entitiesOf(id), accessCount: Number(item.access_count) };
+      return {
+        type: (item.kind === "note" ? "note" : "chunk") as "note" | "chunk", item: toItem(item), neighbours: neighbours(), entities: entitiesOf(id), accessCount: Number(item.access_count),
+        ...(this.ledgerOn ? { deliveredTo: this.deliveredTo(id) } : {}),
+      };
     }
     const episode = this.sql.exec("SELECT * FROM episodes WHERE id = ?", id).toArray()[0];
     if (episode) {
@@ -1296,6 +1321,108 @@ export class MemoryObject extends DurableObject<Env> {
       "INSERT INTO promotions (item_id, from_scope, to_scope, via, created_at) VALUES (?, ?, ?, ?, ?)",
       itemId, fromScope, toScope, via, now,
     );
+  }
+
+  // ---------------------------------------------------------------- ledger
+
+  private get ledgerOn(): boolean {
+    return ledgerEnabled(this.env.LEDGER);
+  }
+
+  /** Ledger: this connector was just given these memories. Giving one again re-arms its correction. */
+  private recordDeliveries(client: Client, items: { id: string; scope: string }[], now: number): void {
+    const seen = new Set<string>();
+    for (const i of items) {
+      if (seen.has(i.id)) continue;
+      seen.add(i.id);
+      this.sql.exec(
+        `INSERT INTO deliveries (item_id, client_id, agent, provider, scope, first_at, last_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (item_id, client_id) DO UPDATE SET last_at = excluded.last_at, scope = excluded.scope, times = times + 1, corrected_at = NULL`,
+        i.id, client.id, client.agent, client.provider, i.scope, now, now,
+      );
+    }
+  }
+
+  /**
+   * Ledger: what changed in memory this connector was given earlier, limited to
+   * the scopes this call may read. Each change is told once; one whose current
+   * version lies outside these scopes waits for a call that may read it.
+   * Returns the lines for the agent and the scopes they come from.
+   */
+  private takeCorrections(client: Client, scopes: string[], now: number): { lines: string[]; scopes: string[] } {
+    if (scopes.length === 0) return { lines: [], scopes: [] };
+    const marks = scopes.map(() => "?").join(", ");
+    const rows = this.sql
+      .exec(
+        `SELECT d.item_id, d.last_at, d.scope, i.id AS present, i.content, i.updated_at, i.expired_at FROM deliveries d
+         LEFT JOIN items i ON i.id = d.item_id
+         WHERE d.client_id = ? AND d.corrected_at IS NULL AND d.scope IN (${marks}) AND (i.id IS NULL OR i.status = 'superseded')
+         ORDER BY d.last_at LIMIT 100`,
+        client.id, ...scopes,
+      )
+      .toArray();
+    if (rows.length === 0) return { lines: [], scopes: [] };
+    const out: Corrections = { replaced: [], deleted: [] };
+    const told: string[] = [];
+    const given: { id: string; scope: string }[] = [];
+    const touched = new Set<string>();
+    for (const r of rows) {
+      const id = String(r.item_id);
+      if (r.present === null) {
+        if (out.deleted.length >= MAX_DELETED) continue;
+        out.deleted.push({ id, givenAt: Number(r.last_at) });
+        told.push(id);
+        touched.add(String(r.scope));
+        continue;
+      }
+      const steps: Step[] = [];
+      let current = id;
+      for (let n = 0; n < 8; n++) {
+        const next = this.sql.exec("SELECT superseded_by FROM items WHERE id = ? AND status = 'superseded'", current).toArray()[0]?.superseded_by;
+        if (!next) break;
+        const merged = this.sql.exec("SELECT 1 FROM links WHERE src = ? AND dst = ? AND kind = 'merged_into'", current, String(next)).toArray().length > 0;
+        steps.push({ merged });
+        current = String(next);
+      }
+      const cur = this.sql.exec("SELECT id, scope, content FROM items WHERE id = ?", current).toArray()[0];
+      if (current === id) {
+        // Superseded without a successor: nothing to tell.
+        told.push(id);
+        continue;
+      }
+      if (!cur) continue;
+      const curScope = String(cur.scope);
+      if (!scopes.includes(curScope) || !can(client, "read", curScope)) continue;
+      if (needsCorrection(steps)) {
+        if (out.replaced.length >= MAX_REPLACED) continue;
+        out.replaced.push({
+          id, oldText: String(r.content), givenAt: Number(r.last_at),
+          newId: current, newText: String(cur.content), newScope: curScope,
+          changedAt: Number(r.expired_at ?? r.updated_at ?? now),
+        });
+        touched.add(String(r.scope));
+        touched.add(curScope);
+      }
+      // A duplicate folded into another note needs no word, but the connector now holds the survivor.
+      told.push(id);
+      given.push({ id: current, scope: curScope });
+    }
+    for (const id of told) this.sql.exec("UPDATE deliveries SET corrected_at = ? WHERE item_id = ? AND client_id = ?", now, id, client.id);
+    this.recordDeliveries(client, given, now);
+    const lines = correctionLines(out);
+    if (lines.length) this.audit(client, "ledger.correct", { replaced: out.replaced.length, deleted: out.deleted.length });
+    return { lines, scopes: [...touched] };
+  }
+
+  /** Ledger: which connectors were given this memory, for the explorer. */
+  private deliveredTo(itemId: string) {
+    return this.sql
+      .exec("SELECT agent, provider, first_at, last_at, times, corrected_at FROM deliveries WHERE item_id = ? ORDER BY first_at LIMIT 50", itemId)
+      .toArray()
+      .map((r) => ({
+        agent: String(r.agent), provider: String(r.provider), firstAt: iso(r.first_at), lastAt: iso(r.last_at), times: Number(r.times),
+        correctedAt: r.corrected_at === null ? null : iso(r.corrected_at),
+      }));
   }
 
   /** Facts kept inside a wall that wanted to go elsewhere, oldest first. Forgotten notes drop out. */
@@ -2074,6 +2201,8 @@ export class MemoryObject extends DurableObject<Env> {
       }
     });
     report.archived = archived;
+    // Ledger rows that were told long ago, or whose connector stopped asking for the memory.
+    this.sql.exec("DELETE FROM deliveries WHERE corrected_at < ? OR (corrected_at IS NULL AND last_at < ?)", now - TOLD_TTL_MS, now - UNTOLD_TTL_MS);
 
     // 2. duplicates among notes changed since the last run
     let merged = 0;

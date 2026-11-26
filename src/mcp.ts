@@ -23,13 +23,13 @@ export interface MemoryApi {
   recall(
     client: Client,
     input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number; asOf?: number; named?: string[]; track?: Tracked },
-  ): Promise<{ items: MemoryItem[]; notices?: string[] }>;
+  ): Promise<{ items: MemoryItem[]; notices?: string[]; corrections?: string[] }>;
   context(
     client: Client,
     scopes: string[],
     budgetTokens?: number,
     opts?: { track?: Tracked },
-  ): Promise<{ text: string; notices?: string[]; conversation?: string }> | { text: string; notices?: string[]; conversation?: string };
+  ): Promise<{ text: string; notices?: string[]; conversation?: string; corrections?: string[] }> | { text: string; notices?: string[]; conversation?: string; corrections?: string[] };
   addNote(client: Client, input: { scope: string; content: string; kind?: NoteKind; trust?: Trust; track?: Tracked }): Promise<{ id: string; scope?: string; heldFor?: string }>;
   addEpisode(
     client: Client,
@@ -273,8 +273,8 @@ function line(i: MemoryItem): string {
 }
 
 /** The text the recall tool hands an agent: notices first, then one line per item. The benchmark reads the same text. */
-export function recallText(res: { items: MemoryItem[]; notices?: string[] }): string {
-  const head = res.notices?.length ? res.notices.join("\n") + "\n\n" : "";
+export function recallText(res: { items: MemoryItem[]; notices?: string[]; corrections?: string[] }): string {
+  const head = [res.corrections, res.notices].map((l) => (l?.length ? l.join("\n") + "\n\n" : "")).join("");
   return head + (res.items.length ? res.items.map(line).join("\n") : "No matching memories.");
 }
 
@@ -298,10 +298,15 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       const proj = project(args.project);
       const scopes = recallScopes(client, undefined, proj);
       const res = await memory.context(client, scopes, 2000, { track: track(args) });
-      const parts = [...(res.notices ?? []), res.text || "Nothing stored yet for these scopes."];
+      const parts = [...(res.corrections?.length ? [res.corrections.join("\n")] : []), ...(res.notices ?? []), res.text || "Nothing stored yet for these scopes."];
       // With walls set, a conversation without a handle gets one (see walls.ts, rule 2).
       if (res.conversation) parts.push(`Conversation handle: ${res.conversation}. Pass it as conversation on every memory call in this conversation.`);
-      return text(parts.join("\n\n"), res.conversation || res.notices?.length ? { ...(res.conversation ? { conversation: res.conversation } : {}), ...(res.notices?.length ? { notices: res.notices } : {}) } : undefined);
+      const extra = {
+        ...(res.conversation ? { conversation: res.conversation } : {}),
+        ...(res.notices?.length ? { notices: res.notices } : {}),
+        ...(res.corrections?.length ? { corrections: res.corrections } : {}),
+      };
+      return text(parts.join("\n\n"), Object.keys(extra).length ? extra : undefined);
     }
     case "recall": {
       const query = str(args.query, "query", 2000, true)!.trim();
@@ -326,8 +331,8 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       // Walled projects are only searched when the call names them (see walls.ts).
       const named = proj ? [`project:${proj}`] : [];
       const res = await memory.recall(client, { query, scopes, limit, budgetTokens: RECALL_TOOL.budgetTokens, queries, from, to, asOf, named, track: track(args) });
-      const notices = res.notices?.length ? { notices: res.notices } : {};
-      if (!res.items.length) return text(recallText(res), res.notices?.length ? { results: [], ...notices } : undefined);
+      const notices = { ...(res.notices?.length ? { notices: res.notices } : {}), ...(res.corrections?.length ? { corrections: res.corrections } : {}) };
+      if (!res.items.length) return text(recallText(res), Object.keys(notices).length ? { results: [], ...notices } : undefined);
       return text(recallText(res), {
         ...notices,
         results: res.items.map((i) => ({
