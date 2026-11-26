@@ -150,3 +150,4 @@ code { font: 13px var(--mono); background: var(--blush); padding: 1px 5px; borde
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+.order-says { font-size: 13px; margin-bottom: 4px; }
