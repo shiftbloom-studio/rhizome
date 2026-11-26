@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, runAi, type Env } from "./env";
 import { MIGRATIONS } from "./schema";
-import { admitNamed, heldTarget, isValidWallName, isWallableScope, wallOf, WALL_LIMIT, type Walls } from "./walls";
+import { admitConversation, admitNamed, HANDLE_TTL_MS, heldTarget, isValidWallName, isWallableScope, latestWall, wallOf, WALL_LIMIT, WINDOW_MS, type Seen, type Tracked, type Walls } from "./walls";
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
@@ -73,6 +73,8 @@ export interface NoteInput {
   trust?: Trust;
   model?: string;
   tEvent?: number;
+  /** Set for notes an agent writes from a conversation (MCP remember), see walls rule 3. */
+  track?: Tracked;
 }
 
 export interface RecallInput {
@@ -100,6 +102,8 @@ export interface RecallInput {
    * Leave it out when every requested scope was asked for explicitly.
    */
   named?: string[];
+  /** Set for calls from an agent's conversation (MCP): applies walls rule 2. */
+  track?: Tracked;
 }
 
 export interface RecallEvidence {
@@ -360,12 +364,16 @@ export class MemoryObject extends DurableObject<Env> {
     return { id, chunks: parts.length };
   }
 
-  async addNote(client: Client, input: NoteInput): Promise<{ id: string }> {
+  async addNote(client: Client, input: NoteInput): Promise<{ id: string; scope?: string; heldFor?: string }> {
     this.userId(client);
     const content = input.content.trim();
     if (!content) throw new Error("note is empty");
     const id = newId();
     const now = Date.now();
+    // Walls rule 3: a conversation that was given walled memory writes into that wall.
+    const target = input.scope;
+    const inside = input.track ? this.writeInside(client, input.track, target, now) : null;
+    if (inside) input = { ...input, scope: inside };
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
         `INSERT INTO items (id, kind, episode_id, scope, content, note_kind, trust, client_id, agent, provider, model, t_event, created_at,
@@ -378,10 +386,11 @@ export class MemoryObject extends DurableObject<Env> {
         now,
       );
       this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", id, now);
+      if (inside) this.hold(id, inside, target, "remember", now);
       this.audit(client, "note.add", { id, scope: input.scope });
     });
     await this.kick();
-    return { id };
+    return inside ? { id, scope: inside, heldFor: target } : { id };
   }
 
   /**
@@ -477,7 +486,33 @@ export class MemoryObject extends DurableObject<Env> {
    * the most trusted recent notes. Changes only when memory changes, so agents
    * keep their prompt cache.
    */
-  context(client: Client, scopes: string[], budgetTokens = 1500): { text: string; blocks: Block[]; notes: MemoryItem[]; version: string } {
+  context(
+    client: Client,
+    requested: string[],
+    budgetTokens = 1500,
+    opts: { track?: Tracked } = {},
+  ): { text: string; blocks: Block[]; notes: MemoryItem[]; version: string; notices?: string[]; conversation?: string } {
+    // Walls rule 2. With walls set, a conversation without a handle gets one here.
+    const now = Date.now();
+    let track = opts.track;
+    let minted: string | undefined;
+    let notices: string[] = [];
+    let scopes = requested;
+    if (track) {
+      const walls = this.walls();
+      if (Object.keys(walls).length) {
+        const seen = this.seenWalls(client, track, now);
+        const gate = admitConversation(requested, seen, walls);
+        scopes = gate.scopes;
+        notices = gate.notices;
+        if (!track.conversation) {
+          // Without a handle conversations cannot be told apart: the new handle starts
+          // with what this connector was given within WINDOW_MS.
+          track = { conversation: (minted = newId()) };
+          for (const [wall, r] of seen) this.markRead(this.conversationKey(client, track), wall, r.scope, r.at);
+        }
+      }
+    }
     const blocks = this.listBlocks(client, scopes);
     let used = blocks.reduce((n, b) => n + estimateTokens(b.value) + 8, 0);
     const marks = scopes.map(() => "?").join(", ");
@@ -507,15 +542,26 @@ export class MemoryObject extends DurableObject<Env> {
       for (const n of notes) lines.push(`- [${n.scope}, ${n.noteKind}, ${n.trust}] ${n.content}`);
     }
     const text = lines.join("\n\n");
-    return { text, blocks, notes, version: fnv1a(text) };
+    if (track) this.recordReads(client, track, [...notes.map((n) => n.scope), ...blocks.map((b) => b.scope)], now);
+    return {
+      text,
+      blocks,
+      notes,
+      version: fnv1a(text),
+      ...(notices.length ? { notices } : {}),
+      ...(minted ? { conversation: minted } : {}),
+    };
   }
 
   async recall(client: Client, input: RecallInput): Promise<RecallResult> {
     const userId = this.userId(client);
     const started = Date.now();
-    const gate = admitNamed(input.scopes, input.named, this.walls());
-    const scopes = gate.scopes;
-    const notices = gate.notices.length ? { notices: gate.notices } : {};
+    const walls = this.walls();
+    const gate = admitNamed(input.scopes, input.named, walls);
+    // Walls rule 2: nothing from a second wall for a conversation that was given one.
+    const second = input.track && Object.keys(walls).length ? admitConversation(gate.scopes, this.seenWalls(client, input.track, started), walls) : null;
+    const scopes = second ? second.scopes : gate.scopes;
+    const notices = gate.notices.length || second?.notices.length ? { notices: [...gate.notices, ...(second?.notices ?? [])] } : {};
     if (scopes.length === 0) return { items: [], text: "", tookMs: 0, sources: {}, ...notices };
     const limit = Math.min(Math.max(input.limit ?? 10, 1), 50);
     const budget = input.budgetTokens ?? 2000;
@@ -702,6 +748,14 @@ export class MemoryObject extends DurableObject<Env> {
       );
     }
     this.audit(client, "recall", { scopes, results: items.length });
+    if (input.track) {
+      const given = items.map((i) => i.scope);
+      for (const i of items) {
+        const source = i.evidence ? this.scopeOf(i.evidence.id) : null;
+        if (source) given.push(source);
+      }
+      this.recordReads(client, input.track, given, now);
+    }
 
     const text = items
       .map((i) => {
@@ -1134,6 +1188,67 @@ export class MemoryObject extends DurableObject<Env> {
     });
     this.audit(client, "wall", { name, scopes: wanted });
     return { name, scopes: wanted.sort() };
+  }
+
+  private scopeOf(itemId: string): string | null {
+    const row = this.sql.exec("SELECT scope FROM items WHERE id = ?", itemId).toArray()[0];
+    return row ? String(row.scope) : null;
+  }
+
+  /** The key a conversation's reads are recorded under: its handle, or the connector for calls without one. */
+  private conversationKey(client: Client, track: Tracked): string {
+    return track.conversation ? `h:${client.id}:${track.conversation}` : `c:${client.id}`;
+  }
+
+  /** Walls this conversation was given memory from (walls rule 2). */
+  private seenWalls(client: Client, track: Tracked, now: number): Seen {
+    const since = track.conversation ? now - HANDLE_TTL_MS : now - WINDOW_MS;
+    const seen: Seen = new Map();
+    for (const r of this.sql.exec("SELECT wall, scope, last_at FROM wall_reads WHERE conversation = ? AND last_at > ?", this.conversationKey(client, track), since).toArray()) {
+      seen.set(String(r.wall), { scope: String(r.scope), at: Number(r.last_at) });
+    }
+    return seen;
+  }
+
+  /**
+   * Records which walls a conversation was just given memory from. Reads under a
+   * handle also count for the connector itself, so a call without the handle
+   * within WINDOW_MS is treated as the same conversation.
+   */
+  private recordReads(client: Client, track: Tracked, scopes: string[], now: number): void {
+    const walls = this.walls();
+    if (Object.keys(walls).length === 0) return;
+    const byWall = new Map<string, string>();
+    for (const s of scopes) {
+      const w = wallOf(s, walls);
+      if (w !== null) byWall.set(w, s);
+    }
+    if (byWall.size === 0) return;
+    const keys = [...new Set([this.conversationKey(client, track), this.conversationKey(client, {})])];
+    for (const [wall, scope] of byWall) for (const key of keys) this.markRead(key, wall, scope, now);
+    this.sql.exec("DELETE FROM wall_reads WHERE last_at < ?", now - HANDLE_TTL_MS);
+  }
+
+  private markRead(key: string, wall: string, scope: string, at: number): void {
+    this.sql.exec(
+      `INSERT INTO wall_reads (conversation, wall, scope, last_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (conversation, wall) DO UPDATE SET scope = excluded.scope, last_at = excluded.last_at`,
+      key, wall, scope, at,
+    );
+  }
+
+  /**
+   * Walls rule 3 for notes an agent writes: a conversation that was given memory
+   * from a wall writes inside it. Returns the scope the note lands in instead of
+   * `target`, or null when it can go where it was meant to.
+   */
+  private writeInside(client: Client, track: Tracked, target: string, now: number): string | null {
+    const walls = this.walls();
+    if (Object.keys(walls).length === 0) return null;
+    const last = latestWall(this.seenWalls(client, track, now));
+    if (!last || wallOf(target, walls) === last.wall) return null;
+    if (!can(client, "write", last.scope)) throw new Error(`this conversation was given memory from behind a wall, and this connection may not write to ${last.scope}`);
+    return last.scope;
   }
 
   private hold(itemId: string, fromScope: string, toScope: string, via: "extraction" | "remember", now: number): void {

@@ -10,6 +10,7 @@ import type { MemoryItem, NoteKind, Trust } from "./memory-object";
 import { NOTE_KINDS } from "./memory-object";
 import { agentScope, can, isValidSlug, recallScopes, type Client } from "./scopes";
 import { parseRangeBound } from "./timewindow";
+import type { Tracked } from "./walls";
 
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -17,10 +18,15 @@ export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "202
 export interface MemoryApi {
   recall(
     client: Client,
-    input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number; asOf?: number; named?: string[] },
+    input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number; asOf?: number; named?: string[]; track?: Tracked },
   ): Promise<{ items: MemoryItem[]; notices?: string[] }>;
-  context(client: Client, scopes: string[], budgetTokens?: number): Promise<{ text: string }> | { text: string };
-  addNote(client: Client, input: { scope: string; content: string; kind?: NoteKind; trust?: Trust }): Promise<{ id: string }>;
+  context(
+    client: Client,
+    scopes: string[],
+    budgetTokens?: number,
+    opts?: { track?: Tracked },
+  ): Promise<{ text: string; notices?: string[]; conversation?: string }> | { text: string; notices?: string[]; conversation?: string };
+  addNote(client: Client, input: { scope: string; content: string; kind?: NoteKind; trust?: Trust; track?: Tracked }): Promise<{ id: string; scope?: string; heldFor?: string }>;
   addEpisode(client: Client, input: { scope: string; sessionId?: string; model?: string; messages?: { role: string; content: string }[]; text?: string }): Promise<{ id: string; chunks: number }>;
   importNotes(client: Client, input: { scope: string; notes: string[]; kind?: NoteKind; trust?: Trust; source?: string }): Promise<{ added: number; skipped: number }>;
   forget(client: Client, id: string): Promise<{ deleted: number }>;
@@ -49,6 +55,11 @@ const projectProp = {
   description: "Project slug, lowercase, e.g. \"rhizome\" or \"website\". Use the repository or folder name.",
   pattern: "^[a-z0-9][a-z0-9._-]{0,47}$",
 };
+const conversationProp = {
+  type: "string",
+  maxLength: 200,
+  description: "Handle of this conversation: the one get_context returned, or your own session id. Pass the same value on every memory call of the conversation.",
+};
 const scopeProp = {
   type: "string",
   enum: ["profile", "project", "private"],
@@ -60,7 +71,7 @@ export const TOOLS = [
     name: "get_context",
     title: "Load standing context",
     description: "Loads the person's profile, working style and, with a project, the project summary and its most trusted notes. Call once at the start of a task.",
-    inputSchema: { type: "object", properties: { project: projectProp }, additionalProperties: false },
+    inputSchema: { type: "object", properties: { project: projectProp, conversation: conversationProp }, additionalProperties: false },
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
@@ -72,6 +83,7 @@ export const TOOLS = [
       properties: {
         query: { type: "string", description: "What you want to know, in plain words." },
         project: projectProp,
+        conversation: conversationProp,
         limit: { type: "integer", minimum: 1, maximum: 20, default: 8 },
         queries: {
           type: "array",
@@ -103,6 +115,7 @@ export const TOOLS = [
         scope: scopeProp,
         project: projectProp,
         said_by_user: { type: "boolean", description: "true only when the person said this explicitly in their own words.", default: false },
+        conversation: conversationProp,
       },
       required: ["content"],
       additionalProperties: false,
@@ -219,8 +232,11 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
     case "get_context": {
       const proj = project(args.project);
       const scopes = recallScopes(client, undefined, proj);
-      const res = await memory.context(client, scopes, 2000);
-      return text(res.text || "Nothing stored yet for these scopes.");
+      const res = await memory.context(client, scopes, 2000, { track: track(args) });
+      const parts = [...(res.notices ?? []), res.text || "Nothing stored yet for these scopes."];
+      // With walls set, a conversation without a handle gets one (see walls.ts, rule 2).
+      if (res.conversation) parts.push(`Conversation handle: ${res.conversation}. Pass it as conversation on every memory call in this conversation.`);
+      return text(parts.join("\n\n"), res.conversation || res.notices?.length ? { ...(res.conversation ? { conversation: res.conversation } : {}), ...(res.notices?.length ? { notices: res.notices } : {}) } : undefined);
     }
     case "recall": {
       const query = str(args.query, "query", 2000, true)!.trim();
@@ -244,7 +260,7 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       if (asOf !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(String(args.as_of).trim())) asOf -= 1;
       // Walled projects are only searched when the call names them (see walls.ts).
       const named = proj ? [`project:${proj}`] : [];
-      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to, asOf, named });
+      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to, asOf, named, track: track(args) });
       const head = res.notices?.length ? res.notices.join("\n") + "\n\n" : "";
       const notices = res.notices?.length ? { notices: res.notices } : {};
       if (!res.items.length) return text(head + "No matching memories.", res.notices?.length ? { results: [], ...notices } : undefined);
@@ -270,7 +286,10 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       if (!NOTE_KINDS.includes(kind as NoteKind)) throw new ToolError(`kind must be one of ${NOTE_KINDS.join(", ")}`);
       const scope = writeScope(client, args.scope, project(args.project));
       const trust: Trust = args.said_by_user === true ? "user_explicit" : "agent_inference";
-      const res = await memory.addNote(client, { scope, content, kind: kind as NoteKind, trust });
+      const res = await memory.addNote(client, { scope, content, kind: kind as NoteKind, trust, track: track(args) });
+      if (res.heldFor && res.scope) {
+        return text(`Kept in ${res.scope} (id ${res.id}): this conversation was given memory from behind a wall. It moves to ${res.heldFor} once the person releases it.`, { id: res.id, scope: res.scope, heldFor: res.heldFor });
+      }
       return text(`Remembered in ${scope} (id ${res.id}).`, { id: res.id, scope });
     }
     case "save_conversation": {
@@ -320,6 +339,12 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
     default:
       throw new RpcError(-32602, `unknown tool: ${name}`);
   }
+}
+
+/** Marks a call as coming from an agent's conversation, with its handle when it passed one. */
+function track(args: Record<string, unknown>): Tracked {
+  const conversation = str(args.conversation, "conversation", 200)?.trim();
+  return conversation ? { conversation } : {};
 }
 
 /** Every scope the client may read: profile, its own notes and each of its projects. */
