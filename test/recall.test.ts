@@ -83,6 +83,12 @@ function generate(_model: string, system: string, user: string): string {
       entities: [],
     });
   }
+  if (system === EXTRACTION_PROMPT && user.includes("RATE")) {
+    return JSON.stringify({
+      facts: [{ statement: "The user charges a day rate of 900 euros.", kind: "fact", scope: "profile", trust: "user_explicit", entities: [] }],
+      entities: [],
+    });
+  }
   if (system === EXTRACTION_PROMPT && user.includes("TABS")) {
     return JSON.stringify({
       facts: [{ statement: "The user indents code with tabs, never spaces.", kind: "preference", scope: "profile", trust: "user_explicit", entities: [] }],
@@ -160,6 +166,29 @@ describe("MemoryObject recall steps", () => {
     const plain = await mo.recall(claude, { query: "tabs indent", scopes: ["profile"], rerank: false, budgetTokens: 4000 });
     expect(plain.items.filter((i) => i.kind === "chunk").length).toBeGreaterThan(1);
     expect(plain.items.some((i) => i.evidence)).toBe(false);
+  });
+
+  it("passes a note's source excerpt only when the recall may read the conversation's scope", async () => {
+    // A profile fact said in a project conversation: the note is in profile, its source in the project.
+    await mo.addEpisode(claude, {
+      scope: "project:acme",
+      messages: [
+        { role: "user", content: "RATE: for Acme I bill 900 euros a day, and the Orion launch is fixed for March 3." },
+        { role: "assistant", content: "Noted: 900 euros per day, Orion launches on March 3." },
+      ],
+    });
+    await settle();
+    const opts = { query: "day rate euros", rerank: false, features: ["evidence"], budgetTokens: 4000 };
+    const narrow = await mo.recall(claude, { ...opts, scopes: ["profile"] });
+    const note = narrow.items.find((i) => i.kind === "note")!;
+    expect(note.scope).toBe("profile");
+    expect(note.evidence).toBeUndefined();
+    expect(narrow.text).not.toContain("Orion");
+
+    // With the project readable too, the excerpt comes along (limit 1 keeps the chunk itself out of the results).
+    const wide = await mo.recall(claude, { ...opts, scopes: ["profile", "project:acme"], limit: 1 });
+    const same = wide.items.find((i) => i.id === note.id)!;
+    expect(same.evidence?.content).toContain("Orion launch");
   });
 
   it("limits recall to the agent's time range and to time words in the query", async () => {
