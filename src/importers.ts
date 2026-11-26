@@ -4,11 +4,12 @@
 //   claude-md   CLAUDE.md and similar instruction files (AGENTS.md, GEMINI.md)
 //   hermes      Hermes Agent MEMORY.md / USER.md, entries separated by a line with "§"
 //   markdown    any other Markdown list or prose
+//   chatgpt     the list ChatGPT and Gemini keep under "Saved memories" / "Saved info"
 // Each bullet or paragraph becomes one note. A heading is kept as context, so
 // "- run npm test" under "## Testing" becomes "Testing: run npm test".
 
-export type ImportFormat = "claude-md" | "hermes" | "markdown";
-export const IMPORT_FORMATS: ImportFormat[] = ["claude-md", "hermes", "markdown"];
+export type ImportFormat = "claude-md" | "hermes" | "markdown" | "chatgpt" | "gemini";
+export const IMPORT_FORMATS: ImportFormat[] = ["claude-md", "hermes", "markdown", "chatgpt", "gemini"];
 
 export const MAX_IMPORT_CHARS = 200_000;
 export const MAX_IMPORT_ENTRIES = 500;
@@ -18,11 +19,17 @@ const MIN_ENTRY_CHARS = 8;
 const BULLET = /^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?/;
 const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
 const FENCE = /^\s*(```|~~~)/;
+const DATE = /^(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.]\d{1,2}[/.]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\s*[-–—:,]*\s*/;
 
 /** Splits a memory file into note texts, in file order, without duplicates. */
 export function parseMemoryFile(content: string, format: ImportFormat): string[] {
   const text = content.replace(/\r\n?/g, "\n").slice(0, MAX_IMPORT_CHARS);
-  const entries = format === "hermes" && /^\s*§\s*$/m.test(text) ? hermesEntries(text) : markdownEntries(text);
+  const entries =
+    format === "hermes" && /^\s*§\s*$/m.test(text)
+      ? hermesEntries(text)
+      : format === "chatgpt" || format === "gemini"
+        ? memoryListEntries(text)
+        : markdownEntries(text);
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of entries) {
@@ -37,6 +44,14 @@ export function parseMemoryFile(content: string, format: ImportFormat): string[]
 
 function hermesEntries(text: string): string[] {
   return text.split(/^\s*§\s*$/m).map((e) => e.trim());
+}
+
+/** One memory per line, with its bullet and any date stamp in front of it removed. */
+function memoryListEntries(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.replace(BULLET, "").replace(DATE, ""))
+    .filter((line) => line.trim().length > 0);
 }
 
 function markdownEntries(text: string): string[] {

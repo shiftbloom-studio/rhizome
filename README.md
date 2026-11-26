@@ -20,7 +20,7 @@ The same code also runs on your own machine. `npm run local` or `docker compose 
 - A nightly reflection recomputes importance, archives what is stale, merges duplicates and rewrites your profile and project summaries.
 - A 3D memory explorer to search, confirm and forget memories.
 - A remote MCP server with OAuth for Claude, ChatGPT and other MCP clients, plus API keys for Claude Code, Hermes and your own agents.
-- Imports of `CLAUDE.md`, `AGENTS.md` and Hermes memory files.
+- Imports of `CLAUDE.md`, `AGENTS.md`, Hermes memory files and the saved-memory lists from ChatGPT and Gemini.
 - Runs on Cloudflare, or on your own machine with Node, SQLite and any OpenAI-compatible model server.
 
 ## How it works
@@ -97,7 +97,7 @@ Until the chosen mode is fully configured, the explorer API answers 404 and nobo
 | `recall` | Hybrid search across the profile, the agent's own notes and every project it may read, or one `project` |
 | `remember` | Stores one note. `said_by_user: true` marks it as something the person said, which wins conflicts |
 | `save_conversation` | Stores a conversation verbatim; notes are extracted from it in the background |
-| `import_memory_file` | Imports a `CLAUDE.md`, `AGENTS.md`, Hermes `MEMORY.md` or `USER.md`, or any Markdown notes. Each bullet or paragraph becomes a note, and a second import of the same file adds nothing |
+| `import_memory_file` | Imports a `CLAUDE.md`, `AGENTS.md`, Hermes `MEMORY.md` or `USER.md`, a ChatGPT or Gemini saved-memory list (`format: chatgpt` or `gemini`), or any Markdown notes. Each bullet or paragraph becomes a note, and a second import of the same file adds nothing |
 | `forget` | Deletes a note or a conversation by id |
 
 There are two ways to connect.
@@ -108,6 +108,18 @@ There are two ways to connect.
 ```sh
 claude mcp add --transport http rhizome https://memory.example.com/mcp --header "Authorization: Bearer $RHIZOME_KEY"
 ```
+
+### Bring your ChatGPT or Gemini memories along
+
+ChatGPT keeps its list under Settings, Personalization, Manage memories; Gemini under Saved info. Copy the list out of that screen (or the JSON export from Settings, Data controls) and hand it to `import_memory_file` with `format: chatgpt`, or to the API:
+
+```sh
+curl -X POST https://memory.example.com/v1/memory/import \
+  -H "Authorization: Bearer $RHIZOME_KEY" -H "Content-Type: application/json" \
+  -d "$(jq -Rs '{format: "chatgpt", content: .}' memories.txt)"
+```
+
+Every non-empty line becomes one note, with a leading bullet, number or date removed. Gemini's list has the same shape, so `format: gemini` reads it too.
 
 ## API
 
@@ -124,7 +136,7 @@ All memory endpoints take `Authorization: Bearer <client api key>`.
 | `GET` | `/v1/memory/episodes` | List episodes, newest first |
 | `GET` | `/v1/memory/episodes/:id` | Raw episode from R2 |
 | `DELETE` | `/v1/memory/items/:id` | Forget a note or a whole episode, everywhere |
-| `POST` | `/v1/memory/import` | Import a memory file (`content`, `format`: claude-md, hermes, markdown; optional `scope`, `kind`, `trust`, `fileName`) |
+| `POST` | `/v1/memory/import` | Import a memory file (`content`, `format`: claude-md, hermes, markdown, chatgpt, gemini; optional `scope`, `kind`, `trust`, `fileName`) |
 | `GET` | `/v1/memory/export` | Page through everything the client may read |
 | `GET` | `/v1/memory/stats` | Counts and database size |
 | `GET` | `/v1/memory/me` | The calling client and its grants |
