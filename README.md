@@ -1,12 +1,27 @@
 # rhizome.
 
+Long-term memory for your AI agents. One shared memory across Claude, ChatGPT and friends, served over MCP from Cloudflare.
+
+**Live:** [rhizome.shiftbloom.studio](https://rhizome.shiftbloom.studio) (explorer behind Cloudflare Access, MCP at `/mcp`) · **License:** AGPL-3.0-or-later
+
 rhizome is a long-horizon memory that belongs to a person, not to an agent. Claude, ChatGPT, Hermes, Cursor and your own agents all read and write the same memory, so each of them knows how you work, what you decided and what you prefer, whichever provider it comes from.
 
 It was built for Cloudflare: one Durable Object per person, Vectorize for semantic search, R2 for the raw history and Workers AI for embeddings and reranking. There is no server, database or GPU to run yourself, and an idle memory costs only its storage.
 
 The same code also runs on your own machine. `npm run local` or `docker compose up` starts it on Node with SQLite files and any OpenAI-compatible model server, such as Ollama or LM Studio. See [Run it without Cloudflare](#run-it-without-cloudflare).
 
-> Status: version 0.3. Store and find, fact extraction with conflict resolution, nightly reflection, a 3D memory explorer and a remote MCP server for Claude, ChatGPT and other MCP clients work. The evaluation harness and the bi-temporal knowledge graph come next. See [Roadmap](#roadmap).
+> Status: version 1.0. Store and find, fact extraction with conflict resolution, nightly reflection, a 3D memory explorer and a remote MCP server for Claude, ChatGPT and other MCP clients work. The evaluation harness and the bi-temporal knowledge graph come next. See [Roadmap](#roadmap).
+
+## Features
+
+- One memory per person, shared by every agent and provider, split into scopes for the profile, each project and each agent's private notes.
+- Hybrid recall: vector search, full-text search and recent items, fused and reranked, within a token budget.
+- Notes are extracted from conversations in the background, compared with what is already known, and updated or marked as disputed. What you said yourself beats what an agent guessed.
+- A nightly reflection recomputes importance, archives what is stale, merges duplicates and rewrites your profile and project summaries.
+- A 3D memory explorer to search, confirm and forget memories.
+- A remote MCP server with OAuth for Claude, ChatGPT and other MCP clients, plus API keys for Claude Code, Hermes and your own agents.
+- Imports of `CLAUDE.md`, `AGENTS.md` and Hermes memory files.
+- Runs on Cloudflare, or on your own machine with Node, SQLite and any OpenAI-compatible model server.
 
 ## How it works
 
@@ -143,6 +158,13 @@ A client can hold several keys, each with an optional label and expiry date. Key
 
 [field](https://github.com/shiftbloom-studio/field) offers the same through a screen, using a D1 binding to `rhizome-control`.
 
+## Tech stack
+
+- TypeScript on [Hono](https://hono.dev), bundled with esbuild. The explorer in `web/` has its own build.
+- Cloudflare Workers with Durable Objects (SQLite), D1, R2, Vectorize, Workers AI, static assets, rate limiting and a Cron Trigger
+- Node.js 26 for builds and tests, and as a second runtime with `node:sqlite` and any OpenAI-compatible model server, also as a Docker image
+- Vitest for tests. `npm run check` runs the typecheck, the explorer build and a dry-run deploy.
+
 ## Self-hosting
 
 rhizome runs in two places. Both use the same code, API and MCP server.
@@ -205,7 +227,7 @@ You need a Cloudflare account with Workers Paid and a zone for the hostname.
    npx wrangler vectorize create-metadata-index rhizome-memory --propertyName=kind --type=string
    ```
 
-2. **Fill in your settings.** `wrangler.jsonc` is a template with placeholders. Copy `.env.deploy.example` to `.env.deploy` and set your hostname and the D1 database id. Optional settings are the Access application of the explorer and the operator details for `/imprint` and `/privacy`; both pages answer 404 without them. `npm run deploy` renders everything into `wrangler.deploy.jsonc`, which is not committed. In Workers Builds, set the same names as build variables, use `npm ci && npm ci --prefix web && npm run build:web && npm run config` as the build command and `npx wrangler deploy -c wrangler.deploy.jsonc` as the deploy command.
+2. **Fill in your settings.** `wrangler.jsonc` is a template with placeholders. Copy `.env.deploy.example` to `.env.deploy` and set your hostname and the D1 database id. Optional settings are the Access application of the explorer and the operator details for `/imprint` and `/privacy`; both pages answer 404 without them. `npm run deploy` renders everything into `wrangler.deploy.jsonc`, which is not committed. To deploy from Workers Builds instead, see [Deploy with Workers Builds](#deploy-with-workers-builds).
 
 3. **Deploy**
 
@@ -232,6 +254,10 @@ You need a Cloudflare account with Workers Paid and a zone for the hostname.
 
 If your zone challenges bots, add a WAF skip rule for requests to your hostname that carry an `Authorization` header, otherwise agents get a challenge page instead of JSON.
 
+### Deploy with Workers Builds
+
+rhizome.shiftbloom.studio deploys with Workers Builds on every push to `main`, and no API token is stored on GitHub. Connect the repository to the Worker in the Cloudflare dashboard (Settings > Build) and set the names from `.env.deploy.example` as build variables. Use `npm ci && npm ci --prefix web && npm run build:web && npm run config` as the build command and `npx wrangler deploy -c wrangler.deploy.jsonc` as the deploy command. The build picks up Node 26 from `.node-version`.
+
 ## Costs
 
 On Node the costs are your machine's. On Cloudflare, measured list prices on Workers AI and Vectorize (November 2026). An idle memory costs only storage, roughly $0.20 a month after a year of heavy use. Active use is dominated by fact extraction, about $0.0006 per short episode with DeepSeek V4.1 Flash, and by the nightly reflection, which only calls GLM 5.3 when notes changed. Details in [docs/m0-spike.md](docs/m0-spike.md).
@@ -253,6 +279,20 @@ On Node the costs are your machine's. On Cloudflare, measured list prices on Wor
 | M9 | Memory explorer UI and a memory proxy for any OpenAI- or Anthropic-compatible client |
 | M10 | Hosted version and control plane |
 
+## Contributing
+
+Issues and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+Please don't report vulnerabilities in public issues. Use GitHub's private vulnerability reporting on this repository or email [safety@shiftbloom.studio](mailto:safety@shiftbloom.studio). [SECURITY.md](SECURITY.md) has the details.
+
 ## License
 
-[AGPL-3.0-or-later](LICENSE). If you run a modified version as a service, you share your changes under the same license.
+Copyright © 2026 shiftbloom studio and contributors.
+
+rhizome is free software under the [GNU Affero General Public License](LICENSE), version 3 or (at your option) any later version (`AGPL-3.0-or-later`). If you run a modified version as a service, you share your changes under the same license.
+
+---
+
+rhizome is part of [shiftbloom studio](https://shiftbloom.studio), an open studio from Hamburg. All of our apps are open source at [github.com/shiftbloom-studio](https://github.com/shiftbloom-studio).
