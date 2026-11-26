@@ -13,9 +13,11 @@ import {
   keywordTerms,
   parseFeatures,
   sentenceWindows,
+  shareUnits,
   shouldAbstain,
   splitTurns,
   turnUnits,
+  unitPriority,
 } from "../src/recall";
 import { chunk, roundChunks, transcript } from "../src/text";
 import type { Client } from "../src/scopes";
@@ -137,6 +139,23 @@ describe("recall helpers", () => {
     // The reranker also reads the start of the reply to a user turn.
     expect(units[0]!.rank).toBe("[user] I adopted a cat named Miso. [assistant] Congratulations! Cats are great. Miso is a lovely name. Do you need feeding tips?");
     expect(units[1]!.rank).toBe(units[1]!.text);
+  });
+
+  it("shares the reranker's room among conversations, so a long one cannot crowd out the rest", () => {
+    const groups = [Array.from({ length: 300 }, (_, i) => `a${i}`), ["b0", "b1"], Array.from({ length: 50 }, (_, i) => `c${i}`)];
+    const prio = (u: string) => (u === "a299" ? 1 : 0);
+    const out = shareUnits(groups, 100, prio);
+    expect(out).toHaveLength(100);
+    expect(out.filter((u) => u.startsWith("b"))).toEqual(["b0", "b1"]);
+    expect(out.filter((u) => u.startsWith("c"))).toHaveLength(49);
+    // The long conversation keeps its best unit, and what it keeps stays in order.
+    const a = out.filter((u) => u.startsWith("a"));
+    expect(a).toHaveLength(49);
+    expect(a.at(-1)).toBe("a299");
+    expect(a.slice(0, 3)).toEqual(["a0", "a1", "a2"]);
+    // With room for everything, nothing is cut.
+    expect(shareUnits(groups, 1000, prio)).toHaveLength(352);
+    expect(unitPriority({ text: "[user] I adopted a cat." }, "[user] I adopted a cat.\n[assistant] Nice.", [["cat"]])).toBe(2);
   });
 
   it("fills the budget with the best units, without a cap per card", () => {
@@ -439,6 +458,28 @@ describe("MemoryObject turn cards", () => {
     const wide = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"] });
     expect(wide.items[0]!.parts).toHaveLength(4);
     expect(wide.items[0]!.parts![2]).toBe("[user] What is the weather like in Lisbon in May?");
+  });
+
+  it("keeps notes and other conversations next to one very long conversation", async () => {
+    await mo.addEpisode(claude, {
+      scope: "profile",
+      tEvent: now - 5 * day,
+      messages: Array.from({ length: 400 }, (_, i) =>
+        i % 2 ? { role: "assistant", content: `Noted, step ${i} about Miso.` } : { role: "user", content: `Miso log entry ${i}: the cat slept.` },
+      ),
+    });
+    await mo.addNote(claude, { scope: "profile", content: "The user's cat Miso lives in Berlin." });
+    await settle();
+    const run = fake.env.AI.run;
+    let scored = 0;
+    fake.env.AI.run = async (model, input) => {
+      if (input.contexts) scored = Math.max(scored, input.contexts.length);
+      return run(model, input);
+    };
+    const res = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"], budgetTokens: 4000 });
+    expect(scored).toBeLessThanOrEqual(200);
+    expect(res.items.some((i) => i.kind === "note")).toBe(true);
+    expect(res.text).toContain("Miso and I moved to Berlin in October.");
   });
 
   it("lets notes compete with turns and keeps plain excerpts on request or without the reranker", async () => {

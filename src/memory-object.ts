@@ -26,9 +26,11 @@ import {
   MAX_CARD_UNITS,
   parseFeatures,
   shouldAbstain,
+  shareUnits,
   SIMILARITY_FLOOR,
   splitTurns,
   turnUnits,
+  unitPriority,
   unitScore,
   type CardUnit,
 } from "./recall";
@@ -893,20 +895,20 @@ export class MemoryObject extends DurableObject<Env> {
       excerpts.set(key, [...(excerpts.get(key) ?? []), String(r.content)]);
     }
 
-    const units: CardUnit[] = [];
-    for (const ep of episodes) {
-      if (units.length >= MAX_CARD_UNITS) break;
+    // Notes keep their place; the conversations share the rest of the reranker call,
+    // so one very long conversation cannot crowd out the others or the notes.
+    const notes = new Map(candidates.filter((c) => c.kind === "note").map((c) => [c.id, c] as const));
+    const noteUnits: CardUnit[] = [...notes.values()].slice(0, MAX_CARD_UNITS).map((n) => ({ key: n.id, order: 0, text: n.content, rank: n.content }));
+    const groups = episodes.map((ep) => {
       const parts = excerpts.get(ep) ?? [];
       const turns = splitTurns(joinExcerpts(parts));
       // Text without turns (an episode saved as plain text): its excerpts are the units.
-      const own = turns.length ? turnUnits(ep, turns, terms) : parts.map((p, i) => ({ key: ep, order: i, text: p, rank: p }));
-      units.push(...own.slice(0, MAX_CARD_UNITS - units.length));
-    }
-    const notes = new Map(candidates.filter((c) => c.kind === "note").map((c) => [c.id, c] as const));
-    for (const n of notes.values()) {
-      if (units.length >= MAX_CARD_UNITS) break;
-      units.push({ key: n.id, order: 0, text: n.content, rank: n.content });
-    }
+      return turns.length ? turnUnits(ep, turns, terms) : parts.map((p, i) => ({ key: ep, order: i, text: p, rank: p }));
+    });
+    const units = [
+      ...shareUnits(groups, MAX_CARD_UNITS - noteUnits.length, (u, i) => unitPriority(u, lead.get(episodes[i]!)!.content, terms)),
+      ...noteUnits,
+    ];
     if (units.length === 0) return null;
 
     const res = await runAi<{ response?: { id: number; score: number }[] }>(this.env.AI, this.env.RERANK_MODEL ?? DEFAULT_RERANK_MODEL, {
