@@ -3,6 +3,7 @@
 // MemoryObject: one Durable Object per human. It is the single writer for all
 // of that person's memory, whichever agent or provider the write comes from.
 
+import { FlagCache } from "./flags";
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, runAi, type Env } from "./env";
 import { MIGRATIONS } from "./schema";
@@ -247,10 +248,21 @@ const SYSTEM_REFLECTION = "system:reflection";
 export class MemoryObject extends DurableObject<Env> {
   private sql: SqlStorage;
 
+  private flags = new FlagCache();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    ctx.blockConcurrencyWhile(async () => this.migrate());
+    ctx.blockConcurrencyWhile(async () => {
+      this.migrate();
+      await this.flags.ready(env);
+    });
+  }
+
+  /** env with flag vars from PostHog where env leaves them unset (src/flags.ts). Refreshes in the background. */
+  private flagEnv(): Env {
+    void this.flags.ready(this.env, this.ctx);
+    return this.flags.apply(this.env);
   }
 
   private migrate(): void {
@@ -532,7 +544,7 @@ export class MemoryObject extends DurableObject<Env> {
     }
     const blocks = this.listBlocks(client, scopes);
     // Open loops that are due lead the context and come out of the same budget.
-    const due = loopsEnabled(this.env) ? this.dueLoops(scopes, now) : { loops: [], total: 0 };
+    const due = loopsEnabled(this.flagEnv()) ? this.dueLoops(scopes, now) : { loops: [], total: 0 };
     const dueText = dueSection(due.loops, due.total);
     let used = blocks.reduce((n, b) => n + estimateTokens(b.value) + 8, 0) + (dueText ? estimateTokens(dueText) : 0);
     const marks = scopes.map(() => "?").join(", ");
@@ -1327,7 +1339,7 @@ export class MemoryObject extends DurableObject<Env> {
   // ---------------------------------------------------------------- ledger
 
   private get ledgerOn(): boolean {
-    return ledgerEnabled(this.env.LEDGER);
+    return ledgerEnabled(this.flagEnv().LEDGER);
   }
 
   /** Ledger: this connector was just given these memories. Giving one again re-arms its correction. */
@@ -1483,7 +1495,7 @@ export class MemoryObject extends DurableObject<Env> {
   // Rules the person stated, checked against tool calls (src/orders.ts). Off unless STANDING_ORDERS=on.
 
   private requireOrders(): void {
-    if (!ordersEnabled(this.env)) throw new Error("standing orders are off (STANDING_ORDERS is not on)");
+    if (!ordersEnabled(this.flagEnv())) throw new Error("standing orders are off (STANDING_ORDERS is not on)");
   }
 
   /** Changes whenever an order changes, for the bundle's ETag. */
@@ -1642,7 +1654,7 @@ export class MemoryObject extends DurableObject<Env> {
    */
   openLoop(client: Client, input: { scope: string; content: string; dueAt?: number; track?: Tracked }): { id: string; scope: string; dueAt: string | null } {
     this.userId(client);
-    if (!loopsEnabled(this.env)) throw new Error("open loops are not allowed here");
+    if (!loopsEnabled(this.flagEnv())) throw new Error("open loops are not allowed here");
     const content = input.content.trim();
     if (!content) throw new Error("loop is empty");
     // Out of Date's range a due time would break every later get_context of the scope.
@@ -1666,7 +1678,7 @@ export class MemoryObject extends DurableObject<Env> {
   /** Closes an open loop. Null when there is no open loop with this id that this connection may write to. */
   closeLoop(client: Client, id: string, outcome?: string): { id: string; scope: string } | null {
     this.userId(client);
-    if (!loopsEnabled(this.env)) throw new Error("open loops are not allowed here");
+    if (!loopsEnabled(this.flagEnv())) throw new Error("open loops are not allowed here");
     const row = this.sql.exec("SELECT scope FROM loops WHERE id = ? AND closed_at IS NULL", id).toArray()[0];
     if (!row) return null;
     const scope = String(row.scope);
@@ -2346,7 +2358,7 @@ export class MemoryObject extends DurableObject<Env> {
     report.merged = merged;
 
     // 2b. disputed notes, settled by trust and time (feature flag, see settleDisputes)
-    if (this.env.DISPUTE_RESOLUTION === "on") report.disputes = await this.settleDisputes(now);
+    if (this.flagEnv().DISPUTE_RESOLUTION === "on") report.disputes = await this.settleDisputes(now);
 
     // 3. "similar" edges for notes that have none yet, e.g. notes written before the threshold fit the embedding model
     const linksBefore = Number(this.sql.exec("SELECT COUNT(*) AS n FROM links WHERE kind = 'similar'").toArray()[0]?.n ?? 0);

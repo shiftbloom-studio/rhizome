@@ -20,6 +20,8 @@ import { cleanupOAuth, oauth, resourceMetadataUrl } from "./oauth";
 import { login } from "./login";
 import { callFromHook, cwdFromHook, HOOK_FORMATS, hookOutput, ordersEnabled, projectFromPath, type HookFormat } from "./orders";
 
+import { FlagCache } from "./flags";
+
 export { MemoryObject } from "./memory-object";
 
 const VERSION = "0.3.0";
@@ -42,6 +44,16 @@ app.onError((err, c) => {
   if (/empty|limit is|must be|unknown user|invalid grant/.test(message)) return c.json({ error: message }, 400);
   console.error(err);
   return c.json({ error: "internal error" }, 500);
+});
+
+// Feature flags from PostHog (POSTHOG_FLAGS=on, src/flags.ts) fill flag vars that are not set in env.
+const flags = new FlagCache();
+app.use("*", async (c, next) => {
+  let bg: { waitUntil(p: Promise<unknown>): void } | undefined;
+  try { bg = c.executionCtx; } catch { /* no execution context (tests) */ }
+  await flags.ready(c.env, bg);
+  c.env = flags.apply(c.env);
+  await next();
 });
 
 app.get("/v1/health", (c) => c.json({ ok: true, version: VERSION }));

@@ -37,6 +37,12 @@ export interface Env {
    * client software). Needs POSTHOG_KEY and POSTHOG_HOST. See src/analytics.ts. Default: off.
    */
   MCP_ANALYTICS?: string;
+  /**
+   * "on": feature flags from PostHog (src/flags.ts). Flag vars that are not set (LEDGER, STANDING_ORDERS,
+   * OPEN_LOOPS, DISPUTE_RESOLUTION) take the value of rhizome-ledger, rhizome-standing-orders,
+   * rhizome-open-loops and rhizome-dispute-resolution. Needs POSTHOG_KEY and POSTHOG_HOST. Default: off.
+   */
+  POSTHOG_FLAGS?: string;
   /** PostHog project API key (phc_...). Set as a secret or deploy variable, never committed. */
   POSTHOG_KEY?: string;
   /** PostHog ingestion host, e.g. https://eu.i.posthog.com or https://us.i.posthog.com. */
