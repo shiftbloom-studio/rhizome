@@ -1,22 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
+const MASK = 63; // smallest 2^k - 1 >= ALPHABET.length - 1
+
+/** `len` uniformly random ALPHABET chars (rejection sampling, no modulo bias). */
+function randomChars(len: number): string {
+  let out = "";
+  while (out.length < len) {
+    for (const b of crypto.getRandomValues(new Uint8Array(len * 2))) {
+      const v = b & MASK;
+      if (v < ALPHABET.length) out += ALPHABET[v];
+      if (out.length === len) break;
+    }
+  }
+  return out;
+}
 
 /** Time-sortable, URL-safe id: 9 chars of milliseconds + 12 random chars. Globally unique per index. */
 export function newId(): string {
   const time = Date.now().toString(36).padStart(9, "0");
-  const bytes = crypto.getRandomValues(new Uint8Array(12));
-  let rand = "";
-  for (const b of bytes) rand += ALPHABET[b % 36];
-  return time + rand;
+  return time + randomChars(12);
 }
 
 /** Random secret with a readable prefix, e.g. `rz_live_…`. */
 export function newSecret(prefix: string): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  let out = "";
-  for (const b of bytes) out += ALPHABET[b % 36];
-  return `${prefix}${out}`;
+  return `${prefix}${randomChars(32)}`;
 }
 
 export async function sha256Hex(text: string): Promise<string> {
