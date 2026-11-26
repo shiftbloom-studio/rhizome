@@ -2,6 +2,8 @@
 
 Long-term memory for your AI agents. One shared memory across Claude, ChatGPT and friends, served over MCP from Cloudflare.
 
+![The rhizome explorer: 115 notes linked by similarity and tied to the projects and tools they name](docs/explorer-graph.png)
+
 **Live:** [rhizome.shiftbloom.studio](https://rhizome.shiftbloom.studio) (explorer behind Cloudflare Access, MCP at `/mcp`) · **License:** AGPL-3.0-or-later
 
 rhizome is a long-horizon memory that belongs to a person, not to an agent. Claude, ChatGPT, Hermes, Cursor and your own agents all read and write the same memory, so each of them knows how you work, what you decided and what you prefer, whichever provider it comes from.
