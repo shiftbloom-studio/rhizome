@@ -111,7 +111,6 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
   const meshes = { note: useRef<THREE.InstancedMesh>(null), episode: useRef<THREE.InstancedMesh>(null), entity: useRef<THREE.InstancedMesh>(null) };
   const lines = useRef<THREE.LineSegments>(null);
   const [hovered, setHovered] = useState<Node3 | null>(null);
-  const [interacting, setInteracting] = useState(false);
   const born = useRef(performance.now());
   const fly = useRef<{ from: THREE.Vector3; to: THREE.Vector3; camFrom: THREE.Vector3; camTo: THREE.Vector3; start: number } | null>(null);
 
@@ -506,12 +505,8 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         makeDefault
         enableDamping
         dampingFactor={0.08}
-        autoRotate={!reducedMotion && !interacting && !selected}
-        autoRotateSpeed={0.35}
         minDistance={20}
         maxDistance={900 * spread}
-        onStart={() => setInteracting(true)}
-        onEnd={() => setTimeout(() => setInteracting(false), 4000)}
       />
       <lineSegments ref={lines} geometry={edgeGeometry} frustumCulled={false}>
         <lineBasicMaterial vertexColors />
