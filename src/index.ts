@@ -13,6 +13,7 @@ import { explorer } from "./explorer";
 import { FAVICON, fontCss, fontFile } from "./fonts";
 import { LEGAL_PATHS, legalPage } from "./legal";
 import { IMPORT_FORMATS, MAX_IMPORT_CHARS, parseMemoryFile, type ImportFormat } from "./importers";
+import { analyticsHost, sendStats, type McpStat } from "./analytics";
 import { mcpResponse, rpcError } from "./mcp";
 import { cleanupOAuth, oauth, resourceMetadataUrl } from "./oauth";
 import { login } from "./login";
@@ -80,7 +81,12 @@ app.post("/mcp", async (c) => {
     return rpcError(null, -32700, "parse error");
   }
   const stub = c.env.MEMORY.get(c.env.MEMORY.idFromName(`user:${client.userId}`));
-  return mcpResponse(stub, client, raw, VERSION);
+  if (!analyticsHost(c.env)) return mcpResponse(stub, client, raw, VERSION);
+  // Anonymous usage analytics (MCP_ANALYTICS=on): sent after the answer, never in its way.
+  const stats: McpStat[] = [];
+  const res = await mcpResponse(stub, client, raw, VERSION, (s) => stats.push(s));
+  if (stats.length) c.executionCtx.waitUntil(sendStats(c.env, stats, client, { serverVersion: VERSION, userAgent: c.req.header("user-agent") }));
+  return res;
 });
 // Stateless server: no server-initiated stream and no sessions to end.
 app.on(["GET", "DELETE"], "/mcp", () => new Response(null, { status: 405, headers: { allow: "POST" } }));

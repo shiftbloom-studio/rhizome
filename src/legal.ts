@@ -4,6 +4,7 @@
 // from deploy-time variables (see README); nothing personal is hardcoded.
 
 import { bloomSvg } from "./bloom";
+import { analyticsHost } from "./analytics";
 import type { Env } from "./env";
 
 type LegalKind = "privacy" | "datenschutz" | "imprint" | "impressum";
@@ -13,7 +14,7 @@ export const LEGAL_PATHS: Record<string, LegalKind> = {
   "/imprint": "imprint",
   "/impressum": "impressum",
 };
-const UPDATED = { en: "Last updated 25 November 2026", de: "Stand: 25. November 2026" };
+const UPDATED = { en: "Last updated 26 November 2026", de: "Stand: 26. November 2026" };
 
 interface Operator {
   name: string;
@@ -52,7 +53,9 @@ export function legalPage(kind: LegalKind, env: Env): Response {
   const other = { privacy: "/datenschutz", datenschutz: "/privacy", imprint: "/impressum", impressum: "/imprint" }[kind];
   const mail = `<a href="mailto:${esc(o.email)}">${esc(o.email)}</a>`;
   const address = `<address>${esc(o.name)}<br>${o.business ? `${esc(o.business)}<br>` : ""}${esc(o.street)}<br>${esc(o.city)}<br>${esc(o.country[lang])}</address>`;
-  const body = isPrivacy ? (de ? privacyDe(address, mail, o) : privacyEn(address, mail, o)) : imprint(de, address, mail, o);
+  const host = analyticsHost(env);
+  const analytics = host ? (de ? analyticsDe(host) : analyticsEn(host)) : "";
+  const body = isPrivacy ? (de ? privacyDe(address, mail, o, analytics) : privacyEn(address, mail, o, analytics)) : imprint(de, address, mail, o);
   const html = `<!doctype html><html lang="${lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} · rhizome.</title><meta name="robots" content="noindex"><link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/fonts/fonts.css">
@@ -103,7 +106,7 @@ function imprint(de: boolean, address: string, mail: string, o: Operator) {
 <h2>Consumer dispute resolution</h2><p>We are not willing or obliged to take part in dispute resolution proceedings before a consumer arbitration board.</p>`;
 }
 
-function privacyEn(address: string, mail: string, o: Operator) {
+function privacyEn(address: string, mail: string, o: Operator, analytics: string) {
   return `<p>rhizome is a private memory for AI agents. It stores what the operator's own agents (for example Claude, ChatGPT or Hermes) write into it, so that they know the operator's way of working across tools. Only members of our organisation can open the memory explorer, and only agents with an API key we issued or a connection we approved can read or write memory. There is no tracking or advertising and no analysis of visitors.</p>
 <h2>Controller</h2>${address}<p>Email: ${mail}</p>
 <h2>Hosting</h2>
@@ -113,12 +116,12 @@ function privacyEn(address: string, mail: string, o: Operator) {
 <h2>Memory content</h2>
 <p>Memory consists of conversation excerpts, notes and summaries that agents send, the facts and names a language model extracts from them, and vectors that make them searchable. It can contain personal data of the operator and of people mentioned in conversations. The models (bge-m3, bge-reranker, DeepSeek and GLM) run on Workers AI inside Cloudflare's network; rhizome sends no memory to other AI providers on its own. When we connect an AI app such as Claude or ChatGPT (through MCP), the memories it asks for go to that app's provider, under the terms we agreed with that provider. Memory is kept until it is deleted. Deleting an entry removes it, its derived facts, its vectors and the stored raw conversation.</p>
 <p>The legal basis is our legitimate interest in giving our own AI agents a shared, consistent memory and in running the service securely (Art. 6(1)(f) GDPR). Cloudflare processes the data as our processor under a data processing agreement (Art. 28 GDPR). Cloudflare, Inc. is certified under the EU-U.S. Data Privacy Framework, for which the European Commission has adopted an adequacy decision (Art. 45 GDPR); the agreement also contains the EU standard contractual clauses. More in <a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's privacy policy</a>.</p>
-<h2>Your rights</h2>
+${analytics}<h2>Your rights</h2>
 <p>You have the right of access to your personal data (Art. 15 GDPR), to rectification (Art. 16), to erasure (Art. 17), to restriction of processing (Art. 18) and to data portability (Art. 20). To exercise them, email us. You can also lodge a complaint with a data protection supervisory authority (Art. 77 GDPR), for example the one where you live or the one responsible for us: ${esc(o.authority)}.</p>
 <p><strong>You may object at any time, on grounds relating to your particular situation, to the processing of your personal data based on Art. 6(1)(f) GDPR (Art. 21 GDPR).</strong></p>`;
 }
 
-function privacyDe(address: string, mail: string, o: Operator) {
+function privacyDe(address: string, mail: string, o: Operator, analytics: string) {
   return `<p>rhizome ist ein privates Gedächtnis für KI-Agenten. Es speichert, was die eigenen Agenten des Betreibers (etwa Claude, ChatGPT oder Hermes) hineinschreiben, damit sie seine Arbeitsweise werkzeugübergreifend kennen. Den Memory Explorer können nur Mitglieder unserer Organisation öffnen, lesen und schreiben können nur Agenten mit einem von uns ausgegebenen API-Schlüssel oder einer von uns freigegebenen Verbindung. Es gibt kein Tracking, keine Werbung und keine Auswertung von Besuchern.</p>
 <h2>Verantwortlicher</h2>${address}<p>E-Mail: ${mail}</p>
 <h2>Hosting</h2>
@@ -128,7 +131,23 @@ function privacyDe(address: string, mail: string, o: Operator) {
 <h2>Gedächtnisinhalte</h2>
 <p>Das Gedächtnis besteht aus Gesprächsausschnitten, Notizen und Zusammenfassungen, die Agenten senden, aus Fakten und Namen, die ein Sprachmodell daraus ableitet, und aus Vektoren, die sie durchsuchbar machen. Es kann personenbezogene Daten des Betreibers und von Personen enthalten, die in Gesprächen vorkommen. Die Modelle (bge-m3, bge-reranker, DeepSeek und GLM) laufen auf Workers AI im Netz von Cloudflare; rhizome sendet von sich aus keine Inhalte an andere KI-Anbieter. Verbinden wir eine KI-App wie Claude oder ChatGPT (über MCP), gehen die Erinnerungen, die sie abruft, an deren Anbieter, zu den Bedingungen, die wir mit diesem Anbieter vereinbart haben. Inhalte bleiben gespeichert, bis sie gelöscht werden. Wird ein Eintrag gelöscht, verschwinden er, die daraus abgeleiteten Fakten, seine Vektoren und das gespeicherte Rohgespräch.</p>
 <p>Rechtsgrundlage ist unser berechtigtes Interesse, unseren eigenen KI-Agenten ein gemeinsames, stimmiges Gedächtnis zu geben und den Dienst sicher zu betreiben (Art. 6 Abs. 1 lit. f DSGVO). Cloudflare verarbeitet die Daten als unser Auftragsverarbeiter auf Grundlage eines Auftragsverarbeitungsvertrags (Art. 28 DSGVO). Cloudflare, Inc. ist nach dem EU-U.S. Data Privacy Framework zertifiziert, für das ein Angemessenheitsbeschluss der Europäischen Kommission besteht (Art. 45 DSGVO); der Vertrag enthält zusätzlich die EU-Standardvertragsklauseln. Mehr dazu in der <a href="https://www.cloudflare.com/de-de/privacypolicy/">Datenschutzerklärung von Cloudflare</a>.</p>
-<h2>Deine Rechte</h2>
+${analytics}<h2>Deine Rechte</h2>
 <p>Du hast das Recht auf Auskunft über deine personenbezogenen Daten (Art. 15 DSGVO), auf Berichtigung (Art. 16), Löschung (Art. 17), Einschränkung der Verarbeitung (Art. 18) und Datenübertragbarkeit (Art. 20). Schreib uns dazu eine E-Mail. Außerdem kannst du dich bei einer Datenschutz-Aufsichtsbehörde beschweren (Art. 77 DSGVO), etwa bei der an deinem Wohnort oder bei der für uns zuständigen: ${esc(o.authority)}.</p>
 <p><strong>Du kannst der Verarbeitung deiner personenbezogenen Daten auf Grundlage von Art. 6 Abs. 1 lit. f DSGVO jederzeit aus Gründen widersprechen, die sich aus deiner besonderen Situation ergeben (Art. 21 DSGVO).</strong></p>`;
+}
+
+const inEu = (host: string) => /(^|\.)eu\.i\.posthog\.com$/.test(new URL(host).hostname);
+
+function analyticsEn(host: string) {
+  const where = inEu(host) ? "on servers in the EU (Frankfurt)" : "on servers in the USA";
+  return `<h2>Usage analytics</h2>
+<p>To see which memory tools are used and where they fail, rhizome sends anonymous usage events to PostHog, Inc., 2261 Market St. #4008, San Francisco, CA 94114, USA, which stores them ${where}. An event holds the tool name, whether the call failed, how long it took, the size of the answer and the name and version of the AI app's software. It holds no memory content, no search queries, no names of projects, no user ids, email or IP addresses and no keys. Calls are counted under a pseudonym that changes every day, and no profiles are created. No cookies are set. The legal basis is our legitimate interest in keeping the service reliable (Art. 6(1)(f) GDPR). PostHog processes the events as our processor under a data processing agreement that contains the EU standard contractual clauses (Art. 28, Art. 46 GDPR). More in <a href="https://posthog.com/privacy">PostHog's privacy policy</a>.</p>
+`;
+}
+
+function analyticsDe(host: string) {
+  const where = inEu(host) ? "auf Servern in der EU (Frankfurt)" : "auf Servern in den USA";
+  return `<h2>Nutzungsstatistik</h2>
+<p>Um zu sehen, welche Gedächtnis-Werkzeuge genutzt werden und wo sie scheitern, sendet rhizome anonyme Nutzungsereignisse an PostHog, Inc., 2261 Market St. #4008, San Francisco, CA 94114, USA, die ${where} gespeichert werden. Ein Ereignis enthält den Namen des Werkzeugs, ob der Aufruf fehlschlug, wie lange er dauerte, die Größe der Antwort sowie Name und Version der Software der KI-App. Es enthält keine Inhalte des Gedächtnisses, keine Suchanfragen, keine Projektnamen, keine Nutzerkennungen, E-Mail- oder IP-Adressen und keine Schlüssel. Aufrufe werden unter einem Pseudonym gezählt, das täglich wechselt, und es werden keine Profile angelegt. Es werden keine Cookies gesetzt. Rechtsgrundlage ist unser berechtigtes Interesse, den Dienst verlässlich zu betreiben (Art. 6 Abs. 1 lit. f DSGVO). PostHog verarbeitet die Ereignisse als unser Auftragsverarbeiter auf Grundlage eines Auftragsverarbeitungsvertrags mit den EU-Standardvertragsklauseln (Art. 28, Art. 46 DSGVO). Mehr dazu in der <a href="https://posthog.com/privacy">Datenschutzerklärung von PostHog</a>.</p>
+`;
 }
