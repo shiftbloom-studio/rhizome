@@ -863,6 +863,10 @@ export class MemoryObject extends DurableObject<Env> {
       .exec("SELECT dst FROM links WHERE src = ? AND kind = 'derived_from'", id)
       .toArray()
       .map((r) => String(r.dst));
+    const revived = this.sql
+      .exec("SELECT id FROM items WHERE superseded_by = ?", id)
+      .toArray()
+      .map((r) => String(r.id));
     this.ctx.storage.transactionSync(() => {
       for (const ep of sources) {
         this.sql.exec("DELETE FROM chunk_keys WHERE rowid IN (SELECT rowid FROM items WHERE episode_id = ? AND kind = 'chunk')", ep);
@@ -876,6 +880,7 @@ export class MemoryObject extends DurableObject<Env> {
       this.dropOrphanEntities();
     });
     for (const ep of sources) this.rebuildFactKeys(ep);
+    if (revived.length) this.ctx.storage.transactionSync(() => revived.forEach((r) => this.refreshFactKeys(r)));
     await this.kick();
     return { deleted: 1 };
   }
@@ -1091,6 +1096,7 @@ export class MemoryObject extends DurableObject<Env> {
            status = 'active', superseded_by = NULL, updated_at = ?, confirmations = confirmations + 1 WHERE id = ?`,
         now, id,
       );
+      if (String(row.status) === "superseded") this.refreshFactKeys(id);
       // A confirmed side of a dispute supersedes the other side. The other side was wrong, not outdated,
       // so only its record expires; it never had a time when it was true.
       for (const l of this.sql.exec("SELECT dst FROM links WHERE src = ? AND kind = 'contradicts'", id).toArray()) {
@@ -1569,7 +1575,8 @@ export class MemoryObject extends DurableObject<Env> {
     const episodes = this.sql
       .exec(
         `SELECT ep.id FROM episodes ep
-         WHERE EXISTS (SELECT 1 FROM links l WHERE l.dst = ep.id AND l.kind = 'derived_from')
+         WHERE EXISTS (SELECT 1 FROM links l JOIN items n ON n.id = l.src AND n.status != 'superseded'
+                       WHERE l.dst = ep.id AND l.kind = 'derived_from')
            AND NOT EXISTS (SELECT 1 FROM items c JOIN chunk_keys k ON k.rowid = c.rowid WHERE c.episode_id = ep.id)
          ORDER BY ep.t_event DESC LIMIT 200`,
       )
@@ -1579,11 +1586,15 @@ export class MemoryObject extends DurableObject<Env> {
     return keyed;
   }
 
-  /** Fact keys of one episode from the notes currently derived from it. False when it has none. */
-  private rebuildFactKeys(episodeId: string): boolean {
+  /**
+   * Fact keys of one episode from the notes currently derived from it. Replaced
+   * notes give no keys, so their wording no longer finds the excerpt. False when
+   * it has none.
+   */
+  private rebuildFactKeys(episodeId: string, atomic = true): boolean {
     const notes = this.sql
       .exec(
-        `SELECT n.content, e.vec FROM links l JOIN items n ON n.id = l.src AND n.kind = 'note'
+        `SELECT n.content, e.vec FROM links l JOIN items n ON n.id = l.src AND n.kind = 'note' AND n.status != 'superseded'
          LEFT JOIN embeddings e ON e.item_id = n.id AND e.model = ?
          WHERE l.dst = ? AND l.kind = 'derived_from' LIMIT 50`,
         this.embeddingModel,
@@ -1593,8 +1604,24 @@ export class MemoryObject extends DurableObject<Env> {
     if (notes.length === 0) return false;
     const vectors = notes.map((n) => (n.vec ? Array.from(decodeVector(n.vec as ArrayBuffer)) : undefined));
     // assignFactKeys uses cosine only when every fact and excerpt has an embedding.
-    this.storeFactKeys(episodeId, notes.map((n) => String(n.content)), vectors.every(Boolean) ? (vectors as number[][]) : []);
+    this.storeFactKeys(episodeId, notes.map((n) => String(n.content)), vectors.every(Boolean) ? (vectors as number[][]) : [], atomic);
     return true;
+  }
+
+  /**
+   * Rebuilds the fact keys of a note's source episodes after the note was
+   * replaced or became current again. Writes without its own transaction, so
+   * callers inside one stay atomic.
+   */
+  private refreshFactKeys(noteId: string): void {
+    const sources = this.sql
+      .exec("SELECT dst FROM links WHERE src = ? AND kind = 'derived_from'", noteId)
+      .toArray()
+      .map((r) => String(r.dst));
+    for (const ep of sources) {
+      this.sql.exec("DELETE FROM chunk_keys WHERE rowid IN (SELECT rowid FROM items WHERE episode_id = ? AND kind = 'chunk')", ep);
+      this.rebuildFactKeys(ep, false);
+    }
   }
 
   /**
@@ -1603,7 +1630,7 @@ export class MemoryObject extends DurableObject<Env> {
    * excerpt has none yet), so recall can find excerpts through their facts. No
    * model call.
    */
-  private storeFactKeys(episodeId: string, statements: string[], vectors: (number[] | undefined)[]): void {
+  private storeFactKeys(episodeId: string, statements: string[], vectors: (number[] | undefined)[], atomic = true): void {
     if (statements.length === 0) return;
     const chunks = this.sql
       .exec(
@@ -1616,12 +1643,14 @@ export class MemoryObject extends DurableObject<Env> {
       .map((r) => ({ rid: Number(r.rid), content: String(r.content), vec: r.vec ? decodeVector(r.vec as ArrayBuffer) : null }));
     if (chunks.length === 0) return;
     const keys = assignFactKeys(statements, vectors, chunks);
-    this.ctx.storage.transactionSync(() => {
+    const write = () => {
       for (const [rid, list] of keys) {
         this.sql.exec("DELETE FROM chunk_keys WHERE rowid = ?", rid);
         this.sql.exec("INSERT INTO chunk_keys (rowid, keys) VALUES (?, ?)", rid, list.join("\n"));
       }
-    });
+    };
+    if (atomic) this.ctx.storage.transactionSync(write);
+    else write();
   }
 
   /**
@@ -1712,6 +1741,7 @@ export class MemoryObject extends DurableObject<Env> {
       newId_, now, now, validTo, validTo, oldId,
     );
     this.link(newId_, oldId, "supersedes", 1, now);
+    this.refreshFactKeys(oldId);
   }
 
   /** Follows superseded_by to the current version of a memory (at most 8 steps). */

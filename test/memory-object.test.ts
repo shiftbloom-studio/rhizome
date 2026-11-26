@@ -192,6 +192,27 @@ describe("MemoryObject pipeline", () => {
     expect(res.items.map((i) => i.content)).not.toContain("The user wants the AGPL license for every project.");
   });
 
+  it("takes a replaced note's wording off its excerpts, so the old excerpt no longer outranks the update", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    const keys = () => db.prepare("SELECT k.keys FROM chunk_keys k JOIN items c ON c.rowid = k.rowid ORDER BY c.t_event").all().map((r) => (r as { keys: string }).keys);
+    expect(keys()).toEqual(["The user wants the AGPL license for every project."]);
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "change of plan: APACHE for every repository from today on" }] });
+    await settle(mo);
+    expect(keys()).toEqual(["The user wants the Apache license for every project."]);
+    const res = await mo.recall(claude, { query: "AGPL license", scopes: ["profile"], rerank: false, features: ["keys"] });
+    const at = (content: string) => res.items.findIndex((i) => i.content === content);
+    expect(at("The user wants the Apache license for every project.")).toBeGreaterThanOrEqual(0);
+    expect(at("The user wants the Apache license for every project.")).toBeLessThan(at("[user] AGPL for all of it, every single repository from now on"));
+    // As of before the change, the old note is still the answer.
+    const old = db.prepare("SELECT id, valid_from FROM items WHERE kind = 'note' ORDER BY created_at").get() as { id: string; valid_from: number };
+    const past = await mo.recall(claude, { query: "AGPL license", scopes: ["profile"], rerank: false, features: ["keys"], asOf: old.valid_from + 1 });
+    expect(past.items.map((i) => i.content)).toContain("The user wants the AGPL license for every project.");
+    // Confirmed again, the old note gets its keys back.
+    mo.confirm(web, old.id);
+    expect(keys()).toContain("The user wants the AGPL license for every project.");
+  });
+
   it("closes the old note's validity on an update and keeps the old note", async () => {
     await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
     await settle(mo);
