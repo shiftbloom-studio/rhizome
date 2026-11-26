@@ -149,6 +149,16 @@ describe("MemoryObject pipeline", () => {
     expect((db.prepare("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n).toBe(0);
   });
 
+  it("extracts without the model's thinking, which would use up the output budget on long episodes", async () => {
+    const run = vi.spyOn(fake.env.AI, "run");
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    const inputs = run.mock.calls.map(([, input]) => input as { messages?: { content: string }[]; max_tokens?: number; reasoning_effort?: string });
+    const extraction = inputs.filter((i) => i.messages?.[0]?.content === EXTRACTION_PROMPT);
+    expect(extraction).toHaveLength(1);
+    expect(extraction[0]).toMatchObject({ max_tokens: 3000, reasoning_effort: "none" });
+  });
+
   it("merges a repeated fact from another agent instead of storing it twice", async () => {
     await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
     await settle(mo);
