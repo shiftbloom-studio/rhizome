@@ -271,7 +271,7 @@ describe("benchmark Worker", () => {
     const bench = readFileSync("wrangler.bench.jsonc", "utf8");
     const deployed = workerVars(readFileSync("wrangler.jsonc", "utf8"));
     const vars = workerVars(bench);
-    for (const key of ["RECALL_FEATURES", "CHUNKING"]) expect(vars[key]).toBe(deployed[key]);
+    for (const key of ["RECALL_FEATURES", "CHUNKING", "DISPUTE_RESOLUTION"]) expect(vars[key]).toBe(deployed[key]);
     expect(vars.EXTRACTION).toBe("off");
     expect(bench).toMatch(/"workers_dev":\s*false/);
     expect(bench).not.toMatch(/"routes"/);

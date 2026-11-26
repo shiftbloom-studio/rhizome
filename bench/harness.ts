@@ -27,6 +27,8 @@ export interface BenchOptions {
   vars?: Record<string, string>;
   /** Extract notes from every session. Default off: recall searches the session chunks only. */
   extraction?: boolean;
+  /** Run one reflection after a question's sessions, before recall. Default off. */
+  reflect?: boolean;
   /** Recall steps, sent with every recall (RecallInput.features). Unset: the memory code's default (RECALL_FEATURES); [] turns all off. */
   features?: string[];
   /** Episode chunking, sent with every session (EpisodeInput.chunking). Unset: the memory code's default (CHUNKING). */
@@ -84,6 +86,7 @@ async function runQuestion(q: Question, opts: BenchOptions, runId: string, store
       features: opts.features,
       chunking: opts.chunking,
       asOf: opts.asOf,
+      reflect: opts.reflect,
       idleTimeoutMs: opts.idleTimeoutMs ?? (opts.extraction ? 3_600_000 : 900_000),
     });
   } finally {

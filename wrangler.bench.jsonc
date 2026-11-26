@@ -15,6 +15,7 @@
     // As deployed (wrangler.jsonc); test/bench-cloudflare.test.ts keeps them equal.
     "RECALL_FEATURES": "all",
     "CHUNKING": "rounds",
+    "DISPUTE_RESOLUTION": "on",
     // A run turns extraction on with the param "extraction".
     "EXTRACTION": "off"
   },

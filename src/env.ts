@@ -22,6 +22,11 @@ export interface Env {
   EXTRACTION_MODEL?: string;
   /** Model for nightly reflection (profile distillation, project summaries). Default: GLM 5.3. */
   REFLECTION_MODEL?: string;
+  /**
+   * "on": nightly reflection settles disputed notes by trust and time, and asks the
+   * extraction model about the pairs the trust ladder cannot decide (at most 20 a night). Default: off.
+   */
+  DISPUTE_RESOLUTION?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
   /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */

@@ -33,6 +33,8 @@ Run options:
   --questions <ids>     comma-separated question ids
   --types <types>       comma-separated question types, or "abstention"
   --extraction          extract notes from every session (slow: paid models allow 20 requests a minute)
+  --reflect             run one nightly reflection per question after its sessions, before recall
+                        (with --extraction; DISPUTE_RESOLUTION from the vars decides whether disputes are settled)
   --features <list>     recall steps for every recall: ${RECALL_FEATURES.join(", ")}, all or none
                         (default: RECALL_FEATURES from the Worker's vars, as deployed)
   --chunking <mode>     episode chunking, fixed or rounds (default: CHUNKING, as deployed)
@@ -143,6 +145,7 @@ async function run(args: string[]) {
       questions: { type: "string" },
       types: { type: "string" },
       extraction: { type: "boolean", default: false },
+      reflect: { type: "boolean", default: false },
       features: { type: "string" },
       chunking: { type: "string" },
       "as-of": { type: "boolean", default: false },
@@ -226,6 +229,7 @@ async function run(args: string[]) {
     ai,
     vars,
     extraction: values.extraction,
+    reflect: values.reflect,
     features,
     chunking,
     asOf: values["as-of"],
@@ -239,6 +243,7 @@ async function run(args: string[]) {
       ai: values.ai,
       vars,
       extraction: values.extraction,
+      reflect: values.reflect,
       features: features ?? null,
       chunking: chunking ?? null,
       asOf: values["as-of"],

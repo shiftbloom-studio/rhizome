@@ -16,10 +16,10 @@ import { scoreQuestion, sessionOrder, type Evidence, type ItemRef, type ResultRe
 export const SCOPE = "profile";
 
 /** Variables of the memory code a run may set over the Worker's vars. */
-export const MEMORY_VARS = ["EMBEDDING_MODEL", "RERANK_MODEL", "EXTRACTION_MODEL", "REFLECTION_MODEL", "RECALL_FEATURES", "CHUNKING"] as const;
+export const MEMORY_VARS = ["EMBEDDING_MODEL", "RERANK_MODEL", "EXTRACTION_MODEL", "REFLECTION_MODEL", "RECALL_FEATURES", "CHUNKING", "DISPUTE_RESOLUTION"] as const;
 
 /** What a question needs of a memory: a store stub on Node, the Durable Object itself on Cloudflare. */
-export type Memory = Pick<MemoryObject, "addEpisode" | "stats" | "recall" | "detail">;
+export type Memory = Pick<MemoryObject, "addEpisode" | "stats" | "recall" | "detail" | "requestReflection">;
 
 export interface QuestionOptions {
   /** Recall steps, sent with every recall (RecallInput.features). Unset: the memory code's default (RECALL_FEATURES); [] turns all off. */
@@ -31,6 +31,8 @@ export interface QuestionOptions {
    * recall as of a time adds an exact search over the stored vectors to the index search.
    */
   asOf?: boolean;
+  /** Run one reflection after the sessions, before recall. Default off. */
+  reflect?: boolean;
   /** Longest wait for embeddings and extraction to finish. */
   idleTimeoutMs: number;
   /** Runs once the background work is done, before the question is asked (on Cloudflare: until the vector index has caught up). */
@@ -160,7 +162,11 @@ export async function askQuestion(memory: Memory, client: Client, q: Question, o
     sessionOf.set(res.id, sessionId);
     chunks += res.chunks;
   }
-  const stats = await waitIdle(memory, client, opts.idleTimeoutMs);
+  let stats = await waitIdle(memory, client, opts.idleTimeoutMs);
+  if (opts.reflect) {
+    await memory.requestReflection(client);
+    stats = await waitIdle(memory, client, opts.idleTimeoutMs);
+  }
   await opts.afterIngest?.();
   const ingestMs = Date.now() - started;
 

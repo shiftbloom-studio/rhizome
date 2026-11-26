@@ -111,6 +111,8 @@ export interface RunParams {
   chunking?: "fixed" | "rounds";
   /** Extract notes from every session. Slow: paid models allow 20 requests a minute. */
   extraction?: boolean;
+  /** Run one nightly reflection per question after its sessions, before recall. Use it with extraction. */
+  reflect?: boolean;
   /** Also send the question date as asOf. */
   asOf?: boolean;
   /** Questions in parallel. Default 8, or 4 with extraction (at most 8 then). */
@@ -130,6 +132,7 @@ export interface RunSettings {
   /** null: the memory code's default, CHUNKING. */
   chunking: NonNullable<EpisodeInput["chunking"]> | null;
   extraction: boolean;
+  reflect: boolean;
   asOf: boolean;
   concurrency: number;
   /** Variables for the memory code: the Worker's vars, then the run's. */
@@ -145,7 +148,7 @@ export const MAX_CONCURRENCY = 32;
  */
 export const MAX_EXTRACTION_CONCURRENCY = 8;
 const RUN_ID = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
-const PARAMS = new Set(["questions", "types", "sample", "seed", "limit", "features", "chunking", "extraction", "asOf", "concurrency", "vars", "baseline", "paidRpm"]);
+const PARAMS = new Set(["questions", "types", "sample", "seed", "limit", "features", "chunking", "extraction", "reflect", "asOf", "concurrency", "vars", "baseline", "paidRpm"]);
 
 function bad(message: string): never {
   throw new Error(`bad run params: ${message}`);
@@ -231,6 +234,7 @@ export function runSettings(raw: unknown, env: Partial<Record<MemoryVar, string>
     features: featureList(p.features),
     chunking,
     extraction,
+    reflect: flag("reflect", p.reflect),
     asOf: flag("asOf", p.asOf),
     concurrency,
     vars,
@@ -357,6 +361,7 @@ export interface QuestionJob {
   features?: string[];
   chunking?: EpisodeInput["chunking"];
   extraction: boolean;
+  reflect: boolean;
   asOf: boolean;
   paidRpm: number;
   /** Longest wait for embeddings and extraction. */
@@ -402,6 +407,7 @@ export class BenchMemory extends MemoryObject {
         features: job.features,
         chunking: job.chunking,
         asOf: job.asOf,
+        reflect: job.reflect,
         idleTimeoutMs: job.idleTimeoutMs,
         afterIngest: () => vectors.searchable(job.vectorTimeoutMs),
       });
@@ -478,6 +484,7 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
           ai: "workers-ai",
           vars: settings.vars,
           extraction: settings.extraction,
+          reflect: settings.reflect,
           features: settings.features,
           chunking: settings.chunking,
           asOf: settings.asOf,
@@ -514,6 +521,7 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
             ...(settings.features ? { features: settings.features } : {}),
             ...(settings.chunking ? { chunking: settings.chunking } : {}),
             extraction: settings.extraction,
+            reflect: settings.reflect,
             asOf: settings.asOf,
             paidRpm: settings.paidRpm,
             idleTimeoutMs,

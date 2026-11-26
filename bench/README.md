@@ -33,6 +33,7 @@ Run the same command with the same `--out` to continue a stopped run; finished q
 | Option | Effect |
 | --- | --- |
 | `--extraction` | Extracts notes from every session, as in production. Without it, recall searches the session chunks only. |
+| `--reflect` | Runs one nightly reflection per question after its sessions, before recall. Use it with `--extraction`; compare `--set DISPUTE_RESOLUTION=on` against `off` to measure dispute resolution. Each reflection can also call the reflection model once for the profile summary. |
 | `--features <list>` | Recall steps for every recall, or `none`. Default: `RECALL_FEATURES` from the Worker's vars in `wrangler.jsonc`, so a run measures what is deployed. |
 | `--chunking <mode>` | Episode chunking. Default: `CHUNKING` from the Worker's vars. |
 | `--set KEY=VALUE` | Any other variable for the memory code, e.g. `EMBEDDING_MODEL`. |
@@ -102,6 +103,7 @@ The first run copies LongMemEval-S from Hugging Face into the bucket (`data/`), 
 | `features` | Recall steps for every recall: a list, `"all"` or `"none"`. Default: `RECALL_FEATURES`, as deployed. |
 | `chunking` | `"fixed"` or `"rounds"`. Default: `CHUNKING`, as deployed. |
 | `extraction` | `true` extracts notes from every session. |
+| `reflect` | `true` runs one nightly reflection per question after its sessions, before recall. Use it with `extraction`; `vars.DISPUTE_RESOLUTION` (default as deployed) decides whether disputes are settled. |
 | `asOf` | `true` also sends the question date as `asOf`. |
 | `vars` | Other variables for the memory code, e.g. `{"RERANK_MODEL": "..."}`. Another embedding model needs an index of its dimensions. |
 | `concurrency` | Questions at a time: 8 (at most 32), or 4 with extraction (at most 8). |
@@ -124,5 +126,5 @@ The Benchmark workflow (Actions > Benchmark > Run workflow) runs the same comman
 ## How this differs from production
 
 * On Node, vector search is exact, while Vectorize is approximate and makes new vectors searchable after about a minute. A Node run measures ranking, not Vectorize. On Cloudflare, a question waits until Vectorize has applied its vectors, as it would have long before an agent asks about months-old chats.
-* A question replays months of sessions within minutes, so the nightly reflection (merging, decay, summaries) does not run between them.
+* A question replays months of sessions within minutes, so the nightly reflection (merging, decay, summaries, disputes) does not run between them. `--reflect` (on Cloudflare: the param `reflect`) runs it once, after the last session.
 * The dataset's dates have no time zone and are read as UTC.

@@ -263,5 +263,9 @@ describe("LongMemEval run", () => {
     const rounds = await runBenchmark(DATASET, { ...opts, out: join(dir, "rounds"), chunking: "rounds", features: ["all"] });
     expect(rounds.records.filter((r) => r.error)).toEqual([]);
     expect(rounds.records.find((r) => r.id === "q1")!.metrics!["turn_recall@10"]).toBe(1);
+
+    // With extraction and one reflection per question, dispute resolution on.
+    const reflected = await runBenchmark(DATASET, { ...opts, out: join(dir, "reflect"), extraction: true, reflect: true, vars: { DISPUTE_RESOLUTION: "on" } });
+    expect(reflected.records.filter((r) => r.error)).toEqual([]);
   }, 60_000);
 });
