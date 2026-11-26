@@ -60,13 +60,21 @@ never let one through. Patterns that can run for a very long time (a repeated gr
 inside a repeated group, backreferences, lookarounds) are refused, and a check reads
 at most the first 20,000 characters of a call. There are at most 100 orders.
 
+Patterns do not run on JavaScript's `RegExp`. rhizome runs them on its own matcher,
+whose time grows with the length of the text and never backtracks
+([`src/linear-regex.ts`](../src/linear-regex.ts)). It understands the usual syntax:
+literals, `.`, character classes, `\d` `\w` `\s` and their negations, `\b`, `^`, `$`,
+groups, `|`, and `*` `+` `?` `{n,m}` (counts up to 100). One check has a fixed amount
+of pattern work; if a set of very large patterns uses it up, the rest of the
+patterns count as not matching and the call goes on.
+
 An order is in the profile (every project) or in one project. A check looks at the
 profile's orders plus the project's: the `project` you pass, or else the name of the
 folder the agent works in.
 
 ## Who can change orders
 
-* An agent stores an order with the MCP tool `add_standing_order` or `POST /v1/memory/orders`. With `said_by_user: true` (REST: `saidByUser`), meaning you gave the rule in your own words, it is checked right away. Otherwise it waits as **proposed** until you activate it.
+* An agent stores an order with the MCP tool `add_standing_order` or `POST /v1/memory/orders`. With `said_by_user: true` (REST: `saidByUser`), meaning you gave the rule in your own words, it is checked right away. Otherwise it waits as **proposed** until you activate it. rhizome cannot verify `said_by_user`: the agent sets it. Because orders only restrict, the worst an agent can do with it is stop calls (its own or other agents'), and you can disable the order in the explorer.
 * Only you activate, disable or delete an order, in the memory explorer. No agent can turn off a rule it is held to.
 
 Each stopped or flagged call is recorded as a strike: the order, the connector, the

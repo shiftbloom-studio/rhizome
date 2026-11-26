@@ -15,6 +15,8 @@
 //
 // Off unless STANDING_ORDERS=on.
 
+import { BudgetError, linearRegex, PatternError, type Budget, type LinearRegex } from "./linear-regex";
+
 export const ORDER_ACTIONS = ["deny", "ask", "warn"] as const;
 export type OrderAction = (typeof ORDER_ACTIONS)[number];
 export const ORDER_OPS = ["eq", "in", "contains", "regex", "exists"] as const;
@@ -77,6 +79,12 @@ const CONDITION_LIMIT = 8;
 const VALUE_MAX = 300;
 /** Conditions never look at more than this many characters of a call. */
 export const MAX_TEXT = 20_000;
+/**
+ * Regex work one check may do, in matcher steps (about a second of CPU at most).
+ * Past it, the remaining regex conditions do not hold: the check lets the call go
+ * on rather than hold up the person's memory, as the hooks do when rhizome is slow.
+ */
+export const CHECK_BUDGET = 20_000_000;
 
 /** Tool names of the shell and file-writing tools in Claude Code, Codex, Cursor and Gemini CLI. */
 export const TOOL_GROUPS: Record<string, string[]> = {
@@ -96,6 +104,8 @@ export function ordersEnabled(env: { STANDING_ORDERS?: string }): boolean {
  * Rejects patterns that can take very long on some inputs: backreferences,
  * lookarounds and a quantified group that itself holds a quantifier, like (a+)+.
  * A check runs inside the person's memory, so one slow pattern would hold it up.
+ * Checks never run the built-in RegExp: patterns run on a linear-time matcher
+ * (linear-regex.ts), so a pattern this test misses, such as (a|a)*$, is still fast.
  */
 export function unsafePattern(source: string): string | null {
   if (source.length > VALUE_MAX) return `patterns are at most ${VALUE_MAX} characters`;
@@ -119,6 +129,11 @@ export function unsafePattern(source: string): string | null {
     new RegExp(source);
   } catch {
     return "invalid regular expression";
+  }
+  try {
+    linearRegex(source);
+  } catch (e) {
+    return e instanceof PatternError ? e.message : "invalid regular expression";
   }
   return null;
 }
@@ -213,8 +228,8 @@ function field(call: ToolCall, path: string): unknown {
   return cur;
 }
 
-const regexes = new Map<string, RegExp>();
-function holds(call: ToolCall, cond: OrderCondition): boolean {
+const regexes = new Map<string, LinearRegex>();
+function holds(call: ToolCall, cond: OrderCondition, budget: Budget): boolean {
   const raw = field(call, cond.path);
   if (cond.op === "exists") return raw !== undefined && raw !== null && raw !== "";
   if (raw === undefined || raw === null) return false;
@@ -230,11 +245,17 @@ function holds(call: ToolCall, cond: OrderCondition): boolean {
       const key = `${cond.flags ?? "i"}/${cond.value}`;
       let re = regexes.get(key);
       if (!re) {
-        re = new RegExp(String(cond.value), cond.flags ?? "i");
+        re = linearRegex(String(cond.value), cond.flags ?? "i");
         if (regexes.size > 2000) regexes.clear();
         regexes.set(key, re);
       }
-      return re.test(value);
+      if (budget.left <= 0) return false;
+      try {
+        return re.test(value, budget);
+      } catch (e) {
+        if (e instanceof BudgetError) return false;
+        throw e;
+      }
     }
     default:
       return false;
@@ -251,14 +272,14 @@ export function reasonFor(order: Pick<Order, "id" | "says" | "said" | "action">)
 }
 
 /** The strictest decision over all active orders that match the call, or null when none does. */
-export function evaluate(orders: Order[], call: ToolCall): Decision | null {
+export function evaluate(orders: Order[], call: ToolCall, budget: Budget = { left: CHECK_BUDGET }): Decision | null {
   let hit: Order | null = null;
   for (const order of orders) {
     if (order.state !== "active") continue;
     if (hit && RANK[order.action] <= RANK[hit.action]) continue;
     for (const clause of order.when) {
       if (!toolMatches(clause.tool, call.tool_name)) continue;
-      if (!(clause.all ?? []).every((c) => holds(call, c))) continue;
+      if (!(clause.all ?? []).every((c) => holds(call, c, budget))) continue;
       hit = order;
       break;
     }
