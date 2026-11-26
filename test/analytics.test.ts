@@ -134,7 +134,7 @@ describe("privacy page", () => {
     expect(off).not.toContain("PostHog");
     const en = await legalPage("privacy", { ...operator, ...on } as unknown as Env).text();
     expect(en).toContain("PostHog");
-    expect(en).toContain("EU (Frankfurt)");
+    expect(en).toContain("on servers in Germany");
     const de = await legalPage("datenschutz", { ...operator, ...on, POSTHOG_HOST: "https://us.i.posthog.com" } as unknown as Env).text();
     expect(de).toContain("Servern in den USA");
   });
