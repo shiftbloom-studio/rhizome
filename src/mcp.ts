@@ -17,8 +17,8 @@ export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "202
 export interface MemoryApi {
   recall(
     client: Client,
-    input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number; asOf?: number },
-  ): Promise<{ items: MemoryItem[] }>;
+    input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number; asOf?: number; named?: string[] },
+  ): Promise<{ items: MemoryItem[]; notices?: string[] }>;
   context(client: Client, scopes: string[], budgetTokens?: number): Promise<{ text: string }> | { text: string };
   addNote(client: Client, input: { scope: string; content: string; kind?: NoteKind; trust?: Trust }): Promise<{ id: string }>;
   addEpisode(client: Client, input: { scope: string; sessionId?: string; model?: string; messages?: { role: string; content: string }[]; text?: string }): Promise<{ id: string; chunks: number }>;
@@ -227,7 +227,7 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       const proj = project(args.project);
       const limit = typeof args.limit === "number" ? Math.min(Math.max(Math.round(args.limit), 1), 20) : 8;
       // Recall sees the profile, this agent's own notes and the project. Without a
-      // project it also looks into every project the client may read.
+      // project it also looks into every project the client may read, except walled ones.
       const scopes = proj ? recallScopes(client, undefined, proj) : await readableScopes(memory, client);
       const queries = args.queries === undefined ? undefined : subQueries(args.queries);
       let from: number | undefined;
@@ -242,9 +242,14 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       }
       // A date as as_of means the end of that day.
       if (asOf !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(String(args.as_of).trim())) asOf -= 1;
-      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to, asOf });
-      if (!res.items.length) return text("No matching memories.");
-      return text(res.items.map(line).join("\n"), {
+      // Walled projects are only searched when the call names them (see walls.ts).
+      const named = proj ? [`project:${proj}`] : [];
+      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to, asOf, named });
+      const head = res.notices?.length ? res.notices.join("\n") + "\n\n" : "";
+      const notices = res.notices?.length ? { notices: res.notices } : {};
+      if (!res.items.length) return text(head + "No matching memories.", res.notices?.length ? { results: [], ...notices } : undefined);
+      return text(head + res.items.map(line).join("\n"), {
+        ...notices,
         results: res.items.map((i) => ({
           id: i.id,
           scope: i.scope,

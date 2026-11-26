@@ -203,4 +203,13 @@ export const MIGRATIONS: string[] = [
     DELETE FROM chunk_keys WHERE rowid = old.rowid;
   END;
   `,
+  // 5: walls. A wall groups project scopes of one client; a scope is behind at most one wall.
+  `
+  CREATE TABLE walls (
+    scope      TEXT PRIMARY KEY,
+    wall       TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  ) WITHOUT ROWID;
+  CREATE INDEX walls_wall ON walls (wall);
+  `,
 ];

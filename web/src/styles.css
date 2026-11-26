@@ -73,6 +73,12 @@ code { font: 13px var(--mono); background: var(--blush); padding: 1px 5px; borde
 .remember textarea { width: 100%; resize: vertical; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; background: #fbf8f6; font-size: 14px; }
 .remember .row { display: flex; gap: 6px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
 .remember select { border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; background: #fbf8f6; font: 12px var(--mono); max-width: 112px; }
+.small { font-size: 12px; margin: 0 0 10px; }
+.walls { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 10px; }
+.wall-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; margin-bottom: 6px; }
+.wall-head .link { font: 12px var(--sans); color: var(--ink60); background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer; }
+.wall-name { width: 100%; border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; background: #fbf8f6; font: 12px var(--mono); margin-bottom: 8px; }
+.chip:disabled { opacity: 0.4; cursor: default; }
 .foot { margin-top: auto; font-size: 12px; color: var(--ink60); }
 .foot a { color: var(--ink60); }
 .foot .link { font: inherit; color: var(--ink60); background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer; }

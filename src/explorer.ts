@@ -135,3 +135,31 @@ explorer.post("/reflect", async (c) => {
   const client = c.get("client");
   return c.json(await memory(c.env, client).requestReflection(client), 202);
 });
+
+explorer.get("/walls", async (c) => {
+  const client = c.get("client");
+  return c.json({ walls: await memory(c.env, client).listWalls(client) });
+});
+
+explorer.put("/walls/:name", async (c) => {
+  const client = c.get("client");
+  const b = (await c.req.json().catch(() => ({}))) as { scopes?: unknown };
+  if (!Array.isArray(b.scopes) || b.scopes.length > 200 || b.scopes.some((s) => typeof s !== "string")) return json(c, 400, "scopes must be a list of project scopes");
+  try {
+    return c.json(await memory(c.env, client).setWall(client, c.req.param("name"), b.scopes as string[]));
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "";
+    if (/must be|only projects|already behind|limit is/.test(message)) return json(c, 400, message);
+    throw e;
+  }
+});
+
+explorer.delete("/walls/:name", async (c) => {
+  const client = c.get("client");
+  try {
+    return c.json(await memory(c.env, client).setWall(client, c.req.param("name"), []));
+  } catch (e) {
+    if (e instanceof Error && /must be/.test(e.message)) return json(c, 400, e.message);
+    throw e;
+  }
+});

@@ -119,3 +119,8 @@ export interface Block {
   updatedAt: string;
   updatedBy: string;
 }
+
+export interface Wall {
+  name: string;
+  scopes: string[];
+}

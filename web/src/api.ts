@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import type { Block, Detail, Graph, Me, SearchResult } from "./types";
+import type { Block, Detail, Graph, Me, SearchResult, Wall } from "./types";
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/ui/api${path}`, {
@@ -31,4 +31,7 @@ export const api = {
   remember: (content: string, scope: string, kind: string) => call<{ id: string }>("POST", "/notes", { content, scope, kind }),
   blocks: () => call<{ blocks: Block[] }>("GET", "/blocks"),
   reflect: () => call<{ scheduled: boolean }>("POST", "/reflect"),
+  walls: () => call<{ walls: Wall[] }>("GET", "/walls"),
+  setWall: (name: string, scopes: string[]) => call<Wall>("PUT", `/walls/${encodeURIComponent(name)}`, { scopes }),
+  removeWall: (name: string) => call<Wall>("DELETE", `/walls/${encodeURIComponent(name)}`),
 };
