@@ -47,6 +47,7 @@ recall: bge-m3 + Vectorize ─┐
   * `project:<slug>`: decisions and conventions of one project.
   * `agent:<slug>`: private notes of one agent, invisible to the others.
 * **Walls** keep one client's projects apart from another's. A wall is a name and a list of projects, set in the explorer. A walled project is searched only when the agent names it; a recall without a project leaves it out and tells the agent so. A conversation that was given memory from one wall gets nothing from another and is told to start a new one. Agents tell conversations apart with the `conversation` handle that `get_context` hands out while walls are set, or with their own session id; without one, the connector counts as inside a wall for 30 minutes after it last read from it. A fact learned in a walled conversation stays in its project, even when it is about you, whether the extractor, the agent's `remember` or `import_memory_file` filed it, and a conversation saved from behind a wall is stored inside it: where it wanted to go waits in the explorer's held list until you release it. Walls are off until you set one, and a project outside every wall behaves as before.
+* **Standing orders** (off unless `STANDING_ORDERS=on`) are rules you gave once, such as "never close GitHub issues", stored as data: a few clauses on tool names and fields of a call, each with `deny`, `ask` or `warn`. Agents see the active ones at the end of `get_context`. rhizome also answers a check for one tool call, so a harness with a pre-tool-call hook (Claude Code, Codex, Cursor, Gemini CLI) can stop a call before it runs. Without such a hook an order is a written rule, and an agent can still break it. An order an agent writes without your own words waits as proposed until you activate it in the explorer, and only you can disable or delete one. See [docs/standing-orders.md](docs/standing-orders.md).
 * **Clients** are agents of a provider (`claude-code` by `anthropic`, `hermes` by `nous`). Each has its own API key and grants that say which scopes it may read and write. Every memory records which agent, provider and model wrote it.
 * **Lossless at the bottom.** Episodes are stored verbatim in R2. Chunks, notes and vectors are derived and can be rebuilt, for example after switching the embedding model.
 * **Cheap reads.** Recall uses no generative model: an embedding, a vector query, SQLite full-text search and a small reranker.
@@ -105,6 +106,8 @@ Until the chosen mode is fully configured, the explorer API answers 404 and nobo
 | `save_conversation` | Stores a conversation verbatim; notes are extracted from it in the background |
 | `import_memory_file` | Imports a `CLAUDE.md`, `AGENTS.md`, Hermes `MEMORY.md` or `USER.md`, or any Markdown notes. Each bullet or paragraph becomes a note, and a second import of the same file adds nothing |
 | `forget` | Deletes a note or a conversation by id |
+
+With `STANDING_ORDERS=on` there are three more: `standing_orders` lists the active orders, `check_tool_call` checks a call an agent is about to make, and `add_standing_order` stores a rule the person gave ([docs/standing-orders.md](docs/standing-orders.md)).
 
 There are two ways to connect.
 

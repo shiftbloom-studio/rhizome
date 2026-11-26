@@ -29,6 +29,8 @@ export interface Env {
   DISPUTE_RESOLUTION?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
+  /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: off. */
+  STANDING_ORDERS?: string;
   /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */
   RECALL_FEATURES?: string;
   /** How conversations are cut for search: "fixed" (1,200 characters, default) or "rounds" (one question and its answers). */

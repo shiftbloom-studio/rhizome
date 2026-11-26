@@ -11,6 +11,7 @@ import { NOTE_KINDS } from "./memory-object";
 import { agentScope, can, isValidSlug, recallScopes, type Client } from "./scopes";
 import { parseRangeBound } from "./timewindow";
 import type { Tracked } from "./walls";
+import { ORDER_ACTIONS, ordersText, type Decision, type Order, type OrderState, type ToolCall } from "./orders";
 
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -40,6 +41,16 @@ export interface MemoryApi {
   ): Promise<{ added: number; skipped: number; scope?: string; heldFor?: string }>;
   forget(client: Client, id: string): Promise<{ deleted: number }>;
   scopes(client: Client): Promise<string[]> | string[];
+  /** Standing orders (src/orders.ts). Only called when they are on. */
+  listOrders?(client: Client, scopes: string[]): Promise<{ version: string; orders: Order[] }> | { version: string; orders: Order[] };
+  addOrder?(client: Client, input: { scope: string; rule: unknown; state?: OrderState }): Promise<Order> | Order;
+  checkToolCall?(client: Client, scopes: string[], call: ToolCall, session?: string): Promise<Decision | null> | Decision | null;
+}
+
+/** Server options that change what the MCP server offers. */
+export interface McpOptions {
+  /** Standing orders are on (STANDING_ORDERS=on): their tools are listed and get_context names the active ones. */
+  orders?: boolean;
 }
 
 interface JsonRpcRequest {
@@ -181,6 +192,79 @@ export const TOOLS = [
   },
 ] as const;
 
+const conditionSchema = {
+  type: "object",
+  properties: {
+    path: { type: "string", description: "text (the command or the written content), file (the path written to), or tool_input.<field>." },
+    op: { type: "string", enum: ["eq", "in", "contains", "regex", "exists"] },
+    value: { description: "A string, or a list of strings for in. Regexes are case-insensitive by default." },
+    flags: { type: "string", description: "Regex flags made of i, m and s." },
+  },
+  required: ["path", "op"],
+  additionalProperties: false,
+};
+
+/** Tools that exist only while standing orders are on. */
+export const ORDER_TOOLS = [
+  {
+    name: "standing_orders",
+    title: "List standing orders",
+    description: "Lists the person's standing orders: rules they gave once that apply to every agent, such as never closing GitHub issues. Follow them.",
+    inputSchema: { type: "object", properties: { project: projectProp }, additionalProperties: false },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: "check_tool_call",
+    title: "Check a tool call",
+    description: "Checks a tool call you are about to make against the person's standing orders. Returns deny, ask, warn or ok, with the reason.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tool_name: { type: "string", maxLength: 200, description: "The tool's name as your harness calls it, e.g. Bash or mcp__github__issue_write." },
+        tool_input: { type: "object", description: "The arguments you would pass." },
+        project: projectProp,
+      },
+      required: ["tool_name"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: "add_standing_order",
+    title: "Add a standing order",
+    description:
+      "Stores a rule the person gave for every agent as a standing order that a pre-tool-call hook can enforce. Write when as precise clauses on tool names and fields of the call; an order can only stop or flag calls. " +
+      "It is checked right away only when said_by_user is true; otherwise the person activates it in the explorer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        says: { type: "string", maxLength: 500, description: "The rule in the person's words, one sentence." },
+        action: { type: "string", enum: ORDER_ACTIONS, default: "deny", description: "deny stops the call, ask has the person confirm it, warn only reminds you." },
+        when: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          description: "Any clause that matches triggers the order.",
+          items: {
+            type: "object",
+            properties: {
+              tool: { type: "string", description: "Tool name with * wildcards (e.g. mcp__*github*__issue_write), or @shell / @write for the shell and file tools of every harness." },
+              all: { type: "array", maxItems: 8, items: conditionSchema, description: "Conditions that must all hold. Empty: every call of the tool." },
+            },
+            required: ["tool"],
+            additionalProperties: false,
+          },
+        },
+        project: { ...projectProp, description: "Only for this project. Without it the order applies everywhere." },
+        said_by_user: { type: "boolean", default: false, description: "true only when the person gave this rule explicitly in their own words." },
+      },
+      required: ["says", "when"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+] as const;
+
 class ToolError extends Error {}
 class RpcError extends Error {
   constructor(public code: number, message: string) {
@@ -244,7 +328,8 @@ const text = (t: string, structured?: Record<string, unknown>): ToolResult => ({
   ...(structured ? { structuredContent: structured } : {}),
 });
 
-async function callTool(memory: MemoryApi, client: Client, name: string, args: Record<string, unknown>): Promise<ToolResult> {
+async function callTool(memory: MemoryApi, client: Client, name: string, args: Record<string, unknown>, opts: McpOptions = {}): Promise<ToolResult> {
+  if (opts.orders && ORDER_TOOLS.some((t) => t.name === name)) return orderTool(memory, client, name, args);
   switch (name) {
     case "get_context": {
       const proj = project(args.project);
@@ -253,6 +338,11 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       const parts = [...(res.notices ?? []), res.text || "Nothing stored yet for these scopes."];
       // With walls set, a conversation without a handle gets one (see walls.ts, rule 2).
       if (res.conversation) parts.push(`Conversation handle: ${res.conversation}. Pass it as conversation on every memory call in this conversation.`);
+      // Standing orders lead nothing and change nothing else in the context: they are added after it.
+      if (opts.orders && memory.listOrders) {
+        const orders = ordersText((await memory.listOrders(client, orderScopes(client, proj))).orders);
+        if (orders) parts.push(orders);
+      }
       return text(parts.join("\n\n"), res.conversation || res.notices?.length ? { ...(res.conversation ? { conversation: res.conversation } : {}), ...(res.notices?.length ? { notices: res.notices } : {}) } : undefined);
     }
     case "recall": {
@@ -373,6 +463,46 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
   }
 }
 
+/** Scopes standing orders are read from: the profile and the project, if any. */
+function orderScopes(client: Client, proj: string | undefined): string[] {
+  return ["profile", ...(proj ? [`project:${proj}`] : [])].filter((s) => can(client, "read", s));
+}
+
+async function orderTool(memory: MemoryApi, client: Client, name: string, args: Record<string, unknown>): Promise<ToolResult> {
+  if (!memory.listOrders || !memory.addOrder || !memory.checkToolCall) throw new ToolError("standing orders are not available");
+  const proj = project(args.project);
+  switch (name) {
+    case "standing_orders": {
+      const { orders } = await memory.listOrders(client, orderScopes(client, proj));
+      const shown = orders.filter((o) => o.state === "active");
+      if (!shown.length) return text("No standing orders.", { orders: [] });
+      return text(ordersText(shown), { orders: shown.map((o) => ({ id: o.id, scope: o.scope, says: o.says, action: o.action, when: o.when })) });
+    }
+    case "check_tool_call": {
+      const tool = str(args.tool_name, "tool_name", 200, true)!;
+      const input = args.tool_input;
+      if (input !== undefined && (input === null || typeof input !== "object" || Array.isArray(input))) throw new ToolError("tool_input must be an object");
+      if (input !== undefined && JSON.stringify(input).length > 200_000) throw new ToolError("tool_input is longer than 200000 characters");
+      const decision = await memory.checkToolCall(client, orderScopes(client, proj), { tool_name: tool, tool_input: (input ?? {}) as Record<string, unknown> }, str(args.conversation, "conversation", 200));
+      if (!decision) return text("ok: no standing order applies to this call.", { action: "ok" });
+      return text(`${decision.action}: ${decision.reason}`, { action: decision.action, order: decision.order, reason: decision.reason });
+    }
+    case "add_standing_order": {
+      const scope = proj ? `project:${proj}` : "profile";
+      if (!can(client, "write", scope)) throw new ToolError(`this connection may not write to ${scope}`);
+      const order = await memory.addOrder(client, {
+        scope,
+        rule: { says: args.says, action: args.action, when: args.when },
+        state: args.said_by_user === true ? "active" : "proposed",
+      });
+      const note = order.state === "active" ? "It is checked from now on where a hook asks rhizome before tool calls." : "It is checked once the person activates it in the memory explorer.";
+      return text(`Stored standing order ${order.id} in ${scope}. ${note}`, { id: order.id, scope, state: order.state });
+    }
+    default:
+      throw new RpcError(-32602, `unknown tool: ${name}`);
+  }
+}
+
 /** Marks a call as coming from an agent's conversation, with its handle when it passed one. */
 function track(args: Record<string, unknown>): Tracked {
   const conversation = str(args.conversation, "conversation", 200)?.trim();
@@ -385,7 +515,7 @@ async function readableScopes(memory: MemoryApi, client: Client): Promise<string
   return [...new Set([...recallScopes(client), ...all.filter((s) => s.startsWith("project:") && can(client, "read", s))])];
 }
 
-async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, version: string): Promise<unknown> {
+async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, version: string, opts: McpOptions): Promise<unknown> {
   const params = req.params ?? {};
   switch (req.method) {
     case "initialize": {
@@ -400,12 +530,12 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
     case "ping":
       return {};
     case "tools/list":
-      return { tools: TOOLS };
+      return { tools: opts.orders ? [...TOOLS, ...ORDER_TOOLS] : TOOLS };
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
       const args = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
       try {
-        return await callTool(memory, client, name, args);
+        return await callTool(memory, client, name, args, opts);
       } catch (e) {
         if (e instanceof RpcError) throw e;
         const message = e instanceof ToolError ? e.message : e instanceof Error && /must be|empty|limit is|not allowed|may not/.test(e.message) ? e.message : "the memory service failed, try again";
@@ -423,7 +553,7 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
 }
 
 /** Answers one Streamable HTTP POST body (a single message or a batch). */
-export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknown, version: string): Promise<Response> {
+export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknown, version: string, opts: McpOptions = {}): Promise<Response> {
   const messages = Array.isArray(raw) ? raw : [raw];
   if (!messages.length) return rpcError(null, -32600, "empty batch");
   const out: JsonRpcResponse[] = [];
@@ -437,7 +567,7 @@ export async function mcpResponse(memory: MemoryApi, client: Client, raw: unknow
     }
     const isNotification = msg.id === undefined;
     try {
-      const result = await handle(memory, client, msg as JsonRpcRequest, version);
+      const result = await handle(memory, client, msg as JsonRpcRequest, version, opts);
       if (!isNotification) out.push({ jsonrpc: "2.0", id: msg.id ?? null, result });
     } catch (e) {
       if (isNotification) continue;

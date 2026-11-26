@@ -9,6 +9,7 @@ import type { Env } from "./env";
 import { authMode, identify, signInHint, signInProblem, signInUrl } from "./identity";
 import type { MemoryObject } from "./memory-object";
 import { isValidScope, type Client } from "./scopes";
+import { ordersEnabled } from "./orders";
 
 type Explorer = { Bindings: Env; Variables: { client: Client; email: string } };
 export const explorer = new Hono<Explorer>();
@@ -175,4 +176,47 @@ explorer.post("/held/:id/:decision{release|dismiss}", async (c) => {
   if (!Number.isSafeInteger(id)) return json(c, 400, "id must be a number");
   const res = await memory(c.env, client).decideHeld(client, id, c.req.param("decision") as "release" | "dismiss");
   return res ? c.json(res) : json(c, 404, "not found");
+});
+
+// Standing orders (src/orders.ts). Only the person activates, disables or deletes one.
+explorer.use("/orders/*", async (c, next) => {
+  if (!ordersEnabled(c.env)) return json(c, 404, "standing orders are off");
+  await next();
+});
+explorer.use("/orders", async (c, next) => {
+  if (!ordersEnabled(c.env)) return json(c, 404, "standing orders are off");
+  await next();
+});
+
+explorer.get("/orders", async (c) => {
+  const client = c.get("client");
+  const stub = memory(c.env, client);
+  const scopes = ["profile", ...(await allScopes(c.env, client)).filter((s) => s.startsWith("project:"))];
+  const [list, strikes] = await Promise.all([stub.listOrders(client, scopes), stub.listStrikes(client, 50)]);
+  return c.json({ orders: list.orders, strikes });
+});
+
+explorer.post("/orders", async (c) => {
+  const client = c.get("client");
+  const b = (await c.req.json().catch(() => ({}))) as { scope?: unknown; says?: unknown; action?: unknown; when?: unknown };
+  const scope = typeof b.scope === "string" && (b.scope === "profile" || (b.scope.startsWith("project:") && isValidScope(b.scope))) ? b.scope : "profile";
+  try {
+    return c.json(await memory(c.env, client).addOrder(client, { scope, rule: { says: b.says, action: b.action, when: b.when }, state: "active" }), 201);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "";
+    if (/must be|limit is/.test(message)) return json(c, 400, message);
+    throw e;
+  }
+});
+
+explorer.post("/orders/:id/:state{active|disabled}", async (c) => {
+  const client = c.get("client");
+  const res = await memory(c.env, client).setOrderState(client, c.req.param("id"), c.req.param("state") as "active" | "disabled");
+  return res ? c.json(res) : json(c, 404, "not found");
+});
+
+explorer.delete("/orders/:id", async (c) => {
+  const client = c.get("client");
+  const res = await memory(c.env, client).deleteOrder(client, c.req.param("id"));
+  return res.deleted ? c.json(res) : json(c, 404, "not found");
 });

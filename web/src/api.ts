@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import type { Block, Detail, Graph, Me, SearchResult, Held, Wall } from "./types";
+import type { Block, Detail, Graph, Me, SearchResult, Held, StandingOrder, Strike, Wall } from "./types";
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/ui/api${path}`, {
@@ -36,4 +36,7 @@ export const api = {
   removeWall: (name: string) => call<Wall>("DELETE", `/walls/${encodeURIComponent(name)}`),
   held: () => call<{ held: Held[] }>("GET", "/held"),
   decideHeld: (id: number, decision: "release" | "dismiss") => call<{ id: number; scope: string }>("POST", `/held/${id}/${decision}`),
+  orders: () => call<{ orders: StandingOrder[]; strikes: Strike[] }>("GET", "/orders"),
+  setOrderState: (id: string, state: "active" | "disabled") => call<StandingOrder>("POST", `/orders/${encodeURIComponent(id)}/${state}`),
+  deleteOrder: (id: string) => call<{ deleted: number }>("DELETE", `/orders/${encodeURIComponent(id)}`),
 };
