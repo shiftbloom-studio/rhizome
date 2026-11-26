@@ -240,4 +240,21 @@ export const MIGRATIONS: string[] = [
   ) WITHOUT ROWID;
   CREATE INDEX wall_reads_time ON wall_reads (last_at);
   `,
+  // 8: ledger. Which connector was given which memory, and whether it was told
+  // that the memory changed since (see ledger.ts). One row per (memory, connector).
+  `
+  CREATE TABLE deliveries (
+    item_id      TEXT NOT NULL,
+    client_id    TEXT NOT NULL,
+    agent        TEXT NOT NULL,
+    provider     TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    first_at     INTEGER NOT NULL,
+    last_at      INTEGER NOT NULL,
+    times        INTEGER NOT NULL DEFAULT 1,
+    corrected_at INTEGER,
+    PRIMARY KEY (item_id, client_id)
+  ) WITHOUT ROWID;
+  CREATE INDEX deliveries_pending ON deliveries (client_id, corrected_at);
+  `,
 ];
