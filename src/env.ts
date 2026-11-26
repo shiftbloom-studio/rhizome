@@ -26,6 +26,8 @@ export interface Env {
   EXTRACTION?: string;
   /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */
   RECALL_FEATURES?: string;
+  /** How conversations are cut for search: "fixed" (1,200 characters, default) or "rounds" (one question and its answers). */
+  CHUNKING?: string;
   /** Maximum episodes per person and UTC day that go through fact extraction. Default: 200. */
   EXTRACTION_DAILY_LIMIT?: string;
 
