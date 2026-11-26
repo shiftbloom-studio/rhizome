@@ -352,6 +352,21 @@ describe("MemoryObject pipeline", () => {
     expect((db.prepare("SELECT mentions FROM entities WHERE name = 'Cloudflare'").get() as { mentions: number }).mentions).toBe(2);
     expect(tagCalls).toBe(before);
   });
+  it("reflects as of a given time, so a replayed history is aged as it was then", async () => {
+    await mo.addEpisode(claude, { scope: "profile", tEvent: Date.UTC(2023, 4, 10), messages: [{ role: "user", content: "SMALLTALK about the tomatoes in the garden and how fast they grow" }] });
+    await settle(mo);
+    const chunks = () => db.prepare("SELECT DISTINCT status FROM items WHERE kind = 'chunk'").all();
+    // Three weeks after the talk, its chunks are young.
+    await mo.requestReflection(web, Date.UTC(2023, 5, 1));
+    await settle(mo);
+    expect(chunks()).toEqual([{ status: "active" }]);
+    expect(mo.stats(web).lastReflection).toBe(String(Date.UTC(2023, 5, 1)));
+    // Today the same chunks are years old, never recalled, and leave the default recall.
+    await mo.requestReflection(web);
+    await settle(mo);
+    expect(chunks()).toEqual([{ status: "archived" }]);
+    await expect(mo.requestReflection(web, Number.NaN)).rejects.toThrow(/epoch milliseconds/);
+  });
 
   describe("dispute resolution in reflection", () => {
     const row = (id: string) => db.prepare("SELECT status, superseded_by, valid_from, valid_to, expired_at FROM items WHERE id = ?").get(id) as Record<string, unknown>;

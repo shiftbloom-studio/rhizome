@@ -1104,12 +1104,16 @@ export class MemoryObject extends DurableObject<Env> {
       .map((r) => ({ at: iso(r.at), client: String(r.client_id), action: String(r.action), detail: r.detail ? JSON.parse(String(r.detail)) : null }));
   }
 
-  /** Schedules a reflection run (consolidation, decay, profile distillation). Called nightly and from the explorer. */
-  async requestReflection(client?: Client): Promise<{ scheduled: boolean }> {
+  /**
+   * Schedules a reflection run (consolidation, decay, profile distillation). Called nightly and from the explorer.
+   * `at` runs it as of that time instead of now, for histories replayed from the past (bench/).
+   */
+  async requestReflection(client?: Client, at?: number): Promise<{ scheduled: boolean }> {
     if (client) this.userId(client);
     else if (!this.meta("user_id")) return { scheduled: false };
+    if (at !== undefined && !Number.isFinite(at)) throw new Error("reflection time must be epoch milliseconds");
     const pending = this.sql.exec("SELECT 1 FROM jobs WHERE kind = 'reflect' AND attempts < ? LIMIT 1", MAX_JOB_ATTEMPTS).toArray()[0];
-    if (!pending) this.enqueue("reflect", "all");
+    if (!pending) this.enqueue("reflect", at === undefined ? "all" : `at:${at}`);
     await this.kick(1_000);
     return { scheduled: true };
   }
@@ -1132,7 +1136,7 @@ export class MemoryObject extends DurableObject<Env> {
     for (const job of due) {
       try {
         if (job.kind === "extract") await this.extract(String(job.ref));
-        else if (job.kind === "reflect") await this.reflect();
+        else if (job.kind === "reflect") await this.reflect(String(job.ref).startsWith("at:") ? Number(String(job.ref).slice(3)) : Date.now());
         this.sql.exec("DELETE FROM jobs WHERE seq = ?", job.seq);
       } catch (err) {
         const attempts = Number(job.attempts) + 1;
@@ -1684,8 +1688,7 @@ export class MemoryObject extends DurableObject<Env> {
    * archiving of stale chunks, merging of duplicates the day produced, and a
    * rewrite of the distilled profile and project summaries when their notes changed.
    */
-  private async reflect(): Promise<void> {
-    const now = Date.now();
+  private async reflect(now = Date.now()): Promise<void> {
     const since = Number(this.meta("last_reflection_at") ?? 0);
     const report: Record<string, unknown> = {};
 
