@@ -61,10 +61,23 @@ function hash(id: string): number {
   return (h >>> 0) / 4294967296;
 }
 
+// Sizes vary a little with weight and importance, but stay close enough that a dense graph doesn't turn into a few big balls.
 function baseSize(n: GraphNode): number {
-  if (n.type === "entity") return 1.2 + Math.min(1.8, Math.log2(1 + n.weight) * 0.45);
+  if (n.type === "entity") return 1.5 + Math.min(0.9, Math.log2(1 + n.weight) * 0.22);
   if (n.type === "episode") return 1.1;
-  return 1.2 + n.importance * 2.2;
+  return 1.3 + n.importance * 0.8;
+}
+
+/**
+ * How much room the layout takes, as a factor on every distance. 1 for a small memory; it grows with the
+ * number of nodes and with how many links each node carries, so a denser memory spreads out instead of
+ * packing tighter into the same space. Capped, so a huge memory still fits a reasonable world.
+ */
+export function layoutSpread(nodeCount: number, linkCount: number): number {
+  if (nodeCount === 0) return 1;
+  const bySize = Math.cbrt(Math.max(1, nodeCount / 150));
+  const byLinks = Math.sqrt(Math.max(1, (2 * linkCount) / nodeCount / 4));
+  return Math.min(4, bySize * byLinks);
 }
 
 function baseColor(n: GraphNode): THREE.Color {
@@ -104,11 +117,12 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
 
   // Simulation nodes keep their position across graph reloads, so a refresh doesn't scramble the layout.
   const previous = useRef(new Map<string, { x: number; y: number; z: number }>());
-  const { nodes, byType, links, byId } = useMemo(() => {
+  const { nodes, byType, links, shown, byId, degree, spread } = useMemo(() => {
     const byType: Record<NodeType, Node3[]> = { note: [], episode: [], entity: [] };
+    const startSpread = layoutSpread(graph.nodes.length, graph.edges.length / 2);
     const nodes: Node3[] = graph.nodes.map((n) => {
       const prev = previous.current.get(n.id);
-      const r = 40 + hash(n.id) * 80;
+      const r = (40 + hash(n.id) * 80) * startSpread;
       const theta = hash(n.id + "t") * Math.PI * 2;
       const phi = Math.acos(2 * hash(n.id + "p") - 1);
       const node: Node3 = {
@@ -133,14 +147,40 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         return true;
       })
       .map((e) => ({ ...e }));
-    return { nodes, byType, links, byId };
+    const spread = layoutSpread(nodes.length, links.length);
+    // In a dense memory every note keeps only its strongest few "similar" links, in the layout and in the
+    // picture. The others appear when you select a note or search, so nothing is lost, it just stops
+    // pulling everything into one knot.
+    const keep = spread > 1.3 ? 3 : Infinity;
+    const kept = new Map<string, number>();
+    const shown = new Array<boolean>(links.length).fill(true);
+    links
+      .map((l, i) => ({ l, i }))
+      .filter(({ l }) => l.kind === "similar")
+      .sort((a, b) => b.l.weight - a.l.weight)
+      .forEach(({ l, i }) => {
+        const a = kept.get(l.source) ?? 0;
+        const b = kept.get(l.target) ?? 0;
+        if (a >= keep && b >= keep) return void (shown[i] = false);
+        kept.set(l.source, a + 1);
+        kept.set(l.target, b + 1);
+      });
+    const degree = new Map<string, number>();
+    links.forEach((l, i) => {
+      if (!shown[i]) return;
+      degree.set(l.source, (degree.get(l.source) ?? 0) + 1);
+      degree.set(l.target, (degree.get(l.target) ?? 0) + 1);
+    });
+    // Resolve every end to its node up front: the layout only sees the shown links, but all of them are drawn on demand.
+    for (const l of links) Object.assign(l, { source: byId.get(l.source), target: byId.get(l.target) });
+    return { nodes, byType, links, shown, byId, degree, spread };
   }, [graph]);
 
   // Every scope gets an anchor on a ring, so profile, each project and each agent form their own region.
   const anchors = useMemo(() => {
     const scopes = [...new Set(nodes.map((n) => n.scope).filter((s): s is string => Boolean(s)))].sort();
     const map = new Map<string, { x: number; y: number; z: number }>();
-    const radius = scopes.length > 1 ? 55 + scopes.length * 12 : 0;
+    const radius = scopes.length > 1 ? (55 + scopes.length * 12) * spread : 0;
     scopes.forEach((s, i) => {
       // profile sits in the middle: it is what every project shares.
       if (s === "profile" && scopes.length > 1) return void map.set(s, { x: 0, y: 0, z: 0 });
@@ -148,24 +188,30 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       map.set(s, { x: Math.cos(a) * radius, y: (hash(s) - 0.5) * radius * 0.5, z: Math.sin(a) * radius });
     });
     return map;
-  }, [nodes]);
+  }, [nodes, spread]);
 
   const sim = useMemo(() => {
+    // Nodes with many "similar" links would otherwise be pulled into a tight knot by all of them at once.
+    const crowd = (l: unknown) => {
+      const { source, target } = l as { source: Node3 | string; target: Node3 | string };
+      const id = (v: Node3 | string) => (typeof v === "string" ? v : v.id);
+      return Math.sqrt(Math.max(1, Math.min(degree.get(id(source)) ?? 1, degree.get(id(target)) ?? 1) / 4));
+    };
     const s = forceSimulation(nodes, 3)
       .force(
         "link",
-        forceLink<Node3>(links as never)
+        forceLink<Node3>(links.filter((_, i) => shown[i]) as never)
           .id((n) => n.id)
           .distance((l) => {
             const kind = (l as unknown as GraphEdge).kind;
-            return kind === "mentions" ? 30 : kind === "derived_from" ? 20 : kind === "similar" ? 16 : 12;
+            return (kind === "mentions" ? 30 : kind === "derived_from" ? 20 : kind === "similar" ? 16 : 12) * spread;
           })
           .strength((l) => {
             const e = l as unknown as GraphEdge;
-            return e.kind === "similar" ? 0.15 + 0.4 * e.weight : e.kind === "mentions" ? 0.25 : 0.5;
+            return e.kind === "similar" ? (0.15 + 0.4 * e.weight) / crowd(l) : e.kind === "mentions" ? 0.25 : 0.5;
           }),
       )
-      .force("charge", forceManyBody().strength((n) => ((n as Node3).type === "entity" ? -70 : -24)).distanceMax(260))
+      .force("charge", forceManyBody().strength((n) => ((n as Node3).type === "entity" ? -70 : -24) * spread).distanceMax(260 * spread))
       .force("center", forceCenter(0, 0, 0))
       .force("scopeX", forceX((n) => anchors.get((n as Node3).scope ?? "")?.x ?? 0).strength((n) => ((n as Node3).scope ? 0.06 : 0)))
       .force("scopeY", forceY((n) => anchors.get((n as Node3).scope ?? "")?.y ?? 0).strength((n) => ((n as Node3).scope ? 0.06 : 0)))
@@ -176,20 +222,35 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     // A head start, so the first frame already shows structure.
     s.tick(previous.current.size ? 5 : 80);
     return s;
-  }, [nodes, links, anchors]);
+  }, [nodes, links, shown, anchors, degree, spread]);
 
   // Frame the whole memory on first load: the camera backs off until every node fits.
   const { size } = useThree();
   useEffect(() => {
     if (previous.current.size || !controls.current || nodes.length === 0) return;
+    // A small memory fits whole; a dense one frames its core and lets the outskirts run past the edges,
+    // so it keeps its spacing and you zoom out or pan (right drag) to see the rest.
     const d = nodes.map((n) => Math.hypot(n.x, n.y, n.z)).sort((a, b) => a - b);
-    const radius = d[Math.floor(d.length * 0.92)] ?? 100;
+    const share = 0.92 - Math.min(0.42, Math.max(0, spread - 1) * 0.3);
+    const radius = d[Math.floor(d.length * share)] ?? 100;
     const fov = ((camera as THREE.PerspectiveCamera).fov * Math.PI) / 180;
-    const distance = Math.min(1200, Math.max(120, (radius * 1.25) / Math.sin(fov / 2)));
+    const distance = Math.min(1200 * spread, Math.max(120, (radius * 1.25) / Math.sin(fov / 2)));
     const dir = camera.position.clone().sub(controls.current.target).normalize();
     camera.position.copy(dir.multiplyScalar(distance));
     controls.current.target.set(0, 0, 0);
-  }, [nodes, camera]);
+  }, [nodes, camera, spread]);
+
+  // A bigger world needs a camera that sees further, and fog that starts further out.
+  const { scene } = useThree();
+  useEffect(() => {
+    const cam = camera as THREE.PerspectiveCamera;
+    cam.far = 2000 * spread;
+    cam.updateProjectionMatrix();
+    if (scene.fog instanceof THREE.Fog) {
+      scene.fog.near = 420 * spread;
+      scene.fog.far = 1300 * spread;
+    }
+  }, [camera, scene, spread]);
 
   // The side panels cover part of the canvas, so the visual centre moves right.
   useEffect(() => {
@@ -227,8 +288,8 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     const centre = new THREE.Vector3();
     for (const n of targets as Node3[]) centre.add(new THREE.Vector3(n.x, n.y, n.z));
     centre.divideScalar(targets.length);
-    const spread = Math.max(...(targets as Node3[]).map((n) => centre.distanceTo(new THREE.Vector3(n.x, n.y, n.z))), 0);
-    const distance = selected ? 150 : Math.min(420, 160 + spread * 2.2);
+    const extent = Math.max(...(targets as Node3[]).map((n) => centre.distanceTo(new THREE.Vector3(n.x, n.y, n.z))), 0);
+    const distance = selected ? 150 : Math.min(420 * spread, 160 + extent * 2.2);
     const dir = camera.position.clone().sub(controls.current.target).normalize();
     fly.current = {
       from: controls.current.target.clone(),
@@ -237,7 +298,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       camTo: centre.clone().add(dir.multiplyScalar(distance)),
       start: performance.now(),
     };
-  }, [selected, highlight, byId, camera]);
+  }, [selected, highlight, byId, camera, spread]);
 
   const temp = useMemo(() => new THREE.Object3D(), []);
   const color = useMemo(() => new THREE.Color(), []);
@@ -246,7 +307,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
   const red = useMemo(() => new THREE.Color("#C81040"), []);
 
   // Only "real" relations carry sparks; history edges (supersedes and so on) stay quiet.
-  const sparkLinks = useMemo(() => links.map((l, i) => (RED_EDGES.has(l.kind) ? -1 : i)).filter((i) => i >= 0), [links]);
+  const sparkLinks = useMemo(() => links.map((l, i) => (RED_EDGES.has(l.kind) || !shown[i] ? -1 : i)).filter((i) => i >= 0), [links, shown]);
   const sparks = useMemo(
     () => Array.from({ length: Math.min(48, Math.ceil(sparkLinks.length / 2)) }, () => ({ edge: -1, t: Math.random(), speed: 0.004 + Math.random() * 0.006, forward: true })),
     [sparkLinks],
@@ -288,6 +349,9 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     }
 
     const age = reducedMotion ? 1 : Math.min(1, (now - born.current) / 900);
+    const nodeGrow = Math.cbrt(spread);
+    // With many links, the plain ones draw lighter, so the nodes stay readable through them.
+    const thin = Math.min(0.22, (spread - 1) * 0.15);
     const dimmed = (id: string) => (focusSet ? !focusSet.has(id) : highlight ? !highlight.has(id) : false);
     for (const type of ["note", "episode", "entity"] as NodeType[]) {
       const mesh = meshes[type].current;
@@ -295,7 +359,8 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       for (const n of byType[type]) {
         // Unfurl from the centre, staggered a little per node.
         const local = Math.max(0, Math.min(1, (age - (n.slot % 40) * 0.006) / 0.75));
-        let scale = baseSize(n) * bloomEase(local);
+        // Nodes grow a little with the world (much slower than the distances), so they stay visible from further out.
+        let scale = baseSize(n) * nodeGrow * bloomEase(local);
         if (n.status === "disputed" && !reducedMotion) scale *= 1 + 0.12 * Math.sin(now / 420);
         if (n.id === selected) scale *= 1.6;
         else if (hovered?.id === n.id) scale *= 1.3;
@@ -317,17 +382,19 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       const s = l.source as unknown as Node3;
       const t = l.target as unknown as Node3;
       if (typeof s !== "object" || typeof t !== "object") return;
-      pos.setXYZ(i * 2, s.x, s.y, s.z);
-      pos.setXYZ(i * 2 + 1, t.x, t.y, t.z);
       const active = focusSet ? focusSet.has(s.id) && focusSet.has(t.id) && (s.id === selected || t.id === selected) : highlight ? highlight.has(s.id) || highlight.has(t.id) : true;
+      // A hidden link collapses to a point unless it belongs to the selection or a search hit.
+      const draw = shown[i] || ((focusSet || highlight) && active);
+      pos.setXYZ(i * 2, s.x, s.y, s.z);
+      pos.setXYZ(i * 2 + 1, draw ? t.x : s.x, draw ? t.y : s.y, draw ? t.z : s.z);
       color.copy(RED_EDGES.has(l.kind) ? red : edgeBase);
       // Stronger similarity draws a darker line, like a well-used connection.
       const fade = focusSet || highlight
         ? active ? 0.3 : 0.97
         : RED_EDGES.has(l.kind) ? 0.45
-        : l.kind === "similar" ? Math.min(0.66, Math.max(0.36, 0.66 - (l.weight - 0.55) * 2))
-        : l.kind === "mentions" ? 0.62
-        : 0.7;
+        : l.kind === "similar" ? Math.min(0.66, Math.max(0.36, 0.66 - (l.weight - 0.55) * 2)) + thin
+        : l.kind === "mentions" ? 0.62 + thin
+        : 0.7 + thin;
       color.lerp(bg, fade);
       col.setXYZ(i * 2, color.r, color.g, color.b);
       col.setXYZ(i * 2 + 1, color.r, color.g, color.b);
@@ -442,7 +509,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         autoRotate={!reducedMotion && !interacting && !selected}
         autoRotateSpeed={0.35}
         minDistance={20}
-        maxDistance={900}
+        maxDistance={900 * spread}
         onStart={() => setInteracting(true)}
         onEnd={() => setTimeout(() => setInteracting(false), 4000)}
       />
