@@ -28,6 +28,7 @@ const EXTRACTIONS: Record<string, unknown> = {
   // Labelled by the extraction model against the notes shown under "Related memory".
   MOVED: { facts: [{ statement: "The user wants the Apache license for every project.", kind: "preference", scope: "profile", trust: "user_explicit", valid_from: "2026-11-27", relation: "update", related: 0, entities: [] }], entities: [] },
   TEA: { facts: [{ statement: "The user drinks green tea every morning.", kind: "preference", scope: "profile", trust: "user_explicit", relation: "same", related: 0, entities: [] }], entities: [] },
+  COFFEE: { facts: [{ statement: "The user drinks black coffee after lunch.", kind: "preference", scope: "profile", trust: "user_explicit", relation: "update", related: 0, entities: [] }], entities: [] },
   VERCEL: { facts: [{ statement: "The user hosted the homepage on Vercel.", kind: "fact", scope: "profile", trust: "user_explicit", valid_to: "2026-11-01", entities: [] }], entities: [] },
 };
 
@@ -225,6 +226,17 @@ describe("MemoryObject pipeline", () => {
     expect(n).toHaveLength(2);
     expect(n.map((x) => x.status)).toEqual(["active", "active"]);
     expect(n[0]!.confirmations).toBe(1);
+  });
+
+  it("does not supersede an unrelated note the model labelled as updated", async () => {
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });
+    await settle(mo);
+    await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "COFFEE after lunch, black, every single day" }] });
+    await settle(mo);
+    const n = notes();
+    expect(n).toHaveLength(2);
+    expect(n.map((x) => x.status)).toEqual(["active", "active"]);
+    expect(n[0]!.superseded_by).toBeNull();
   });
 
   it("stores an end date from the episode and leaves an unknown start open", async () => {

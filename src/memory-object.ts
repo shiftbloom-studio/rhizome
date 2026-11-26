@@ -1084,9 +1084,10 @@ export class MemoryObject extends DurableObject<Env> {
       const shown = fact.related !== null ? related[fact.related] : undefined;
       if (fact.relation && fact.relation !== "new" && shown && shown.scope === fact.scope) {
         const similarity = cosine(vec, shown.vec);
-        // "same" drops the new wording, so it needs real overlap; updates and
-        // contradictions keep both notes and stay reversible.
-        if (fact.relation !== "same" || similarity >= LINK_SIMILARITY) {
+        // The label needs real overlap: "same" drops the new wording, and an update
+        // or contradiction against a wrongly numbered note would hide or dispute an
+        // unrelated one. Below that the fallback decides.
+        if (similarity >= LINK_SIMILARITY) {
           labelled++;
           plans.push({ fact, vec, relation: fact.relation, target: shown, similarity });
           return;
