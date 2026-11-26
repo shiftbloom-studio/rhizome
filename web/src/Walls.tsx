@@ -3,19 +3,22 @@
 // searched when an agent names it. Off until the person sets a wall here.
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
-import type { Wall } from "./types";
+import type { Held, Wall } from "./types";
 
 const SLUG = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 
-export function Walls({ scopes, onNotice }: { scopes: string[]; onNotice: (msg: string) => void }) {
+export function Walls({ scopes, onNotice, onChanged }: { scopes: string[]; onNotice: (msg: string) => void; onChanged: () => void }) {
   const [walls, setWalls] = useState<Wall[] | null>(null);
+  const [held, setHeld] = useState<Held[]>([]);
   const [name, setName] = useState("");
   const [picked, setPicked] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      setWalls((await api.walls()).walls);
+      const [w, h] = await Promise.all([api.walls(), api.held()]);
+      setWalls(w.walls);
+      setHeld(h.held);
     } catch (e) {
       onNotice(String((e as Error).message));
     }
@@ -52,6 +55,16 @@ export function Walls({ scopes, onNotice }: { scopes: string[]; onNotice: (msg: 
       setBusy(false);
     }
   };
+  const decide = async (h: Held, decision: "release" | "dismiss") => {
+    try {
+      await api.decideHeld(h.id, decision);
+      onNotice(decision === "release" ? `Moved to ${h.to}.` : `Kept in ${h.from}.`);
+      await load();
+      onChanged();
+    } catch (err) {
+      onNotice(String((err as Error).message));
+    }
+  };
   const remove = async (w: Wall) => {
     try {
       await api.removeWall(w.name);
@@ -86,6 +99,25 @@ export function Walls({ scopes, onNotice }: { scopes: string[]; onNotice: (msg: 
             </li>
           ))}
         </ul>
+      )}
+      {held.length > 0 && (
+        <div className="held">
+          <h3 className="label red">held · {held.length}</h3>
+          <p className="muted small">Learned inside a wall and kept there. Release one to let it go where it wanted to.</p>
+          <ul>
+            {held.map((h) => (
+              <li key={h.id}>
+                <span className="text">{h.content}</span>
+                <span className="meta label">{h.from} → {h.to}</span>
+                <span className="actions-row">
+                  <button type="button" className="link" onClick={() => void decide(h, "release")}>Release to {h.to}</button>
+                  {" · "}
+                  <button type="button" className="link" onClick={() => void decide(h, "dismiss")}>Keep in {h.from}</button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
       {projects.length > 0 ? (
         <form className="remember" onSubmit={save}>

@@ -76,7 +76,13 @@ code { font: 13px var(--mono); background: var(--blush); padding: 1px 5px; borde
 .small { font-size: 12px; margin: 0 0 10px; }
 .walls { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 10px; }
 .wall-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; margin-bottom: 6px; }
-.wall-head .link { font: 12px var(--sans); color: var(--ink60); background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer; }
+.held { margin: 0 0 12px; padding: 12px 14px; border-radius: 14px; border: 1px solid var(--petal); background: #fbf8f6; }
+.held h3 { margin: 0 0 4px; }
+.held ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.held li { display: grid; gap: 3px; font-size: 13px; }
+.held .text { font-size: 13px; }
+.held .meta { font-size: 10px; letter-spacing: 0.08em; }
+.wall-head .link, .held .link { font: 12px var(--sans); color: var(--ink60); background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer; }
 .wall-name { width: 100%; border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; background: #fbf8f6; font: 12px var(--mono); margin-bottom: 8px; }
 .chip:disabled { opacity: 0.4; cursor: default; }
 .foot { margin-top: auto; font-size: 12px; color: var(--ink60); }

@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, runAi, type Env } from "./env";
 import { MIGRATIONS } from "./schema";
-import { admitNamed, isValidWallName, isWallableScope, wallOf, WALL_LIMIT, type Walls } from "./walls";
+import { admitNamed, heldTarget, isValidWallName, isWallableScope, wallOf, WALL_LIMIT, type Walls } from "./walls";
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
@@ -1136,6 +1136,66 @@ export class MemoryObject extends DurableObject<Env> {
     return { name, scopes: wanted.sort() };
   }
 
+  private hold(itemId: string, fromScope: string, toScope: string, via: "extraction" | "remember", now: number): void {
+    this.sql.exec(
+      "INSERT INTO promotions (item_id, from_scope, to_scope, via, created_at) VALUES (?, ?, ?, ?, ?)",
+      itemId, fromScope, toScope, via, now,
+    );
+  }
+
+  /** Facts kept inside a wall that wanted to go elsewhere, oldest first. Forgotten notes drop out. */
+  listHeld(client: Client) {
+    this.userId(client);
+    return this.sql
+      .exec(
+        `SELECT p.seq, p.item_id, p.from_scope, p.to_scope, p.via, p.created_at, i.content, i.note_kind, i.status FROM promotions p
+         JOIN items i ON i.id = p.item_id
+         WHERE p.state = 'held' ORDER BY p.seq LIMIT 500`,
+      )
+      .toArray()
+      .map((r) => ({
+        id: Number(r.seq),
+        itemId: String(r.item_id),
+        content: String(r.content),
+        kind: r.note_kind === null ? null : String(r.note_kind),
+        status: String(r.status),
+        from: String(r.from_scope),
+        to: String(r.to_scope),
+        via: String(r.via),
+        at: iso(r.created_at),
+      }));
+  }
+
+  /**
+   * Decides a held promotion. release moves the note to where it wanted to go;
+   * dismiss keeps it in its project for good. Returns null when there is nothing to decide.
+   */
+  async decideHeld(client: Client, id: number, decision: "release" | "dismiss"): Promise<{ id: number; itemId: string; scope: string } | null> {
+    this.userId(client);
+    const row = this.sql
+      .exec(
+        "SELECT p.item_id, p.from_scope, p.to_scope, i.scope FROM promotions p JOIN items i ON i.id = p.item_id WHERE p.seq = ? AND p.state = 'held'",
+        id,
+      )
+      .toArray()[0];
+    if (!row) return null;
+    const itemId = String(row.item_id);
+    const scope = decision === "release" ? String(row.to_scope) : String(row.scope);
+    if (!can(client, "write", scope)) throw new ForbiddenError(scope);
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      if (decision === "release" && String(row.scope) !== scope) {
+        this.sql.exec("UPDATE items SET scope = ?, updated_at = ? WHERE id = ?", scope, now, itemId);
+        // The vector index filters by scope: write the new scope there too.
+        this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", itemId, now);
+      }
+      this.sql.exec("UPDATE promotions SET state = ?, decided_at = ? WHERE seq = ?", decision === "release" ? "released" : "dismissed", now, id);
+      this.audit(client, `held.${decision}`, { id: itemId, from: String(row.from_scope), to: String(row.to_scope) });
+    });
+    if (decision === "release") await this.kick();
+    return { id, itemId, scope };
+  }
+
   /** Every scope that holds something, for the explorer's filters. */
   scopes(client: Client): string[] {
     this.userId(client);
@@ -1373,11 +1433,14 @@ export class MemoryObject extends DurableObject<Env> {
       return;
     }
 
-    const facts = extraction.facts.map((f) => ({
-      ...f,
-      scope: targetScope(f.scope, String(ep.scope)),
-      trust: capTrust(f.trust, hasUser),
-    }));
+    // Rule 3 of walls: a fact from a walled conversation stays inside its wall. Where
+    // the extractor wanted it to go is kept as a held promotion (see promotions).
+    const walls = this.walls();
+    const facts = extraction.facts.map((f) => {
+      const target = targetScope(f.scope, String(ep.scope));
+      const held = heldTarget(String(ep.scope), target, walls);
+      return { ...f, scope: held ? String(ep.scope) : target, heldFor: held, trust: capTrust(f.trust, hasUser) };
+    });
     const vectors = facts.length ? await this.embed(facts.map((f) => f.statement)) : [];
     const pool = this.candidates([...new Set(facts.map((f) => f.scope))]);
 
@@ -1475,6 +1538,7 @@ export class MemoryObject extends DurableObject<Env> {
         );
         this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", id, now);
         this.link(id, episodeId, "derived_from", 1, now);
+        if (p.fact.heldFor) this.hold(id, p.fact.scope, p.fact.heldFor, "extraction", now);
         if (relation === "update" && target) this.supersede(target.id, id, now);
         if (relation === "contradicts" && target) this.link(id, target.id, "contradicts", p.similarity, now);
         for (const name of p.fact.entities) {

@@ -163,3 +163,16 @@ explorer.delete("/walls/:name", async (c) => {
     throw e;
   }
 });
+
+explorer.get("/held", async (c) => {
+  const client = c.get("client");
+  return c.json({ held: await memory(c.env, client).listHeld(client) });
+});
+
+explorer.post("/held/:id/:decision{release|dismiss}", async (c) => {
+  const client = c.get("client");
+  const id = Number(c.req.param("id"));
+  if (!Number.isSafeInteger(id)) return json(c, 400, "id must be a number");
+  const res = await memory(c.env, client).decideHeld(client, id, c.req.param("decision") as "release" | "dismiss");
+  return res ? c.json(res) : json(c, 404, "not found");
+});

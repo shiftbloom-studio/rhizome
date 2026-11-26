@@ -124,3 +124,15 @@ export interface Wall {
   name: string;
   scopes: string[];
 }
+
+export interface Held {
+  id: number;
+  itemId: string;
+  content: string;
+  kind: string | null;
+  status: string;
+  from: string;
+  to: string;
+  via: string;
+  at: string;
+}

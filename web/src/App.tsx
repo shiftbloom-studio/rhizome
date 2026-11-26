@@ -214,7 +214,7 @@ export function App() {
             </dl>
           </section>
         )}
-        <Walls scopes={me.scopes ?? []} onNotice={setNotice} />
+        <Walls scopes={me.scopes ?? []} onNotice={setNotice} onChanged={() => void load()} />
         <Remember scopes={me.scopes ?? []} onSaved={() => { setNotice("Saved. It shows up in the graph after a short moment."); setTimeout(load, 2500); }} />
         <Footer signOut={me.signOut} />
       </aside>

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Walls: two clients' projects in one memory, through the real MCP layer.
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { EXTRACTION_PROMPT } from "../src/intel";
 import { mcpResponse, type MemoryApi } from "../src/mcp";
 import { MemoryObject } from "../src/memory-object";
 import { DEFAULT_GRANTS, type Client } from "../src/scopes";
@@ -106,5 +107,105 @@ describe("walls in recall", () => {
     expect(mo.listWalls(claudeCode)).toEqual([{ name: "acme", scopes: ["project:acme"] }]);
     mo.setWall(claudeCode, "acme", []);
     expect(mo.listWalls(claudeCode)).toEqual([]);
+  });
+});
+
+function extract(_model: string, system: string, user: string): string {
+  if (system === EXTRACTION_PROMPT && user.includes("RATE")) {
+    return JSON.stringify({
+      facts: [
+        // The extractor files the rate under the profile because it is about the person.
+        { statement: "The user charges Acme a day rate of 900 euros.", kind: "fact", scope: "profile", trust: "user_explicit", entities: [] },
+        { statement: "Acme launches the Orion feature on March 3.", kind: "decision", scope: "project", trust: "user_explicit", entities: [] },
+      ],
+      entities: [],
+    });
+  }
+  return JSON.stringify({ facts: [], entities: [] });
+}
+
+describe("walls and extraction (held promotions)", () => {
+  let mo: MemoryObject;
+  let db: ReturnType<typeof fakeState>["db"];
+  const settle = async () => {
+    for (let i = 0; i < 12; i++) {
+      now += 5_000;
+      await mo.alarm();
+    }
+  };
+  const said = async () => {
+    await mo.addEpisode(claudeCode, {
+      scope: "project:acme",
+      messages: [
+        { role: "user", content: "RATE: for Acme I bill 900 euros a day, and their Orion launch is fixed for March 3." },
+        { role: "assistant", content: "Noted." },
+      ],
+    });
+    await settle();
+  };
+  const scopeOf = (text: string) => (db.prepare("SELECT scope FROM items WHERE kind = 'note' AND content LIKE ?").get(`%${text}%`) as { scope: string } | undefined)?.scope;
+
+  beforeEach(() => {
+    now = Date.UTC(2026, 10, 26, 9);
+    const s = fakeState();
+    db = s.db;
+    mo = new MemoryObject(s.state as never, fakeEnv(extract).env as never);
+  });
+
+  it("without walls a profile fact from a project conversation goes to the profile, as before", async () => {
+    await said();
+    expect(scopeOf("900 euros")).toBe("profile");
+    expect(mo.listHeld(claudeCode)).toEqual([]);
+  });
+
+  it("keep a fact from a walled conversation in its project and hold the promotion", async () => {
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    mo.setWall(claudeCode, "globex", ["project:globex"]);
+    await said();
+    expect(scopeOf("900 euros")).toBe("project:acme");
+    expect(scopeOf("Orion")).toBe("project:acme");
+    const held = mo.listHeld(claudeCode);
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatchObject({ content: "The user charges Acme a day rate of 900 euros.", from: "project:acme", to: "profile", via: "extraction" });
+
+    // Globex's agent sees nothing of it, in context or recall.
+    const ctx = await tool(mo, cursor, "get_context", { project: "globex" });
+    expect(ctx.text).not.toContain("900 euros");
+    const rec = await tool(mo, cursor, "recall", { query: "day rate euros", project: "globex" });
+    expect(rec.text).not.toContain("900 euros");
+    // Inside the wall it is found as usual.
+    const inside = await tool(mo, claudeCode, "recall", { query: "day rate euros", project: "acme" });
+    expect(inside.results.some((r) => r.content.includes("900 euros"))).toBe(true);
+  });
+
+  it("move a released note to where it wanted to go, and keep a dismissed one", async () => {
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    await said();
+    const [held] = mo.listHeld(claudeCode);
+    expect(await mo.decideHeld(claudeCode, held!.id, "release")).toEqual({ id: held!.id, itemId: held!.itemId, scope: "profile" });
+    expect(scopeOf("900 euros")).toBe("profile");
+    expect(mo.listHeld(claudeCode)).toEqual([]);
+    expect(await mo.decideHeld(claudeCode, held!.id, "dismiss")).toBeNull();
+    const outbox = db.prepare("SELECT op FROM outbox WHERE item_id = ?").all(held!.itemId) as { op: string }[];
+    await settle();
+    // The vector index got the new scope (the outbox drained after the release).
+    expect(outbox.some((r) => r.op === "upsert")).toBe(true);
+
+    await mo.forget(claudeCode, held!.itemId);
+    now += 60_000;
+    await said();
+    const [again] = mo.listHeld(claudeCode);
+    expect(await mo.decideHeld(claudeCode, again!.id, "dismiss")).toMatchObject({ scope: "project:acme" });
+    expect(scopeOf("900 euros")).toBe("project:acme");
+    expect(mo.listHeld(claudeCode)).toEqual([]);
+  });
+
+  it("drop a held promotion from the list when its note is forgotten", async () => {
+    mo.setWall(claudeCode, "acme", ["project:acme"]);
+    await said();
+    const [held] = mo.listHeld(claudeCode);
+    await mo.forget(claudeCode, held!.itemId);
+    expect(mo.listHeld(claudeCode)).toEqual([]);
+    expect(await mo.decideHeld(claudeCode, held!.id, "release")).toBeNull();
   });
 });
