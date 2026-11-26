@@ -83,13 +83,29 @@ function datasetResponse(text: string, size = 97): Response {
 type Gate = { reserve(model: string, rpm: number): number; alarm?: () => Promise<void> };
 const GateClass = AiGate as unknown as new (ctx: DurableObjectState, env: unknown) => Gate;
 
+/** The local index with Vectorize's limit on deletes, which the stand-in does not have. */
+function vectorizeLimits(index: LocalVectorIndex): LocalVectorIndex {
+  return new Proxy(index, {
+    get(target, prop) {
+      if (prop === "deleteByIds") {
+        return (ids: string[]) => {
+          if (ids.length > 100) throw new Error(`VECTOR_DELETE_ERROR (code = 40007): too many ids in payload; max id count is 100, got ${ids.length}`);
+          return target.deleteByIds(ids);
+        };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 function benchEnv(root: string): { env: BenchEnv; close: () => void } {
   const vectors = new LocalVectorIndex(join(root, "vectors.sqlite"));
   const bucket = new LocalBucket(join(root, "bucket"));
   let env!: BenchEnv;
   const memory = new LocalNamespace(join(root, "memory"), BenchMemory, () => env);
   const gate = new LocalNamespace(join(root, "gate"), GateClass, () => env);
-  env = { AI: new FakeAi(), MEMORY: memory, AI_GATE: gate, BENCH: bucket, EPISODES: bucket, VECTORS: vectors, RECALL_FEATURES: "all", CHUNKING: "rounds" } as unknown as BenchEnv;
+  env = { AI: new FakeAi(), MEMORY: memory, AI_GATE: gate, BENCH: bucket, EPISODES: bucket, VECTORS: vectorizeLimits(vectors), RECALL_FEATURES: "all", CHUNKING: "rounds" } as unknown as BenchEnv;
   return {
     env,
     close: () => {
@@ -293,6 +309,26 @@ describe("benchmark Worker", () => {
     expect(bench).toMatch(/"workers_dev":\s*false/);
     expect(bench).not.toMatch(/"routes"/);
   });
+
+  it("deletes everything of a question with more vectors than Vectorize deletes at once", async () => {
+    const { env, close } = benchEnv(dir);
+    try {
+      const big = question("big", "single-session-user", "What is the name of my cat?", [{ role: "user", content: "My cat is called Luna.", has_answer: true }]);
+      // 120 rounds long enough to be a chunk each.
+      big.haystack_sessions[0] = Array.from({ length: 240 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `garden ${i}: ` + "more about the tomatoes and the beans. ".repeat(6) }));
+      await env.BENCH.put(questionKey("big"), JSON.stringify(big));
+      const memory = env.MEMORY.get(env.MEMORY.idFromName("big"));
+      const record = await memory.benchRun({ key: questionKey("big"), userId: "big-1", vars: { CHUNKING: "rounds" }, extraction: false, reflect: false, asOf: false, paidRpm: 15, idleTimeoutMs: 60_000, vectorTimeoutMs: 60_000 });
+      expect(record.chunks).toBeGreaterThan(100);
+      const db = new DatabaseSync(join(dir, "vectors.sqlite"));
+      expect(db.prepare("SELECT COUNT(*) AS n FROM vectors").get()).toEqual({ n: 0 });
+      db.close();
+      const episodes = readdirSync(join(dir, "bucket", "users"), { recursive: true, withFileTypes: true }).filter((e) => e.isFile());
+      expect(episodes).toEqual([]);
+    } finally {
+      close();
+    }
+  }, 60_000);
 
   it("runs a Workflow of questions on fresh memories, cleans up after each and compares runs", async () => {
     const fetches = vi.fn(async () => datasetResponse(JSON.stringify(DATASET)));

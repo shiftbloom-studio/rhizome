@@ -740,7 +740,7 @@ export class MemoryObject extends DurableObject<Env> {
       const shown = new Set(items.map((i) => i.id));
       for (const item of items) {
         if (item.kind !== "note") continue;
-        const ev = this.bestEvidence(item.id, vecs.get(item.id) ?? null, qvecs, shown);
+        const ev = this.bestEvidence(item.id, vecs.get(item.id) ?? null, qvecs, shown, scopes);
         if (!ev) continue;
         const cost = estimateTokens(ev.content) + 8;
         if (used + cost > budget) continue;
@@ -829,15 +829,23 @@ export class MemoryObject extends DurableObject<Env> {
    * of its source episodes, the one closest to the note and the query. Falls back
    * to keyword overlap with the note when embeddings are missing.
    */
-  private bestEvidence(noteId: string, noteVec: Float32Array | null, qvecs: number[][], skip: Set<string>): RecallEvidence | null {
+  /**
+   * The excerpt a note was extracted from. It lives in the conversation's scope, which
+   * can differ from the note's (a profile fact said in a project conversation), so only
+   * excerpts from scopes this recall may read are considered.
+   */
+  private bestEvidence(noteId: string, noteVec: Float32Array | null, qvecs: number[][], skip: Set<string>, scopes: string[]): RecallEvidence | null {
+    if (scopes.length === 0) return null;
+    const marks = scopes.map(() => "?").join(", ");
     const rows = this.sql
       .exec(
         `SELECT c.id, c.content, c.episode_id, c.t_event, e.vec FROM links l
          JOIN items c ON c.episode_id = l.dst AND c.kind = 'chunk'
          LEFT JOIN embeddings e ON e.item_id = c.id AND e.model = ?
-         WHERE l.src = ? AND l.kind = 'derived_from' LIMIT 200`,
+         WHERE l.src = ? AND l.kind = 'derived_from' AND c.scope IN (${marks}) LIMIT 200`,
         this.embeddingModel,
         noteId,
+        ...scopes,
       )
       .toArray()
       .filter((r) => !skip.has(String(r.id)));
