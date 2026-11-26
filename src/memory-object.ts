@@ -9,6 +9,8 @@ import { MIGRATIONS } from "./schema";
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, rrf, transcript } from "./text";
 import { newId } from "./ids";
+import { confidence, diversify, keywordCoverage, keywordTerms, parseFeatures, shouldAbstain, SIMILARITY_FLOOR } from "./recall";
+import { parseTimeWindow } from "./timewindow";
 import {
   DEFAULT_EXTRACTION_MODEL,
   DEFAULT_REFLECTION_MODEL,
@@ -23,6 +25,7 @@ import {
   TRUST_RANK,
   aiText,
   capTrust,
+  cosine,
   decodeVector,
   encodeVector,
   entityKey,
@@ -68,6 +71,38 @@ export interface RecallInput {
   limit?: number;
   budgetTokens?: number;
   rerank?: boolean;
+  /** Up to four more wordings or parts of the question, supplied by the calling agent. */
+  queries?: string[];
+  /** Time window supplied by the calling agent, epoch milliseconds (from inclusive, to exclusive). */
+  from?: number;
+  to?: number;
+  /** Optional recall steps for this request (see RECALL_FEATURES). Default: the RECALL_FEATURES variable. */
+  features?: string[];
+}
+
+export interface RecallEvidence {
+  id: string;
+  episodeId: string;
+  content: string;
+  tEvent: string;
+}
+
+interface RecallWindow {
+  from: number;
+  to: number;
+  source: "agent" | "query";
+  text?: string;
+}
+
+export interface RecallResult {
+  items: MemoryItem[];
+  text: string;
+  tookMs: number;
+  sources: Record<string, number>;
+  /** Set when the abstain step ran: true when nothing was relevant enough to return. */
+  abstained?: boolean;
+  /** The time window recall was limited to, if any. */
+  window?: { from: string; to: string | null; source: "agent" | "query"; text?: string };
 }
 
 export interface MemoryItem {
@@ -87,6 +122,10 @@ export interface MemoryItem {
   confirmations: number;
   supersededBy: string | null;
   score?: number;
+  /** Recall only: how sure rhizome is that this result is relevant, 0 to 1. */
+  confidence?: number;
+  /** Recall only (evidence step): the source excerpt this note was extracted from. */
+  evidence?: RecallEvidence;
 }
 
 export interface GraphNode {
@@ -409,58 +448,115 @@ export class MemoryObject extends DurableObject<Env> {
     return { text, blocks, notes, version: fnv1a(text) };
   }
 
-  async recall(client: Client, input: RecallInput): Promise<{ items: MemoryItem[]; text: string; tookMs: number; sources: Record<string, number> }> {
+  async recall(client: Client, input: RecallInput): Promise<RecallResult> {
     const userId = this.userId(client);
     const started = Date.now();
     const scopes = input.scopes;
     if (scopes.length === 0) return { items: [], text: "", tookMs: 0, sources: {} };
     const limit = Math.min(Math.max(input.limit ?? 10, 1), 50);
     const budget = input.budgetTokens ?? 2000;
+    const features = input.features ? parseFeatures(input.features) : parseFeatures(this.env.RECALL_FEATURES);
     const marks = scopes.map(() => "?").join(", ");
+    // Sub-queries from the calling agent (other wordings, parts of a question) widen the candidate pool.
+    const queries = [input.query, ...(input.queries ?? [])].map((q) => q.trim()).filter(Boolean).slice(0, 5);
+    const terms = queries.map(keywordTerms);
 
-    const vectorIds = this.vectorSearch(userId, input.query, scopes).catch(() => [] as string[]);
+    // Time window: given by the agent, or (feature "time") read from the query. A window from the
+    // query is a hint: when nothing falls inside it, recall runs without it.
+    let window: RecallWindow | undefined;
+    if (input.from !== undefined || input.to !== undefined) {
+      window = { from: input.from ?? 0, to: input.to ?? Number.MAX_SAFE_INTEGER, source: "agent" };
+    } else if (features.has("time")) {
+      const parsed = parseTimeWindow(input.query, started);
+      if (parsed) window = { from: parsed.from, to: parsed.to, source: "query", text: parsed.text };
+    }
 
-    const match = ftsQuery(input.query);
-    const ftsIds = match
-      ? this.sql
-          .exec(
-            `SELECT items.id AS id FROM items_fts JOIN items ON items.rowid = items_fts.rowid
-             WHERE items_fts MATCH ? AND items.scope IN (${marks}) AND items.status IN ${RECALLABLE}
-             ORDER BY bm25(items_fts) LIMIT 50`,
-            match,
-            ...scopes,
-          )
-          .toArray()
-          .map((r) => String(r.id))
-      : [];
+    const queryVectors = this.embed(queries).catch(() => [] as number[][]);
+    const vectorIds = queryVectors.then((vs) =>
+      Promise.all(vs.map((v) => this.vectorSearch(userId, v, scopes).catch(() => [] as string[]))),
+    );
 
-    const recentIds = this.sql
-      .exec(`SELECT id FROM items WHERE scope IN (${marks}) AND status IN ${RECALLABLE} ORDER BY t_event DESC LIMIT 10`, ...scopes)
-      .toArray()
-      .map((r) => String(r.id));
+    const search = (w: RecallWindow | undefined) => {
+      const time = w ? " AND items.t_event >= ? AND items.t_event < ?" : "";
+      const timeArgs = w ? [w.from, w.to] : [];
+      const fts = queries.map((q) => {
+        const match = ftsQuery(q);
+        return match
+          ? this.sql
+              .exec(
+                `SELECT items.id AS id FROM items_fts JOIN items ON items.rowid = items_fts.rowid
+                 WHERE items_fts MATCH ? AND items.scope IN (${marks}) AND items.status IN ${RECALLABLE}${time}
+                 ORDER BY bm25(items_fts) LIMIT 50`,
+                match,
+                ...scopes,
+                ...timeArgs,
+              )
+              .toArray()
+              .map((r) => String(r.id))
+          : [];
+      });
+      const recent = this.sql
+        .exec(
+          `SELECT id FROM items WHERE scope IN (${marks}) AND status IN ${RECALLABLE}${time.replaceAll("items.", "")} ORDER BY t_event DESC LIMIT 10`,
+          ...scopes,
+          ...timeArgs,
+        )
+        .toArray()
+        .map((r) => String(r.id));
+      return { fts, recent };
+    };
 
-    const vec = await vectorIds;
+    let { fts: ftsLists, recent: recentIds } = search(window);
+    const vecLists = await vectorIds;
+    const qvecs = await queryVectors;
+    // Inside a window the stored embeddings are scored exactly: the vector index
+    // can neither filter by time nor see writes of the last minute or so.
+    let windowVecLists: string[][] = window ? qvecs.map((v) => this.exactSearch(v, scopes, window!)) : [];
+    if (window?.source === "query" && ftsLists.every((l) => l.length === 0) && windowVecLists.every((l) => l.length === 0)) {
+      window = undefined;
+      ({ fts: ftsLists, recent: recentIds } = search(undefined));
+      windowVecLists = [];
+    }
+
     // Superseded or merged memories are replaced by their current version.
     const current = (ids: string[]) => ids.map((id) => this.currentVersion(id));
-    const fused = rrf([current(vec), current(ftsIds), recentIds.slice(0, 5)]);
+    const fused = rrf([...vecLists.map(current), ...windowVecLists.map(current), ...ftsLists.map(current), recentIds.slice(0, 5)]);
     const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 24);
-    if (ranked.length === 0) return { items: [], text: "", tookMs: Date.now() - started, sources: { vector: 0, fts: 0, recent: 0 } };
+    const vectorCount = vecLists.reduce((n, l) => n + l.length, 0) + windowVecLists.reduce((n, l) => n + l.length, 0);
+    const ftsCount = ftsLists.reduce((n, l) => n + l.length, 0);
+    const sources = { vector: vectorCount, fts: ftsCount, recent: recentIds.length };
+    const windowOut = window && { from: iso(window.from), to: window.to >= Number.MAX_SAFE_INTEGER ? null : iso(window.to), source: window.source, ...(window.text ? { text: window.text } : {}) };
+    if (ranked.length === 0) {
+      return { items: [], text: "", tookMs: Date.now() - started, sources, ...(features.has("abstain") ? { abstained: true } : {}), ...(windowOut ? { window: windowOut } : {}) };
+    }
 
     const idMarks = ranked.map(() => "?").join(", ");
+    const time = window ? " AND t_event >= ? AND t_event < ?" : "";
     const rows = new Map(
       this.sql
         .exec(
-          `SELECT * FROM items WHERE id IN (${idMarks}) AND scope IN (${marks}) AND status IN ${RECALLABLE}`,
+          `SELECT * FROM items WHERE id IN (${idMarks}) AND scope IN (${marks}) AND status IN ${RECALLABLE}${time}`,
           ...ranked.map(([id]) => id),
           ...scopes,
+          ...(window ? [window.from, window.to] : []),
         )
         .toArray()
         .map((r) => [String(r.id), toItem(r)] as const),
     );
+    const vecs = this.storedVectors([...rows.keys()]);
     let candidates = ranked.flatMap(([id, s]) => {
       const item = rows.get(id);
-      return item ? [{ ...item, score: s }] : [];
+      if (!item) return [];
+      const vec = vecs.get(id) ?? null;
+      const similarity = vec && qvecs.length ? Math.max(...qvecs.map((q) => cosine(q, vec))) : null;
+      const coverage = Math.max(...terms.map((t) => keywordCoverage(t, item.content)));
+      return [{ ...item, score: s, similarity, coverage, vec }];
     });
+
+    if (features.has("abstain") && shouldAbstain(candidates)) {
+      this.audit(client, "recall", { scopes, results: 0, abstained: true });
+      return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}) };
+    }
 
     const maxRrf = Math.max(...candidates.map((c) => c.score ?? 0), 1e-9);
     if (input.rerank !== false && candidates.length > 1) {
@@ -486,6 +582,7 @@ export class MemoryObject extends DurableObject<Env> {
       }
     }
     candidates.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    if (features.has("diversity")) candidates = diversify(candidates);
 
     const items: MemoryItem[] = [];
     let used = 0;
@@ -494,7 +591,22 @@ export class MemoryObject extends DurableObject<Env> {
       const cost = estimateTokens(c.content) + 12;
       if (used + cost > budget && items.length > 0) continue;
       used += cost;
-      items.push({ ...c, score: Number((c.score ?? 0).toFixed(4)) });
+      const { similarity, coverage, vec: _vec, ...item } = c;
+      items.push({ ...item, score: Number((c.score ?? 0).toFixed(4)), confidence: confidence(similarity, coverage) });
+    }
+
+    if (features.has("evidence")) {
+      const shown = new Set(items.map((i) => i.id));
+      for (const item of items) {
+        if (item.kind !== "note") continue;
+        const ev = this.bestEvidence(item.id, vecs.get(item.id) ?? null, qvecs, shown);
+        if (!ev) continue;
+        const cost = estimateTokens(ev.content) + 8;
+        if (used + cost > budget) continue;
+        used += cost;
+        shown.add(ev.id);
+        item.evidence = ev;
+      }
     }
 
     const now = Date.now();
@@ -509,23 +621,94 @@ export class MemoryObject extends DurableObject<Env> {
     this.audit(client, "recall", { scopes, results: items.length });
 
     const text = items
-      .map((i) => `- [${i.scope} · ${i.kind === "note" ? i.noteKind : "episode"} · ${i.agent}/${i.provider} · ${i.tEvent.slice(0, 10)}] ${i.content}`)
+      .map((i) => {
+        const head = `- [${i.scope} · ${i.kind === "note" ? i.noteKind : "episode"} · ${i.agent}/${i.provider} · ${i.tEvent.slice(0, 10)}] ${i.content}`;
+        return i.evidence ? `${head}\n  source (${i.evidence.tEvent.slice(0, 10)}): ${i.evidence.content}` : head;
+      })
       .join("\n");
-    return { items, text, tookMs: now - started, sources: { vector: vec.length, fts: ftsIds.length, recent: recentIds.length } };
+    return {
+      items,
+      text,
+      tookMs: now - started,
+      sources,
+      ...(features.has("abstain") ? { abstained: false } : {}),
+      ...(windowOut ? { window: windowOut } : {}),
+    };
   }
 
-  private async vectorSearch(userId: string, query: string, scopes: string[]): Promise<string[]> {
-    const emb = await runAi<{ data: number[][] }>(this.env.AI, this.env.EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL, {
-      text: [query],
-    });
-    const vector = emb.data[0];
-    if (!vector) return [];
+  private async vectorSearch(userId: string, vector: number[], scopes: string[]): Promise<string[]> {
     const res = await this.env.VECTORS.query(vector, {
       topK: 50,
       namespace: userId,
       filter: scopes.length === 1 ? { scope: scopes[0]! } : { scope: { $in: scopes } },
     });
     return res.matches.map((m) => m.id);
+  }
+
+  /** Top 50 by exact cosine over the stored embeddings of the items inside a time window. */
+  private exactSearch(vector: number[], scopes: string[], window: { from: number; to: number }): string[] {
+    const rows = this.sql
+      .exec(
+        `SELECT i.id, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id AND e.model = ?
+         WHERE i.scope IN (SELECT value FROM json_each(?)) AND i.status IN ${RECALLABLE} AND i.t_event >= ? AND i.t_event < ?
+         ORDER BY i.t_event DESC LIMIT ?`,
+        this.embeddingModel,
+        JSON.stringify(scopes),
+        window.from,
+        window.to,
+        MAX_CANDIDATES,
+      )
+      .toArray()
+      .map((r) => ({ id: String(r.id), vec: decodeVector(r.vec as ArrayBuffer) }));
+    return nearest(vector, rows, 50, SIMILARITY_FLOOR).map((n) => n.item.id);
+  }
+
+  /** Stored embeddings of the given items (current embedding model only). */
+  private storedVectors(ids: string[]): Map<string, Float32Array> {
+    if (ids.length === 0) return new Map();
+    return new Map(
+      this.sql
+        .exec("SELECT item_id, vec FROM embeddings WHERE model = ? AND item_id IN (SELECT value FROM json_each(?))", this.embeddingModel, JSON.stringify(ids))
+        .toArray()
+        .map((r) => [String(r.item_id), decodeVector(r.vec as ArrayBuffer)] as const),
+    );
+  }
+
+  /**
+   * The excerpt a note was extracted from that best supports it: among the chunks
+   * of its source episodes, the one closest to the note and the query. Falls back
+   * to keyword overlap with the note when embeddings are missing.
+   */
+  private bestEvidence(noteId: string, noteVec: Float32Array | null, qvecs: number[][], skip: Set<string>): RecallEvidence | null {
+    const rows = this.sql
+      .exec(
+        `SELECT c.id, c.content, c.episode_id, c.t_event, e.vec FROM links l
+         JOIN items c ON c.episode_id = l.dst AND c.kind = 'chunk'
+         LEFT JOIN embeddings e ON e.item_id = c.id AND e.model = ?
+         WHERE l.src = ? AND l.kind = 'derived_from' LIMIT 200`,
+        this.embeddingModel,
+        noteId,
+      )
+      .toArray()
+      .filter((r) => !skip.has(String(r.id)));
+    if (rows.length === 0) return null;
+    const note = this.sql.exec("SELECT content FROM items WHERE id = ?", noteId).toArray()[0];
+    const noteTerms = keywordTerms(String(note?.content ?? ""));
+    let best: (typeof rows)[number] | null = null;
+    let bestScore = -Infinity;
+    for (const r of rows) {
+      const vec = r.vec ? decodeVector(r.vec as ArrayBuffer) : null;
+      const score =
+        vec && noteVec
+          ? cosine(noteVec, vec) + (qvecs.length ? Math.max(...qvecs.map((q) => cosine(q, vec))) : 0)
+          : keywordCoverage(noteTerms, String(r.content));
+      if (score > bestScore) {
+        bestScore = score;
+        best = r;
+      }
+    }
+    if (!best) return null;
+    return { id: String(best.id), episodeId: String(best.episode_id), content: String(best.content), tEvent: iso(best.t_event) };
   }
 
   listEpisodes(client: Client, scopes: string[], cursor?: number, limit = 50) {

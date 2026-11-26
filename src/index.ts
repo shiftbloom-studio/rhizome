@@ -8,6 +8,7 @@ import { authenticate, createClient, createKey, createUser, listClients, listKey
 import type { Env } from "./env";
 import { ForbiddenError, NOTE_KINDS, TRUST_LEVELS, type NoteKind, type Trust } from "./memory-object";
 import { can, isValidScope, isValidSlug, recallScopes, type Client, type Grants } from "./scopes";
+import { parseRangeBound } from "./timewindow";
 import { explorer } from "./explorer";
 import { FAVICON, fontCss, fontFile } from "./fonts";
 import { LEGAL_PATHS, legalPage } from "./legal";
@@ -276,12 +277,37 @@ mem.post("/notes", async (c) => {
 
 mem.post("/recall", async (c) => {
   const client = c.get("client");
-  const b = await body<{ query?: string; scopes?: string[]; project?: string; limit?: number; budgetTokens?: number; rerank?: boolean }>(c);
+  const b = await body<{
+    query?: string;
+    scopes?: string[];
+    project?: string;
+    limit?: number;
+    budgetTokens?: number;
+    rerank?: boolean;
+    queries?: unknown;
+    from?: unknown;
+    to?: unknown;
+    features?: unknown;
+  }>(c);
   const query = str(b.query, "query", 2000)?.trim();
   if (!query) throw new HttpError(400, "query is required");
   if (b.project !== undefined && (typeof b.project !== "string" || !isValidSlug(b.project))) throw new HttpError(400, "invalid project");
   if (b.scopes !== undefined && (!Array.isArray(b.scopes) || b.scopes.some((s) => typeof s !== "string" || !isValidScope(s)))) {
     throw new HttpError(400, "scopes must be an array of valid scopes");
+  }
+  if (b.queries !== undefined && (!Array.isArray(b.queries) || b.queries.length > 4 || b.queries.some((q) => typeof q !== "string" || q.length > 500))) {
+    throw new HttpError(400, "queries must be at most 4 strings of up to 500 characters");
+  }
+  if (b.features !== undefined && (!Array.isArray(b.features) || b.features.length > 10 || b.features.some((f) => typeof f !== "string" || f.length > 32))) {
+    throw new HttpError(400, "features must be an array of feature names");
+  }
+  let from: number | undefined;
+  let to: number | undefined;
+  try {
+    from = parseRangeBound(b.from, false);
+    to = parseRangeBound(b.to, true);
+  } catch {
+    throw new HttpError(400, "from and to must be ISO 8601 dates or times");
   }
   const scopes = recallScopes(client, b.scopes, b.project);
   const res = await memory(c).recall(client, {
@@ -290,6 +316,10 @@ mem.post("/recall", async (c) => {
     limit: typeof b.limit === "number" ? b.limit : undefined,
     budgetTokens: typeof b.budgetTokens === "number" ? Math.min(Math.max(b.budgetTokens, 100), 16_000) : undefined,
     rerank: b.rerank,
+    queries: b.queries as string[] | undefined,
+    from,
+    to,
+    features: b.features as string[] | undefined,
   });
   return c.json({ ...res, scopes });
 });

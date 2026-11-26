@@ -9,12 +9,16 @@ import { IMPORT_FORMATS, MAX_IMPORT_CHARS, parseMemoryFile, type ImportFormat } 
 import type { MemoryItem, NoteKind, Trust } from "./memory-object";
 import { NOTE_KINDS } from "./memory-object";
 import { agentScope, can, isValidSlug, recallScopes, type Client } from "./scopes";
+import { parseRangeBound } from "./timewindow";
 
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 /** The part of the MemoryObject the MCP tools use. A Durable Object stub fits. */
 export interface MemoryApi {
-  recall(client: Client, input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number }): Promise<{ items: MemoryItem[] }>;
+  recall(
+    client: Client,
+    input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number },
+  ): Promise<{ items: MemoryItem[] }>;
   context(client: Client, scopes: string[], budgetTokens?: number): Promise<{ text: string }> | { text: string };
   addNote(client: Client, input: { scope: string; content: string; kind?: NoteKind; trust?: Trust }): Promise<{ id: string }>;
   addEpisode(client: Client, input: { scope: string; sessionId?: string; model?: string; messages?: { role: string; content: string }[]; text?: string }): Promise<{ id: string; chunks: number }>;
@@ -69,6 +73,14 @@ export const TOOLS = [
         query: { type: "string", description: "What you want to know, in plain words." },
         project: projectProp,
         limit: { type: "integer", minimum: 1, maximum: 20, default: 8 },
+        queries: {
+          type: "array",
+          items: { type: "string", maxLength: 500 },
+          maxItems: 4,
+          description: "Optional: other wordings or the separate parts of a question with several parts. Each one is searched too.",
+        },
+        from: { type: "string", description: "Optional: only memories from this date or time on (ISO 8601, e.g. 2026-11-01)." },
+        to: { type: "string", description: "Optional: only memories up to this date or time (ISO 8601; a date includes that whole day)." },
       },
       required: ["query"],
       additionalProperties: false,
@@ -181,7 +193,15 @@ function writeScope(client: Client, scope: unknown, proj: string | undefined): s
 function line(i: MemoryItem): string {
   const what = i.kind === "note" ? i.noteKind : "conversation";
   const flag = i.status === "disputed" ? " · disputed" : "";
-  return `- [${i.id}] (${i.scope} · ${what} · ${i.trust} · ${i.agent} · ${i.tEvent.slice(0, 10)}${flag}) ${i.content}`;
+  const head = `- [${i.id}] (${i.scope} · ${what} · ${i.trust} · ${i.agent} · ${i.tEvent.slice(0, 10)}${flag}) ${i.content}`;
+  return i.evidence ? `${head}\n  source (${i.evidence.tEvent.slice(0, 10)}): ${i.evidence.content}` : head;
+}
+
+function subQueries(v: unknown): string[] {
+  if (!Array.isArray(v) || v.length > 4 || v.some((q) => typeof q !== "string" || q.length > 500)) {
+    throw new ToolError("queries must be at most 4 strings of up to 500 characters");
+  }
+  return (v as string[]).map((q) => q.trim()).filter(Boolean);
 }
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: Record<string, unknown> };
@@ -205,10 +225,29 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       // Recall sees the profile, this agent's own notes and the project. Without a
       // project it also looks into every project the client may read.
       const scopes = proj ? recallScopes(client, undefined, proj) : await readableScopes(memory, client);
-      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000 });
+      const queries = args.queries === undefined ? undefined : subQueries(args.queries);
+      let from: number | undefined;
+      let to: number | undefined;
+      try {
+        from = parseRangeBound(args.from, false);
+        to = parseRangeBound(args.to, true);
+      } catch {
+        throw new ToolError("from and to must be ISO 8601 dates or times, e.g. 2026-11-01");
+      }
+      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to });
       if (!res.items.length) return text("No matching memories.");
       return text(res.items.map(line).join("\n"), {
-        results: res.items.map((i) => ({ id: i.id, scope: i.scope, kind: i.kind, content: i.content, trust: i.trust, status: i.status, date: i.tEvent })),
+        results: res.items.map((i) => ({
+          id: i.id,
+          scope: i.scope,
+          kind: i.kind,
+          content: i.content,
+          trust: i.trust,
+          status: i.status,
+          date: i.tEvent,
+          ...(i.confidence !== undefined ? { confidence: i.confidence } : {}),
+          ...(i.evidence ? { evidence: { id: i.evidence.id, content: i.evidence.content, date: i.evidence.tEvent } } : {}),
+        })),
       });
     }
     case "remember": {
