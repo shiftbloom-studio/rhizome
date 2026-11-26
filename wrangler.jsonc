@@ -40,7 +40,9 @@
     "DISPUTE_RESOLUTION": "on",
     // Anonymous MCP usage analytics to PostHog, off unless MCP_ANALYTICS is "on" (see README).
     "MCP_ANALYTICS": "<MCP_ANALYTICS?>",
-    "POSTHOG_HOST": "<POSTHOG_HOST?>"
+    "POSTHOG_HOST": "<POSTHOG_HOST?>",
+    // Feature flags from PostHog, off unless POSTHOG_FLAGS is "on" (src/flags.ts).
+    "POSTHOG_FLAGS": "<POSTHOG_FLAGS?>"
   },
   "ai": { "binding": "AI" },
   "durable_objects": { "bindings": [{ "name": "MEMORY", "class_name": "MemoryObject" }] },
