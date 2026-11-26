@@ -18,7 +18,9 @@ import {
   BenchMemory,
   BenchWorkflow,
   DATA_PREFIX,
+  EmbeddingCache,
   TrackedVectors,
+  embeddingCacheKey,
   pacedAi,
   questionKey,
   runSettings,
@@ -26,7 +28,7 @@ import {
   type RunOutput,
   type RunParams,
 } from "../bench/worker";
-import { runAi } from "../src/env";
+import { DEFAULT_EMBEDDING_MODEL, runAi } from "../src/env";
 import { LocalBucket } from "../src/node/blobs";
 import { LocalNamespace } from "../src/node/durable";
 import { LocalVectorIndex } from "../src/node/vectors";
@@ -191,8 +193,10 @@ describe("run params", () => {
       paidRpm: 15,
       baseline: null,
       vars: { RECALL_FEATURES: "all", CHUNKING: "rounds" },
+      embeddingCache: true,
     });
     expect(runSettings({ extraction: true }, env).concurrency).toBe(4);
+    expect(runSettings({ embeddingCache: false }, env).embeddingCache).toBe(false);
   });
 
   it("take recall steps, chunking, a selection and memory variables", () => {
@@ -214,6 +218,7 @@ describe("run params", () => {
     expect(() => runSettings({ asOf: "yes" }, env)).toThrow(/asOf/);
     expect(() => runSettings({ baseline: "../other" }, env)).toThrow(/baseline/);
     expect(() => runSettings({ reader: "gpt 4o" }, env)).toThrow(/reader must be an OpenAI model id/);
+    expect(() => runSettings({ embeddingCache: "off" }, env)).toThrow(/embeddingCache/);
   });
 
   it("take a reader for LongMemEval's own evaluation", () => {
@@ -258,6 +263,48 @@ describe("Workers AI", () => {
     expect(calls.filter((c) => c === "@cf/broken/model")).toHaveLength(1);
     await runAi(paced, "@cf/deepseek/deepseek-v4-flash", {});
     expect(reserved).toEqual(["@cf/deepseek/deepseek-v4-flash"]);
+  });
+
+  it("answers a question's embeddings from its cache on the next run", async () => {
+    const objects = new Map<string, string>();
+    const bucket = {
+      get: async (k: string) => (objects.has(k) ? { json: async () => JSON.parse(objects.get(k)!) } : null),
+      put: async (k: string, v: string) => void objects.set(k, v),
+    } as unknown as R2Bucket;
+    const sent: string[][] = [];
+    const ai = {
+      async run(model: string, input: { text?: string[] }) {
+        if (input.text) {
+          sent.push(input.text);
+          return { data: input.text.map((t) => [t.length + 0.1, 1 / 3]) };
+        }
+        return { model };
+      },
+    } as unknown as Ai;
+    const model = "@cf/baai/bge-m3";
+    const key = embeddingCacheKey(questionKey("q 1"), model);
+    expect(key).toBe("cache/embeddings/%40cf%2Fbaai%2Fbge-m3/q%25201.json");
+
+    const first = new EmbeddingCache(bucket, key, model);
+    await first.load();
+    const a = (await runAi(first.wrap(ai), model, { text: ["one", "two", "one"] })) as { data: number[][] };
+    expect(sent).toEqual([["one", "two"]]);
+    expect(a.data).toEqual([[Math.fround(3.1), Math.fround(1 / 3)], [Math.fround(3.1), Math.fround(1 / 3)], [Math.fround(3.1), Math.fround(1 / 3)]]);
+    // Other models and inputs pass through untouched.
+    expect(await runAi(first.wrap(ai), "@cf/baai/bge-reranker-base", { query: "q", contexts: [] })).toEqual({ model: "@cf/baai/bge-reranker-base" });
+    await first.save();
+
+    const next = new EmbeddingCache(bucket, key, model);
+    await next.load();
+    const b = (await runAi(next.wrap(ai), model, { text: ["two", "one", "three"] })) as { data: number[][] };
+    expect(sent).toEqual([["one", "two"], ["three"]]);
+    expect(b.data[1]).toEqual(a.data[0]);
+    expect([next.hits, next.misses]).toEqual([2, 1]);
+    // A cache of another model is ignored.
+    const other = new EmbeddingCache(bucket, key, "@cf/other/model");
+    await other.load();
+    await runAi(other.wrap(ai), "@cf/other/model", { text: ["one"] });
+    expect(sent.at(-1)).toEqual(["one"]);
   });
 });
 
@@ -358,6 +405,8 @@ describe("benchmark Worker", () => {
       expect(config.settings).toMatchObject({ dataset: index.sha256, features: [], chunking: "fixed", asOf: false, vars: { RECALL_FEATURES: "all", CHUNKING: "rounds" } });
       expect(parseResults(await text(env, "runs/base/results.jsonl")).map((r) => r.id)).toEqual(["c1", "c2", "c3_abs"]);
       expect(await text(env, "runs/base/summary.md")).toContain("run base");
+      // The questions' embeddings stay for the next run.
+      expect(await env.BENCH.get(embeddingCacheKey(questionKey("c1"), DEFAULT_EMBEDDING_MODEL))).not.toBeNull();
 
       // Nothing of the questions is left: no vectors, no raw episodes.
       const db = new DatabaseSync(join(dir, "vectors.sqlite"));

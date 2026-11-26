@@ -51,9 +51,10 @@ Abstention questions (ids ending in `_abs`) have no evidence and get no retrieva
 | `recall_all@k` | All evidence sessions are among the first k. |
 | `ndcg_any@k` | nDCG over the same session ranking, with LongMemEval's weights. |
 | `turn_recall@k` | Share of the evidence turns that the first k items cover (half of the turn, or 300 characters of it). |
-| `delivered_*` | The same for what a default recall hands an agent: limit 10, a 2,000-token budget. `delivered_tokens` is its size. |
+| `delivered_*` | The same for what a default recall hands an agent: limit 10, a 2,000-token budget. `delivered_tokens` is its size. `delivered_turns_all`: every evidence turn is there. |
+| `reader_*` | The same for what the recall tool hands an agent (8 items, 4,000 tokens), which is what the reader answers from. Runs with a reader only. |
 
-The ranking comes from a recall with limit 50, which today returns at most 24 items after reranking. A note counts for the sessions it was extracted from. When the `abstain` step returns nothing for an answerable question, every score of that question is a miss, as it would be for an agent.
+The ranking comes from a recall with limit 50 that asks for plain excerpts (`cards: false`), which today returns at most 24 items after reranking. A turn card counts for the turns it shows; a part of a reply counts for the whole reply. A note counts for the sessions it was extracted from. When the `abstain` step returns nothing for an answerable question, every score of that question is a miss, as it would be for an agent.
 
 ## Compare two runs
 
@@ -110,6 +111,7 @@ The first run copies LongMemEval-S from Hugging Face into the bucket (`data/`), 
 | `paidRpm` | Requests a minute to each paid model, for all questions together. Default 15: the account allows 20, and the deployed rhizome needs some of them. |
 | `baseline` | The id of an earlier run, compared with this one in `comparison.md`. |
 | `reader` | An OpenAI model, e.g. `"gpt-4o-2024-08-06"`: LongMemEval's own evaluation, see below. Needs the Worker secret `OPENAI_API_KEY`. |
+| `embeddingCache` | Default `true`: every question's embeddings are kept in the bucket under `cache/embeddings/` and reused, so a rerun embeds only texts it has not seen. A full run fills about 1 GB. `false` embeds everything again. |
 
 The instance's output is the summary. The files go to `runs/<id>/` in the bucket: `config.json`, `results.jsonl`, `summary.json`, `summary.md` and, with `baseline`, `comparison.md`.
 

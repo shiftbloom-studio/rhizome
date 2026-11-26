@@ -56,7 +56,7 @@ export interface Env {
   EXTRACTION?: string;
   /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: on (unset follows the PostHog flag, src/flags.ts); "off" turns it off. */
   STANDING_ORDERS?: string;
-  /** Optional recall steps that are on by default, comma separated: abstain, diversity, evidence, time, or "all". Default: none. */
+  /** Recall steps, comma separated: abstain, diversity, evidence, time, keys, turns, "all" or "none". Default: all. */
   RECALL_FEATURES?: string;
   /** How conversations are cut for search: "fixed" (1,200 characters, default) or "rounds" (one question and its answers). */
   CHUNKING?: string;

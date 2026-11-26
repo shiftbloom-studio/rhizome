@@ -14,7 +14,27 @@ import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
 import { DUE_SHOWN, dueSection, isLoopId, isValidDue, LOOP_PREFIX, loopsEnabled, MAX_OPEN_LOOPS, type DueLoop } from "./loops";
-import { assignFactKeys, confidence, diversify, keywordCoverage, keywordTerms, parseFeatures, shouldAbstain, SIMILARITY_FLOOR } from "./recall";
+import {
+  assignFactKeys,
+  CARD_EPISODES,
+  confidence,
+  diversify,
+  fillCards,
+  cardCost,
+  joinExcerpts,
+  keywordCoverage,
+  keywordTerms,
+  MAX_CARD_UNITS,
+  parseFeatures,
+  shouldAbstain,
+  shareUnits,
+  SIMILARITY_FLOOR,
+  splitTurns,
+  turnUnits,
+  unitPriority,
+  unitScore,
+  type CardUnit,
+} from "./recall";
 import { parseTimeWindow } from "./timewindow";
 import {
   DEFAULT_EXTRACTION_MODEL,
@@ -94,8 +114,13 @@ export interface RecallInput {
   /** Time window supplied by the calling agent, epoch milliseconds (from inclusive, to exclusive). */
   from?: number;
   to?: number;
-  /** Optional recall steps for this request (see RECALL_FEATURES). Default: the RECALL_FEATURES variable. */
+  /** Recall steps for this request (see RECALL_FEATURES). Default: the RECALL_FEATURES variable, or all steps without it. */
   features?: string[];
+  /**
+   * With the turns step: false returns plain excerpts, ranked, instead of turn
+   * cards (for callers that score the ranking itself, such as the benchmark).
+   */
+  cards?: boolean;
   /** Time that words like "last week" are read against (epoch milliseconds). Default: now. */
   referenceTime?: number;
   /**
@@ -170,6 +195,11 @@ export interface MemoryItem {
   confidence?: number;
   /** Recall only (evidence step): the source excerpt this note was extracted from. */
   evidence?: RecallEvidence;
+  /**
+   * Recall only (turns step): this item is a turn card, and these are the turns
+   * of the conversation it shows, in order. `content` joins them by line breaks.
+   */
+  parts?: string[];
 }
 
 export interface GraphNode {
@@ -609,7 +639,7 @@ export class MemoryObject extends DurableObject<Env> {
     const notices = { ...(gate.notices.length || second?.notices.length ? { notices: [...gate.notices, ...(second?.notices ?? [])] } : {}), ...told };
     const limit = Math.min(Math.max(input.limit ?? 10, 1), 50);
     const budget = input.budgetTokens ?? 2000;
-    const features = input.features ? parseFeatures(input.features) : parseFeatures(this.env.RECALL_FEATURES);
+    const features = parseFeatures(input.features ?? this.env.RECALL_FEATURES);
     const marks = scopes.map(() => "?").join(", ");
     // Sub-queries from the calling agent (other wordings, parts of a question) widen the candidate pool.
     const queries = [input.query, ...(input.queries ?? [])].map((q) => q.trim()).filter(Boolean).slice(0, 5);
@@ -700,7 +730,7 @@ export class MemoryObject extends DurableObject<Env> {
     const asOfOut = asOf !== undefined ? { asOf: iso(asOf) } : {};
     const windowOut = window && { from: iso(window.from), to: window.to >= Number.MAX_SAFE_INTEGER ? null : iso(window.to), source: window.source, ...(window.text ? { text: window.text } : {}) };
     if (ranked.length === 0) {
-      return { items: [], text: "", tookMs: Date.now() - started, sources, ...(features.has("abstain") ? { abstained: true } : {}), ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...told };
+      return { items: [], text: "", tookMs: Date.now() - started, sources, ...(features.has("abstain") ? { abstained: true } : {}), ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...notices };
     }
 
     const idMarks = ranked.map(() => "?").join(", ");
@@ -728,7 +758,7 @@ export class MemoryObject extends DurableObject<Env> {
 
     if (features.has("abstain") && shouldAbstain(candidates)) {
       this.audit(client, "recall", { scopes, results: 0, abstained: true });
-      return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...told };
+      return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...notices };
     }
 
     const maxRrf = Math.max(...candidates.map((c) => c.score ?? 0), 1e-9);
@@ -757,15 +787,23 @@ export class MemoryObject extends DurableObject<Env> {
     candidates.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
     if (features.has("diversity")) candidates = diversify(candidates);
 
-    const items: MemoryItem[] = [];
-    let used = 0;
-    for (const c of candidates) {
-      if (items.length >= limit) break;
-      const cost = estimateTokens(c.content) + 12;
-      if (used + cost > budget && items.length > 0) continue;
-      used += cost;
-      const { similarity, coverage, vec: _vec, ...item } = c;
-      items.push({ ...item, score: Number((c.score ?? 0).toFixed(4)), confidence: confidence(similarity, coverage) });
+    // Feature "turns": the turns of the best conversations compete for the budget.
+    // Without the reranker, or when it fails, recall hands out the excerpts as before.
+    const cards =
+      features.has("turns") && input.cards !== false && input.rerank !== false
+        ? await this.turnCards(input.query, candidates, terms, scopes, window, asOf, budget, limit).catch(() => null)
+        : null;
+    const items: MemoryItem[] = cards?.items ?? [];
+    let used = cards?.used ?? 0;
+    if (!cards) {
+      for (const c of candidates) {
+        if (items.length >= limit) break;
+        const cost = estimateTokens(c.content) + 12;
+        if (used + cost > budget && items.length > 0) continue;
+        used += cost;
+        const { similarity, coverage, vec: _vec, ...item } = c;
+        items.push({ ...item, score: Number((c.score ?? 0).toFixed(4)), confidence: confidence(similarity, coverage) });
+      }
     }
 
     if (features.has("evidence")) {
@@ -781,6 +819,8 @@ export class MemoryObject extends DurableObject<Env> {
         item.evidence = ev;
       }
     }
+    // Turn cards come in the order things happened, so a later update follows what it changes.
+    if (cards) items.sort((a, b) => a.tEvent.localeCompare(b.tEvent));
 
     const now = Date.now();
     if (items.length) {
@@ -825,6 +865,97 @@ export class MemoryObject extends DurableObject<Env> {
       ...asOfOut,
       ...notices,
     };
+  }
+
+  /**
+   * Turn cards (recall step "turns"). The conversations of the best excerpts
+   * (CARD_EPISODES, by their best excerpt) are rebuilt from their stored excerpts
+   * and split into turns; turns and the notes among the candidates are scored in
+   * one reranker call (0.7 reranker, 0.3 keyword coverage) and the best fill the
+   * budget, without a cap per conversation. Each conversation becomes one card
+   * with its picked turns in order; a card carries the id and date of the
+   * conversation's best excerpt. Returns null when there is nothing to build
+   * cards from, so recall falls back to plain excerpts.
+   */
+  private async turnCards(
+    query: string,
+    candidates: (MemoryItem & { similarity: number | null; coverage: number })[],
+    terms: string[][],
+    scopes: string[],
+    window: RecallWindow | undefined,
+    asOf: number | undefined,
+    budget: number,
+    limit: number,
+  ): Promise<{ items: MemoryItem[]; used: number } | null> {
+    const lead = new Map<string, (typeof candidates)[number]>();
+    for (const c of candidates) if (c.kind === "chunk" && c.episodeId && !lead.has(c.episodeId)) lead.set(c.episodeId, c);
+    if (lead.size === 0) return null;
+    const episodes = [...lead.keys()].slice(0, CARD_EPISODES);
+    const marks = scopes.map(() => "?").join(", ");
+    const cond = recallCondition("items", window, asOf);
+    const excerpts = new Map<string, string[]>();
+    for (const r of this.sql
+      .exec(
+        `SELECT episode_id, content FROM items WHERE kind = 'chunk' AND episode_id IN (${episodes.map(() => "?").join(", ")})
+         AND scope IN (${marks}) AND ${cond.sql} ORDER BY rowid`,
+        ...episodes,
+        ...scopes,
+        ...cond.args,
+      )
+      .toArray()) {
+      const key = String(r.episode_id);
+      excerpts.set(key, [...(excerpts.get(key) ?? []), String(r.content)]);
+    }
+
+    // Notes keep their place; the conversations share the rest of the reranker call,
+    // so one very long conversation cannot crowd out the others or the notes.
+    const notes = new Map(candidates.filter((c) => c.kind === "note").map((c) => [c.id, c] as const));
+    const noteUnits: CardUnit[] = [...notes.values()].slice(0, MAX_CARD_UNITS).map((n) => ({ key: n.id, order: 0, text: n.content, rank: n.content }));
+    const groups = episodes.map((ep) => {
+      const parts = excerpts.get(ep) ?? [];
+      const turns = splitTurns(joinExcerpts(parts));
+      // Text without turns (an episode saved as plain text): its excerpts are the units.
+      return turns.length ? turnUnits(ep, turns, terms) : parts.map((p, i) => ({ key: ep, order: i, text: p, rank: p }));
+    });
+    const units = [
+      ...shareUnits(groups, MAX_CARD_UNITS - noteUnits.length, (u, i) => unitPriority(u, lead.get(episodes[i]!)!.content, terms)),
+      ...noteUnits,
+    ];
+    if (units.length === 0) return null;
+
+    const res = await runAi<{ response?: { id: number; score: number }[] }>(this.env.AI, this.env.RERANK_MODEL ?? DEFAULT_RERANK_MODEL, {
+      query,
+      contexts: units.map((u) => ({ text: u.rank.slice(0, 2000) })),
+    });
+    const rerank = new Map((res.response ?? []).map((r) => [r.id, r.score]));
+    const maxRerank = Math.max(...rerank.values(), 1e-9);
+    const scored = units.map((u, i) => ({
+      ...u,
+      score: unitScore(rerank.get(i) ?? 0, maxRerank, terms, u.text) - (notes.get(u.key)?.status === "disputed" ? 0.1 : 0),
+    }));
+    const picked = fillCards(scored, budget, limit);
+
+    const byKey = new Map<string, typeof picked>();
+    for (const u of picked) byKey.set(u.key, [...(byKey.get(u.key) ?? []), u]);
+    const items: MemoryItem[] = [];
+    let used = 0;
+    for (const [key, list] of byKey) {
+      const best = list[0]!.score;
+      const note = notes.get(key);
+      if (note) {
+        const { similarity, coverage, vec: _vec, ...item } = note as typeof note & { vec?: unknown };
+        used += cardCost(note.content, true);
+        items.push({ ...item, score: Number(best.toFixed(4)), confidence: confidence(similarity, coverage) });
+        continue;
+      }
+      const base = lead.get(key)!;
+      const parts = [...list].sort((a, b) => a.order - b.order).map((u) => u.text);
+      used += parts.reduce((n, p, i) => n + cardCost(p, i === 0), 0);
+      const { similarity, coverage: _coverage, vec: _vec, ...item } = base as typeof base & { vec?: unknown };
+      const cover = Math.max(...terms.map((t) => keywordCoverage(t, parts.join("\n"))));
+      items.push({ ...item, content: parts.join("\n"), parts, score: Number(best.toFixed(4)), confidence: confidence(similarity, cover) });
+    }
+    return { items, used };
   }
 
   private async vectorSearch(userId: string, vector: number[], scopes: string[]): Promise<string[]> {

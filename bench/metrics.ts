@@ -8,7 +8,9 @@
 // (all of them) and ndcg_any@k.
 // Turn level: the share of evidence turns that the first k items cover.
 // Delivered: the same scores for what a default recall hands an agent
-// (limit 10, 2,000-token budget), which is what an answer gets built from.
+// (limit 10, 2,000-token budget). Reader: the same for what the recall tool
+// hands an agent (limit 8, 4,000 tokens), which is what the official
+// evaluation's reader answers from; runs with a reader only.
 
 export const SESSION_KS = [1, 3, 5, 10] as const;
 export const TURN_KS = [5, 10] as const;
@@ -57,8 +59,8 @@ export function turnCoverage(items: ItemRef[], turns: Set<string>, k = items.len
   return covered.size / turns.size;
 }
 
-/** All scores of one question: the deep ranking (recall with limit 50) and what a default recall delivered. */
-export function scoreQuestion(ranked: ItemRef[], delivered: ItemRef[], evidence: Evidence): Record<string, number> {
+/** All scores of one question: the deep ranking (recall with limit 50), what a default recall delivered and what the reader got. */
+export function scoreQuestion(ranked: ItemRef[], delivered: ItemRef[], evidence: Evidence, reader?: ItemRef[]): Record<string, number> {
   const out: Record<string, number> = {};
   const order = sessionOrder(ranked);
   for (const k of SESSION_KS) {
@@ -71,11 +73,21 @@ export function scoreQuestion(ranked: ItemRef[], delivered: ItemRef[], evidence:
     const t = turnCoverage(ranked, evidence.turns, k);
     if (t !== undefined) out[`turn_recall@${k}`] = t;
   }
-  const got = new Set(sessionOrder(delivered));
-  out.delivered_any = [...evidence.sessions].some((s) => got.has(s)) ? 1 : 0;
-  out.delivered_all = evidence.sessions.size > 0 && [...evidence.sessions].every((s) => got.has(s)) ? 1 : 0;
-  const t = turnCoverage(delivered, evidence.turns);
-  if (t !== undefined) out.delivered_turns = t;
+  const views: [string, ItemRef[] | undefined][] = [
+    ["delivered", delivered],
+    ["reader", reader],
+  ];
+  for (const [name, items] of views) {
+    if (!items) continue;
+    const got = new Set(sessionOrder(items));
+    out[`${name}_any`] = [...evidence.sessions].some((s) => got.has(s)) ? 1 : 0;
+    out[`${name}_all`] = evidence.sessions.size > 0 && [...evidence.sessions].every((s) => got.has(s)) ? 1 : 0;
+    const t = turnCoverage(items, evidence.turns);
+    if (t === undefined) continue;
+    out[`${name}_turns`] = t;
+    // Every evidence turn there: what an answer needs when it is spread over several turns.
+    out[`${name}_turns_all`] = t === 1 ? 1 : 0;
+  }
   return out;
 }
 
@@ -200,11 +212,17 @@ const HEADLINE: [string, string][] = [
   ["delivered_any", "Default recall delivers an evidence session"],
   ["delivered_all", "Default recall delivers all evidence sessions"],
   ["delivered_turns", "Evidence turns in the default recall"],
+  ["delivered_turns_all", "Default recall delivers every evidence turn"],
   ["delivered_tokens", "Tokens in the default recall"],
+  ["reader_any", "Recall tool delivers an evidence session"],
+  ["reader_all", "Recall tool delivers all evidence sessions"],
+  ["reader_turns", "Evidence turns in the recall tool's answer"],
+  ["reader_turns_all", "Recall tool delivers every evidence turn"],
+  ["reader_tokens", "Tokens in the recall tool's answer"],
 ];
 
 /** Counts are shown as they are, rates in percent. */
-const isCount = (metric: string) => metric === "delivered_tokens" || metric === "delivered_items";
+const isCount = (metric: string) => /^(delivered|reader)_(tokens|items)$/.test(metric);
 
 function fmt(metric: string, v: number | undefined): string {
   if (v === undefined || Number.isNaN(v)) return "–";
@@ -264,7 +282,7 @@ export function mcnemar(b: number, c: number): number {
   return Math.min(1, 2 * tail);
 }
 
-const BINARY = /^(recall_any|recall_all)@\d+$|^delivered_(any|all)$/;
+const BINARY = /^(recall_any|recall_all)@\d+$|^(delivered|reader)_(any|all|turns_all)$/;
 
 export interface MetricComparison {
   metric: string;

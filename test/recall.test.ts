@@ -3,7 +3,24 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { EXTRACTION_PROMPT } from "../src/intel";
 import { MemoryObject } from "../src/memory-object";
-import { assignFactKeys, confidence, diversify, keywordCoverage, keywordTerms, parseFeatures, shouldAbstain } from "../src/recall";
+import {
+  assignFactKeys,
+  confidence,
+  diversify,
+  fillCards,
+  joinExcerpts,
+  keywordCoverage,
+  keywordTerms,
+  parseFeatures,
+  sentenceWindows,
+  shareUnits,
+  shouldAbstain,
+  splitTurns,
+  turnUnits,
+  unitPriority,
+  wideWindow,
+} from "../src/recall";
+import { chunk, roundChunks, transcript } from "../src/text";
 import type { Client } from "../src/scopes";
 import { fakeEnv, fakeState } from "./support/fake-do";
 
@@ -25,8 +42,13 @@ describe("recall helpers", () => {
 
   it("parses feature lists", () => {
     expect([...parseFeatures("abstain, diversity,unknown")]).toEqual(["abstain", "diversity"]);
-    expect(parseFeatures("all").size).toBe(5);
-    expect(parseFeatures(undefined).size).toBe(0);
+    expect(parseFeatures("all").size).toBe(6);
+    // Unset means every step; "none" or an empty list turns them all off.
+    expect(parseFeatures(undefined).size).toBe(6);
+    expect(parseFeatures(null).size).toBe(6);
+    expect(parseFeatures("none").size).toBe(0);
+    expect(parseFeatures("").size).toBe(0);
+    expect(parseFeatures([]).size).toBe(0);
     expect([...parseFeatures(["evidence"])]).toEqual(["evidence"]);
   });
 
@@ -67,6 +89,98 @@ describe("recall helpers", () => {
     ]);
     // n1 repeats c1, so the unrelated n3 overtakes it.
     expect(out.map((c) => c.id)).toEqual(["c1", "n2", "n3", "n1"]);
+  });
+
+  it("rebuilds a conversation from its excerpts", () => {
+    const messages = [
+      { role: "user", content: "Short question about the garden?" },
+      { role: "assistant", content: "Plant tomatoes in May. ".repeat(80).trim() },
+      { role: "user", content: "And the roses?" },
+      { role: "assistant", content: "Roses like sun.\n\nWater them twice a week. ".repeat(40).trim() },
+    ];
+    const parts = roundChunks(messages);
+    expect(parts.length).toBeGreaterThan(3);
+    expect(joinExcerpts(parts)).toBe(transcript(messages));
+    expect(joinExcerpts(chunk("word ".repeat(700).trim()))).toBe("word ".repeat(700).trim());
+    // Excerpts that do not overlap, e.g. after one was forgotten, are joined by a line break.
+    expect(joinExcerpts(["[user] first round", "", "[user] third round"])).toBe("[user] first round\n[user] third round");
+  });
+
+  it("splits a transcript into turns", () => {
+    const text = transcript([
+      { role: "user", content: "line one\nline two" },
+      { role: "assistant", content: "[x] a checkbox, not a turn" },
+    ]);
+    expect(splitTurns(text)).toEqual([
+      { role: "user", content: "line one\nline two" },
+      { role: "assistant", content: "[x] a checkbox, not a turn" },
+    ]);
+    expect(splitTurns("…the end of a turn whose start was forgotten\n[user] next")).toEqual([
+      { role: "text", content: "…the end of a turn whose start was forgotten" },
+      { role: "user", content: "next" },
+    ]);
+    expect(splitTurns("plain text without turns")).toEqual([]);
+    expect(sentenceWindows("One. Two! Three?\n- four\n- five")).toEqual(["One. Two!", "Three? - four", "- five"]);
+  });
+
+  it("makes a unit of every user turn and of the best window of every reply", () => {
+    const turns = [
+      { role: "user", content: "I adopted a cat named Miso." },
+      { role: "assistant", content: "Congratulations! Cats are great. Miso is a lovely name. Do you need feeding tips?" },
+      { role: "user", content: "x".repeat(3100) },
+    ];
+    const units = turnUnits("e1", turns, [keywordTerms("my cat Miso")]);
+    expect(units.map((u) => [u.key, u.order, u.text])).toEqual([
+      ["e1", 0, "[user] I adopted a cat named Miso."],
+      ["e1", 1001, "[assistant] … Miso is a lovely name. Do you need feeding tips?"],
+      ["e1", 2000, `[user] ${"x".repeat(1500)} …`],
+      ["e1", 2001, `[user] … ${"x".repeat(1500)} …`],
+      ["e1", 2002, `[user] … ${"x".repeat(300)}`],
+    ]);
+    // The reranker also reads the start of the reply to a user turn.
+    expect(units[0]!.rank).toBe("[user] I adopted a cat named Miso. [assistant] Congratulations! Cats are great. Miso is a lovely name. Do you need feeding tips?");
+    expect(units[1]!.rank).toBe(units[1]!.text);
+  });
+
+  it("shares the reranker's room among conversations, so a long one cannot crowd out the rest", () => {
+    const groups = [Array.from({ length: 300 }, (_, i) => `a${i}`), ["b0", "b1"], Array.from({ length: 50 }, (_, i) => `c${i}`)];
+    const prio = (u: string) => (u === "a299" ? 1 : 0);
+    const out = shareUnits(groups, 100, prio);
+    expect(out).toHaveLength(100);
+    expect(out.filter((u) => u.startsWith("b"))).toEqual(["b0", "b1"]);
+    expect(out.filter((u) => u.startsWith("c"))).toHaveLength(49);
+    // The long conversation keeps its best unit, and what it keeps stays in order.
+    const a = out.filter((u) => u.startsWith("a"));
+    expect(a).toHaveLength(49);
+    expect(a.at(-1)).toBe("a299");
+    expect(a.slice(0, 3)).toEqual(["a0", "a1", "a2"]);
+    // With room for everything, nothing is cut.
+    expect(shareUnits(groups, 1000, prio)).toHaveLength(352);
+    expect(unitPriority({ text: "[user] I adopted a cat." }, "[user] I adopted a cat.\n[assistant] Nice.", [["cat"]])).toBe(2);
+  });
+
+  it("fills the budget with the best units, without a cap per card", () => {
+    const u = (key: string, score: number, chars = 40) => ({ key, score, text: "x".repeat(chars) });
+    const units = [u("a", 0.9), u("a", 0.8), u("a", 0.7), u("b", 0.6), u("c", 0.5), u("d", 0.85, 4000)];
+    // d is too long for the budget, so it is passed over; a brings all three of its units.
+    expect(fillCards(units, 80, 8).map((x) => [x.key, x.score])).toEqual([["a", 0.9], ["a", 0.8], ["a", 0.7], ["b", 0.6]]);
+    expect(fillCards(units, 1000, 2).map((x) => x.key)).toEqual(["a", "a", "a", "b"]);
+    // The first unit always comes, even over the budget.
+    expect(fillCards(units, 10, 8).map((x) => x.key)).toEqual(["a"]);
+    // The best three units show their wider text when it fits.
+    const wide = [1, 0.9, 0.8, 0.7].map((score, i) => ({ key: `k${i}`, score, text: "short", wide: "w".repeat(400) }));
+    expect(fillCards(wide, 1000, 8).map((x) => x.text.length)).toEqual([400, 400, 400, 5]);
+    // Wider text only where it fits: the second one would not, so it shows its short text.
+    expect(fillCards(wide, 150, 8).map((x) => x.text.length)).toEqual([400, 5, 5]);
+  });
+
+  it("widens a window of a reply with the sentences that follow it", () => {
+    const reply = "Here are options.\n1. First idea.\n2. Second idea.\n3. Third idea.\n4. Fourth idea.";
+    expect(wideWindow(reply, 0)).toEqual({ text: "Here are options. 1. First idea. 2. Second idea. 3. Third idea. 4. Fourth idea.", last: true });
+    expect(wideWindow(reply, 0, 50)).toEqual({ text: "Here are options. 1. First idea. 2. Second idea.", last: false });
+    const units = turnUnits("e", [{ role: "assistant", content: reply }], [keywordTerms("options")]);
+    expect(units[0]!.text).toBe("[assistant] Here are options. 1. First idea. …");
+    expect(units[0]!.wide).toBe("[assistant] Here are options. 1. First idea. 2. Second idea. 3. Third idea. 4. Fourth idea.");
   });
 });
 
@@ -125,7 +239,7 @@ describe("MemoryObject recall steps", () => {
     await mo.addNote(claude, { scope: "profile", content: "The user deploys every app through Workers Builds." });
     await mo.addNote(claude, { scope: "profile", content: "The user drinks green tea in the morning." });
     await settle();
-    const res = await mo.recall(claude, { query: "Workers Builds deploys", scopes: ["profile"], rerank: false });
+    const res = await mo.recall(claude, { query: "Workers Builds deploys", scopes: ["profile"], rerank: false, features: [] });
     expect(res.items[0]!.content).toContain("Workers Builds");
     expect(res.items[0]!.confidence).toBeGreaterThan(0.5);
     expect(res.abstained).toBeUndefined();
@@ -135,7 +249,7 @@ describe("MemoryObject recall steps", () => {
   it("abstains when nothing is relevant, only with the abstain step", async () => {
     await mo.addNote(claude, { scope: "profile", content: "The user drinks green tea in the morning." });
     await settle();
-    const plain = await mo.recall(claude, { query: "kubernetes cluster upgrade", scopes: ["profile"], rerank: false });
+    const plain = await mo.recall(claude, { query: "kubernetes cluster upgrade", scopes: ["profile"], rerank: false, features: [] });
     // The newest items always join the pool, so default recall returns the tea note.
     expect(plain.items).toHaveLength(1);
     const res = await mo.recall(claude, { query: "kubernetes cluster upgrade", scopes: ["profile"], rerank: false, features: ["abstain"] });
@@ -163,7 +277,7 @@ describe("MemoryObject recall steps", () => {
     expect(chunks.length).toBeLessThanOrEqual(1);
     expect(chunks.map((c) => c.id)).not.toContain(note.evidence!.id);
 
-    const plain = await mo.recall(claude, { query: "tabs indent", scopes: ["profile"], rerank: false, budgetTokens: 4000 });
+    const plain = await mo.recall(claude, { query: "tabs indent", scopes: ["profile"], rerank: false, budgetTokens: 4000, features: [] });
     expect(plain.items.filter((i) => i.kind === "chunk").length).toBeGreaterThan(1);
     expect(plain.items.some((i) => i.evidence)).toBe(false);
   });
@@ -281,7 +395,7 @@ describe("MemoryObject recall steps", () => {
     const chunk = db.prepare("SELECT id FROM items WHERE kind = 'chunk'").get() as { id: string };
     expect(db.prepare("SELECT keys FROM chunk_keys").all()).toEqual([{ keys: "The user's favourite editor is Zed.\nThe user values a fast rust based editor." }]);
 
-    const without = await mo.recall(claude, { query: "Zed", scopes: ["profile"], rerank: false });
+    const without = await mo.recall(claude, { query: "Zed", scopes: ["profile"], rerank: false, features: [] });
     expect(without.items.map((i) => i.id)).not.toContain(chunk.id);
     const withKeys = await mo.recall(claude, { query: "Zed", scopes: ["profile"], rerank: false, features: ["keys"] });
     expect(withKeys.items.map((i) => i.id)).toContain(chunk.id);
@@ -304,5 +418,103 @@ describe("MemoryObject recall steps", () => {
     const ep = db.prepare("SELECT id FROM episodes").get() as { id: string };
     await mo.forget(web, ep.id);
     expect(db.prepare("SELECT COUNT(*) AS n FROM chunk_keys").get()).toEqual({ n: 0 });
+  });
+});
+
+describe("MemoryObject turn cards", () => {
+  let mo: MemoryObject;
+  let fake: ReturnType<typeof fakeEnv>;
+  const day = 86_400_000;
+
+  const settle = async () => {
+    for (let i = 0; i < 12; i++) {
+      now += 5_000;
+      await mo.alarm();
+    }
+  };
+
+  beforeEach(async () => {
+    const s = fakeState();
+    fake = fakeEnv(generate);
+    mo = new MemoryObject(s.state as never, fake.env as never);
+    await mo.addEpisode(claude, {
+      scope: "profile",
+      tEvent: now - 10 * day,
+      messages: [
+        { role: "user", content: "I adopted a cat named Miso last spring." },
+        { role: "assistant", content: "Congratulations! Cats are great company. Miso is a lovely name. Do you need tips on feeding?" },
+        { role: "user", content: "What is the weather like in Lisbon in May?" },
+        { role: "assistant", content: "Lisbon is warm in May. Expect sunny days." },
+      ],
+    });
+    await mo.addEpisode(claude, {
+      scope: "profile",
+      tEvent: now - 2 * day,
+      messages: [
+        { role: "user", content: "Miso and I moved to Berlin in October." },
+        { role: "assistant", content: "Berlin is a great city for cats." },
+      ],
+    });
+    await settle();
+  });
+
+  it("hands out the best turns, one card per conversation, in the order things happened", async () => {
+    const res = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"], budgetTokens: 70 });
+    expect(res.items.map((i) => i.parts)).toEqual([
+      ["[user] I adopted a cat named Miso last spring.", "[assistant] … Miso is a lovely name. Do you need tips on feeding?"],
+      ["[user] Miso and I moved to Berlin in October."],
+    ]);
+    expect(res.items.map((i) => i.kind)).toEqual(["chunk", "chunk"]);
+    expect(res.items[0]!.content).toBe(res.items[0]!.parts!.join("\n"));
+    expect(res.items[0]!.tEvent < res.items[1]!.tEvent).toBe(true);
+    expect(res.text).toContain("[user] Miso and I moved to Berlin in October.");
+
+    // With room for everything, a card shows all of its turns in order.
+    const wide = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"] });
+    expect(wide.items[0]!.parts).toHaveLength(4);
+    expect(wide.items[0]!.parts![2]).toBe("[user] What is the weather like in Lisbon in May?");
+  });
+
+  it("keeps notes and other conversations next to one very long conversation", async () => {
+    await mo.addEpisode(claude, {
+      scope: "profile",
+      tEvent: now - 5 * day,
+      messages: Array.from({ length: 400 }, (_, i) =>
+        i % 2 ? { role: "assistant", content: `Noted, step ${i} about Miso.` } : { role: "user", content: `Miso log entry ${i}: the cat slept.` },
+      ),
+    });
+    await mo.addNote(claude, { scope: "profile", content: "The user's cat Miso lives in Berlin." });
+    await settle();
+    const run = fake.env.AI.run;
+    let scored = 0;
+    fake.env.AI.run = async (model, input) => {
+      if (input.contexts) scored = Math.max(scored, input.contexts.length);
+      return run(model, input);
+    };
+    const res = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"], budgetTokens: 4000 });
+    expect(scored).toBeLessThanOrEqual(200);
+    expect(res.items.some((i) => i.kind === "note")).toBe(true);
+    expect(res.text).toContain("Miso and I moved to Berlin in October.");
+  });
+
+  it("lets notes compete with turns and keeps plain excerpts on request or without the reranker", async () => {
+    await mo.addNote(claude, { scope: "profile", content: "The user's cat Miso lives in Berlin." });
+    await settle();
+    const res = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"] });
+    expect(res.items.map((i) => i.kind)).toEqual(["chunk", "chunk", "note"]);
+    expect(res.items[2]!.parts).toBeUndefined();
+
+    const plain = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"], cards: false });
+    expect(plain.items.some((i) => i.parts)).toBe(false);
+    expect(plain.items.find((i) => i.kind === "chunk")!.content).toContain("[user] I adopted a cat named Miso last spring.\n[assistant]");
+
+    const run = fake.env.AI.run;
+    fake.env.AI.run = async (model, input) => {
+      if (input.contexts) throw new Error("reranker down");
+      return run(model, input);
+    };
+    const down = await mo.recall(claude, { query: "Where does my cat Miso live?", scopes: ["profile"], features: ["turns"] });
+    expect(down.items.length).toBeGreaterThan(0);
+    expect(down.items.some((i) => i.parts)).toBe(false);
   });
 });

@@ -8,8 +8,9 @@
 // started and read through the Cloudflare API. See bench/README.md, "On Cloudflare".
 
 import { DurableObject, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep, type WorkflowStepConfig } from "cloudflare:workers";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { runAi, type Env } from "../src/env";
+import { DEFAULT_EMBEDDING_MODEL, runAi, type Env } from "../src/env";
 import { MemoryObject, type EpisodeInput } from "../src/memory-object";
 import { RECALL_FEATURES } from "../src/recall";
 import { DEFAULT_GRANTS, type Client } from "../src/scopes";
@@ -155,6 +156,11 @@ export interface RunParams {
    * Needs the Worker secret OPENAI_API_KEY.
    */
   reader?: string;
+  /**
+   * Keep every question's embeddings in the BENCH bucket (cache/embeddings/) and reuse
+   * them, so a rerun embeds only texts it has not seen. Default true.
+   */
+  embeddingCache?: boolean;
 }
 
 export interface RunSettings {
@@ -173,6 +179,7 @@ export interface RunSettings {
   paidRpm: number;
   /** null: no answers, retrieval scores only. */
   reader: string | null;
+  embeddingCache: boolean;
 }
 
 export const MAX_CONCURRENCY = 32;
@@ -182,7 +189,24 @@ export const MAX_CONCURRENCY = 32;
  */
 export const MAX_EXTRACTION_CONCURRENCY = 8;
 const RUN_ID = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
-const PARAMS = new Set(["questions", "types", "sample", "seed", "limit", "features", "chunking", "extraction", "reflect", "asOf", "concurrency", "vars", "baseline", "paidRpm", "reader"]);
+const PARAMS = new Set([
+  "questions",
+  "types",
+  "sample",
+  "seed",
+  "limit",
+  "features",
+  "chunking",
+  "extraction",
+  "reflect",
+  "asOf",
+  "concurrency",
+  "vars",
+  "baseline",
+  "paidRpm",
+  "reader",
+  "embeddingCache",
+]);
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
 
 function bad(message: string): never {
@@ -278,6 +302,7 @@ export function runSettings(raw: unknown, env: Partial<Record<MemoryVar, string>
     baseline,
     paidRpm,
     reader,
+    embeddingCache: p.embeddingCache === undefined || p.embeddingCache === null ? true : flag("embeddingCache", p.embeddingCache),
   };
 }
 
@@ -329,6 +354,91 @@ export function pacedAi(ai: Ai, reserve: (model: string) => Promise<number>, tri
     }
   };
   return { run } as unknown as Ai;
+}
+
+/** Where a question's embeddings for one model are kept between runs. */
+export const embeddingCacheKey = (question: string, model: string) =>
+  `cache/embeddings/${encodeURIComponent(model)}/${encodeURIComponent(question.split("/").pop() ?? question)}`;
+
+const textKey = (text: string) => createHash("sha256").update(text).digest("base64url").slice(0, 24);
+
+function encodeVector(v: ArrayLike<number>): string {
+  return Buffer.from(new Float32Array(Array.from(v)).buffer).toString("base64");
+}
+
+function decodeVector(text: string): number[] {
+  const bytes = Buffer.from(text, "base64");
+  const out = new Float32Array(bytes.byteLength / 4);
+  new Uint8Array(out.buffer).set(bytes);
+  return Array.from(out);
+}
+
+/**
+ * The embeddings of one question, kept in the BENCH bucket between runs: every
+ * run replays the same sessions, so a rerun embeds only the texts it has not
+ * seen before (a new chunking, a new wording). Vectors are kept as 32-bit
+ * floats, as rhizome stores them. Losing the cache only costs embeddings.
+ */
+export class EmbeddingCache {
+  private readonly vectors = new Map<string, number[]>();
+  private added = 0;
+  hits = 0;
+  misses = 0;
+
+  constructor(
+    private readonly bucket: Pick<R2Bucket, "get" | "put">,
+    private readonly key: string,
+    private readonly model: string,
+  ) {}
+
+  async load(): Promise<void> {
+    try {
+      const object = await this.bucket.get(this.key);
+      if (!object) return;
+      const data = (await object.json()) as { model?: string; vectors?: Record<string, string> };
+      if (data.model !== this.model) return;
+      for (const [k, v] of Object.entries(data.vectors ?? {})) this.vectors.set(k, decodeVector(v));
+    } catch (err) {
+      console.error("bench: could not read the embedding cache", String(err));
+    }
+  }
+
+  /** Writes the cache back when the question embedded something new. */
+  async save(): Promise<void> {
+    if (this.added === 0) return;
+    try {
+      const vectors = Object.fromEntries([...this.vectors].map(([k, v]) => [k, encodeVector(v)]));
+      await this.bucket.put(this.key, JSON.stringify({ model: this.model, vectors }), { httpMetadata: { contentType: "application/json" } });
+      this.added = 0;
+    } catch (err) {
+      console.error("bench: could not write the embedding cache", String(err));
+    }
+  }
+
+  /** Workers AI with the embedding model's calls answered from the cache where it can. */
+  wrap(ai: Ai): Ai {
+    const run = async (model: string, input: unknown): Promise<unknown> => {
+      const texts = (input as { text?: unknown } | null)?.text;
+      if (model !== this.model || !Array.isArray(texts) || !texts.every((t) => typeof t === "string")) return runAi<unknown>(ai, model, input);
+      const keys = (texts as string[]).map(textKey);
+      const missing = [...new Set(keys.filter((k) => !this.vectors.has(k)))];
+      this.hits += keys.length - missing.length;
+      this.misses += missing.length;
+      if (missing.length) {
+        const byKey = new Map(keys.map((k, i) => [k, (texts as string[])[i]!] as const));
+        const res = await runAi<{ data?: number[][] }>(ai, model, { ...(input as object), text: missing.map((k) => byKey.get(k)!) });
+        if (!Array.isArray(res?.data) || res.data.length !== missing.length) throw new Error("embedding model returned an unexpected shape");
+        missing.forEach((k, i) => {
+          // As rhizome stores it, so a cached run sees the same numbers as a fresh one.
+          this.vectors.set(k, decodeVector(encodeVector(res.data![i]!)));
+          this.added++;
+        });
+      }
+      const data = keys.map((k) => this.vectors.get(k)!);
+      return { shape: [data.length, data[0]?.length ?? 0], data };
+    };
+    return { run } as unknown as Ai;
+  }
 }
 
 // ------------------------------------------------------------------ Vectorize
@@ -414,6 +524,8 @@ export interface QuestionJob {
   vectorTimeoutMs: number;
   /** Also recall as the recall tool does, for the reader. */
   agentView?: boolean;
+  /** Reuse and keep the question's embeddings (EmbeddingCache). */
+  embeddingCache?: boolean;
 }
 
 function benchClient(userId: string): Client {
@@ -436,6 +548,10 @@ export class BenchMemory extends MemoryObject {
     this.running = true;
     const vectors = new TrackedVectors(this.bench.VECTORS);
     const gate = this.bench.AI_GATE.get(this.bench.AI_GATE.idFromName("workers-ai"));
+    const paced = pacedAi(this.bench.AI, (model) => gate.reserve(model, job.paidRpm));
+    const model = job.vars.EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL;
+    const cache = job.embeddingCache ? new EmbeddingCache(this.bench.BENCH, embeddingCacheKey(job.key, model), model) : null;
+    await cache?.load();
     this.env = {
       ...job.vars,
       EXTRACTION: job.extraction ? "on" : "off",
@@ -443,7 +559,7 @@ export class BenchMemory extends MemoryObject {
       EXTRACTION_DAILY_LIMIT: "1000000",
       EPISODES: this.bench.EPISODES,
       VECTORS: vectors,
-      AI: pacedAi(this.bench.AI, (model) => gate.reserve(model, job.paidRpm)),
+      AI: cache ? cache.wrap(paced) : paced,
     } as unknown as Env;
     try {
       const object = await this.bench.BENCH.get(job.key);
@@ -459,6 +575,7 @@ export class BenchMemory extends MemoryObject {
         agentView: job.agentView,
       });
     } finally {
+      await cache?.save();
       await this.wipe();
       this.running = false;
     }
@@ -561,6 +678,7 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
           chunking: settings.chunking,
           asOf: settings.asOf,
           selection: settings.selection,
+          embeddingCache: settings.embeddingCache,
         },
         questions: questions.length,
         concurrency: settings.concurrency,
@@ -600,6 +718,7 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
             idleTimeoutMs,
             vectorTimeoutMs,
             ...(settings.reader ? { agentView: true } : {}),
+            ...(settings.embeddingCache ? { embeddingCache: true } : {}),
           };
           return (await memory.benchRun(job)) as ResultRecord & { view?: AgentView };
         });

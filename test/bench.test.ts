@@ -9,7 +9,7 @@ import { AiCache, BenchAi, FakeAi, RateWindow, isRetryable, stableJson, type AiR
 import { readResults, runBenchmark, workerVars } from "../bench/harness";
 import { parseDate, select, typeKey, validateDataset, type Question, type Turn } from "../bench/longmemeval";
 import { compareRuns, mcnemar, rankingScores, scoreQuestion, sessionOrder, summarize, turnCoverage } from "../bench/metrics";
-import { coveredTurns, indexSession } from "../bench/question";
+import { coveredTurns, indexSession, partTurn } from "../bench/question";
 import { chunk, roundChunks, transcript } from "../src/text";
 
 let dir: string;
@@ -116,7 +116,26 @@ describe("scores", () => {
     expect(turnCoverage(ranked, new Set(["s1#0", "s1#4"]))).toBe(0.5);
     expect(turnCoverage(ranked, new Set())).toBeUndefined();
     const m = scoreQuestion(ranked, ranked.slice(0, 1), { sessions: new Set(["s1"]), turns: new Set(["s1#0"]) });
-    expect(m).toMatchObject({ "recall_any@1": 0, "recall_any@3": 1, delivered_any: 0, delivered_turns: 0, "turn_recall@5": 1 });
+    expect(m).toMatchObject({ "recall_any@1": 0, "recall_any@3": 1, delivered_any: 0, delivered_turns: 0, delivered_turns_all: 0, "turn_recall@5": 1 });
+    expect(m.reader_any).toBeUndefined();
+    // What the recall tool handed the reader, scored the same way.
+    const evidence = { sessions: new Set(["s1", "s2"]), turns: new Set(["s1#0", "s2#3"]) };
+    const read = scoreQuestion(ranked, ranked, evidence, [{ sessions: ["s1"], turns: ["s1#0"] }, { sessions: ["s2"], turns: ["s2#3"] }]);
+    expect(read).toMatchObject({ reader_any: 1, reader_all: 1, reader_turns: 1, reader_turns_all: 1, delivered_all: 0, delivered_turns: 0.5, delivered_turns_all: 0 });
+  });
+
+  it("finds the turn each part of a turn card shows", () => {
+    const turns: Turn[] = [
+      { role: "user", content: "I adopted a cat named Miso." },
+      { role: "assistant", content: "Congratulations!  Cats are great.\nMiso is a lovely name. Do you need tips?" },
+      { role: "user", content: "x".repeat(1600) },
+    ];
+    const index = indexSession(turns);
+    expect(partTurn(index, "[user] I adopted a cat named Miso.")).toBe(0);
+    expect(partTurn(index, "[assistant] … Miso is a lovely name. Do you need tips?")).toBe(1);
+    expect(partTurn(index, "[assistant] Congratulations! Cats are great. …")).toBe(1);
+    expect(partTurn(index, `[user] … ${"x".repeat(100)}`)).toBe(2);
+    expect(partTurn(index, "[user] not in this session")).toBeUndefined();
   });
 
   it("finds the turns of fixed and round chunks, also where trimming changed the whitespace", () => {

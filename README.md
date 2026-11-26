@@ -152,13 +152,14 @@ Recall leaves out superseded and archived notes, and returns disputed ones with 
 
 Set `CHUNKING=rounds` to cut new conversations into rounds (a question with its answers, short rounds joined) instead of fixed 1,200-character excerpts.
 
-Optional recall steps are chosen per request with `features` or for every request with the `RECALL_FEATURES` variable (comma separated, or `all`). The Cloudflare config in `wrangler.jsonc` turns all of them on, together with `CHUNKING=rounds`; without the variable (for example on Node) they are off. `features: []` runs a single request without them:
+Recall runs the steps below. The `RECALL_FEATURES` variable (comma separated, `all` or `none`) or `features` on a request names fewer; without the variable all of them run, and `features: []` runs a single request without them. The Cloudflare config in `wrangler.jsonc` sets `RECALL_FEATURES=all` together with `CHUNKING=rounds`:
 
 * `abstain`: returns nothing (`abstained: true`) when no result shares a keyword with the query and none is semantically close.
 * `diversity`: at most one excerpt per conversation, and near-identical results make room for different ones.
 * `evidence`: a note brings the conversation excerpt it was extracted from, when the token budget allows.
 * `keys`: conversation excerpts are also found through the facts extracted from them. New extractions file each fact under its excerpt; nightly reflection fills in older episodes.
 * `time`: English and German time words in the query ("last week", "letzten Monat", "im März", "vor 3 Tagen", "since Monday") become a time window. When nothing falls inside it, recall runs without it.
+* `turns`: conversations come back as turn cards. The ten best conversations (by their best excerpt) are split into turns, and the turns and the notes found are scored one by one, so the best of them fill the token budget, with no cap per conversation. Each conversation is one result with its picked turns in order (`parts`, joined in `content`), and results come in the order things happened. A user turn shows up to 1,500 characters; of a reply, the two sentences that share the most words with the query. It costs one more reranker call per recall (up to 200 turns). `cards: false` returns plain excerpts instead.
 
 ```sh
 # remember something about yourself

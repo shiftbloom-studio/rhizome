@@ -119,19 +119,49 @@ async function waitIdle(memory: Memory, client: Client, timeoutMs: number) {
   }
 }
 
+/**
+ * The turn a part of a turn card shows (src/recall.ts turnUnits): its text
+ * without the role and the "…" marks of a cut, found in the session, in the turn
+ * it overlaps most. A window of a reply stands for the whole reply.
+ */
+export function partTurn(index: SessionIndex, part: string): number | undefined {
+  const needle = part
+    .replace(/^\[[^\]\n]{1,32}\] /, "")
+    .replace(/^… /, "")
+    .replace(/ …$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const found = needle ? index.flat.indexOf(needle) : -1;
+  if (found < 0) return undefined;
+  const start = index.at[found]!;
+  const end = index.at[found + needle.length - 1]! + 1;
+  let best: number | undefined;
+  let most = 0;
+  index.turns.forEach((t, i) => {
+    const overlap = Math.min(end, t.end) - Math.max(start, t.start);
+    if (overlap > most) {
+      most = overlap;
+      best = i;
+    }
+  });
+  return best;
+}
+
 /** Maps recalled items to the sessions and turns they stand for. A note stands for the episodes it was extracted from. */
 function itemRefs(memory: Memory, client: Client, sessionOf: Map<string, string>, indexes: Map<string, SessionIndex>) {
   const noteSessions = new Map<string, string[]>();
-  const chunkRef = (episodeId: string | null | undefined, content: string): ItemRef => {
+  const chunkRef = (episodeId: string | null | undefined, content: string, parts?: string[]): ItemRef => {
     const session = episodeId ? sessionOf.get(episodeId) : undefined;
     if (!session) return { sessions: [], turns: [] };
-    return { sessions: [session], turns: coveredTurns(indexes.get(session)!, content).map((n) => `${session}#${n}`) };
+    const index = indexes.get(session)!;
+    const turns = parts ? [...new Set(parts.flatMap((p) => partTurn(index, p) ?? []))] : coveredTurns(index, content);
+    return { sessions: [session], turns: turns.map((n) => `${session}#${n}`) };
   };
   return async (items: MemoryItem[]): Promise<ItemRef[]> => {
     const out: ItemRef[] = [];
     for (const item of items) {
       if (item.kind === "chunk") {
-        out.push(chunkRef(item.episodeId, item.content));
+        out.push(chunkRef(item.episodeId, item.content, item.parts));
         continue;
       }
       let sessions = noteSessions.get(item.id);
@@ -197,13 +227,16 @@ export async function askQuestion(memory: Memory, client: Client, q: Question, o
     ...(opts.asOf ? { asOf: askedAt } : {}),
     ...(opts.features ? { features: opts.features } : {}),
   };
-  const deep = await memory.recall(client, { ...ask, limit: 50, budgetTokens: 1_000_000 });
+  // The deep ranking scores excerpts, so it asks for them instead of turn cards.
+  const deep = await memory.recall(client, { ...ask, limit: 50, budgetTokens: 1_000_000, cards: false });
   const shown = await memory.recall(client, ask);
   const tool = opts.agentView ? await memory.recall(client, { ...ask, ...RECALL_TOOL }) : undefined;
 
   const refs = itemRefs(memory, client, sessionOf, indexes);
   const ranked = await refs(deep.items);
   const delivered = await refs(shown.items);
+  const read = tool ? await refs(tool.items) : undefined;
+  const text = tool ? recallText(tool) : undefined;
   const deliveredTokens = estimateTokens(shown.text);
   const abstained = shown.abstained;
   const confidence = shown.items[0]?.confidence;
@@ -223,12 +256,12 @@ export async function askQuestion(memory: Memory, client: Client, q: Question, o
     ...(confidence !== undefined ? { confidence } : {}),
   };
   if (!abstention && evidence.sessions.size > 0) {
-    record.metrics = { ...scoreQuestion(ranked, delivered, evidence), delivered_items: shown.items.length, delivered_tokens: deliveredTokens };
+    record.metrics = { ...scoreQuestion(ranked, delivered, evidence, read), delivered_items: shown.items.length, delivered_tokens: deliveredTokens };
+    if (tool) Object.assign(record.metrics, { reader_items: tool.items.length, reader_tokens: estimateTokens(text!) });
   }
   const official = officialRetrieval(q, sessionOrder(ranked));
   if (official) record.official = official;
   if (!tool) return record;
-  const text = recallText(tool);
-  const view: AgentView = { text, items: tool.items.length, tokens: estimateTokens(text), question: q.question, questionDate: q.question_date, type: q.question_type, answer: q.answer as string | number };
+  const view: AgentView = { text: text!, items: tool.items.length, tokens: estimateTokens(text!), question: q.question, questionDate: q.question_date, type: q.question_type, answer: q.answer as string | number };
   return { ...record, view };
 }

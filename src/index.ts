@@ -310,6 +310,7 @@ mem.post("/recall", async (c) => {
     to?: unknown;
     asOf?: unknown;
     features?: unknown;
+    cards?: unknown;
   }>(c);
   const query = str(b.query, "query", 2000)?.trim();
   if (!query) throw new HttpError(400, "query is required");
@@ -347,6 +348,7 @@ mem.post("/recall", async (c) => {
     to,
     asOf,
     features: b.features as string[] | undefined,
+    cards: typeof b.cards === "boolean" ? b.cards : undefined,
   });
   return c.json({ ...res, scopes });
 });
