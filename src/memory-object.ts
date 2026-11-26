@@ -78,6 +78,8 @@ export interface RecallInput {
   to?: number;
   /** Optional recall steps for this request (see RECALL_FEATURES). Default: the RECALL_FEATURES variable. */
   features?: string[];
+  /** Time that words like "last week" are read against (epoch milliseconds). Default: now. */
+  referenceTime?: number;
 }
 
 export interface RecallEvidence {
@@ -467,7 +469,7 @@ export class MemoryObject extends DurableObject<Env> {
     if (input.from !== undefined || input.to !== undefined) {
       window = { from: input.from ?? 0, to: input.to ?? Number.MAX_SAFE_INTEGER, source: "agent" };
     } else if (features.has("time")) {
-      const parsed = parseTimeWindow(input.query, started);
+      const parsed = parseTimeWindow(input.query, input.referenceTime ?? started);
       if (parsed) window = { from: parsed.from, to: parsed.to, source: "query", text: parsed.text };
     }
 

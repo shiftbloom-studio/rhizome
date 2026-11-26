@@ -159,6 +159,10 @@ describe("MemoryObject recall steps", () => {
     const empty = await mo.recall(claude, { query: "database decision yesterday", scopes: ["profile"], rerank: false, features: ["time"] });
     expect(empty.items).toHaveLength(2);
     expect(empty.window).toBeUndefined();
+
+    // Time words are read against a reference time when one is given.
+    const then = await mo.recall(claude, { query: "database decision 2 weeks ago", scopes: ["profile"], rerank: false, features: ["time"], referenceTime: now - 5 * day });
+    expect(then.items.map((i) => i.content)).toEqual(["Decision about the database: D1 for va-dispatcher."]);
   });
 
   it("searches sub-queries too", async () => {
