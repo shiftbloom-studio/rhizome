@@ -1324,7 +1324,8 @@ export class MemoryObject extends DurableObject<Env> {
       `Agent: ${ep.agent} (provider ${ep.provider})\nEpisode scope: ${ep.scope}\nMessages:\n${body}` +
       relatedSection(related);
     const model = this.env.EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
-    const extraction = await this.generateJson<Extraction>(model, EXTRACTION_PROMPT, user, validateExtraction);
+    // No thinking: on long episodes the flash model spends the whole budget on it, and the JSON comes out cut off.
+    const extraction = await this.generateJson<Extraction>(model, EXTRACTION_PROMPT, user, validateExtraction, 3000, { reasoning_effort: "none" });
     const now = Date.now();
     if (extraction.facts.length === 0 && extraction.entities.length === 0) {
       this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'extract.none', ?)", now, SYSTEM_EXTRACTION, JSON.stringify({ episodeId }));
