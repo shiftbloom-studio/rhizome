@@ -2,9 +2,9 @@
 
 Long-term memory for your AI agents. One shared memory across Claude, ChatGPT and friends, served over MCP from Cloudflare.
 
-![The rhizome explorer: 115 notes linked by similarity and tied to the projects and tools they name](docs/explorer-graph.png)
+![The rhizome explorer: 115 notes linked by similarity and tied to the projects and tools they name, with scopes, legend and memory stats](docs/explorer-graph.png)
 
-**Live:** [rhizome.shiftbloom.studio](https://rhizome.shiftbloom.studio) (explorer behind Cloudflare Access, MCP at `/mcp`) · **License:** AGPL-3.0-or-later
+**License:** AGPL-3.0-or-later
 
 rhizome is a long-horizon memory that belongs to a person, not to an agent. Claude, ChatGPT, Hermes, Cursor and your own agents all read and write the same memory, so each of them knows how you work, what you decided and what you prefer, whichever provider it comes from.
 
@@ -258,7 +258,7 @@ If your zone challenges bots, add a WAF skip rule for requests to your hostname 
 
 ### Deploy with Workers Builds
 
-rhizome.shiftbloom.studio deploys with Workers Builds on every push to `main`, and no API token is stored on GitHub. Connect the repository to the Worker in the Cloudflare dashboard (Settings > Build) and set the names from `.env.deploy.example` as build variables. Use `npm ci && npm ci --prefix web && npm run build:web && npm run config` as the build command and `npx wrangler deploy -c wrangler.deploy.jsonc` as the deploy command. The build picks up Node 26 from `.node-version`.
+A rhizome Worker can deploy with Workers Builds on every push to `main`, and no API token is stored on GitHub. Connect the repository to the Worker in the Cloudflare dashboard (Settings > Build) and set the names from `.env.deploy.example` as build variables. Use `npm ci && npm ci --prefix web && npm run build:web && npm run config` as the build command and `npx wrangler deploy -c wrangler.deploy.jsonc` as the deploy command. The build picks up Node 26 from `.node-version`.
 
 ## Costs
 
