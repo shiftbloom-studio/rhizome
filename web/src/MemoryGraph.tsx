@@ -2,11 +2,12 @@
 //
 // The memory as a living 3D graph: notes coloured by trust, the conversations
 // they came from, and the people, projects and tools they mention. Layout is a
-// 3D force simulation that keeps settling while you look at it.
+// 3D force simulation that keeps settling while you look at it: related notes
+// pull together along their edges, and each scope gathers around its own anchor.
 
-import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Html, OrbitControls } from "@react-three/drei";
-import { forceCenter, forceLink, forceManyBody, forceSimulation, type SimNode } from "d3-force-3d";
+import { forceCenter, forceLink, forceManyBody, forceSimulation, forceX, forceY, forceZ, type SimNode } from "d3-force-3d";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
@@ -23,6 +24,9 @@ const EPISODE_COLOR = "#B9AEB2";
 const ENTITY_COLOR = "#1A1216";
 const EDGE_COLOR = "#1A1216";
 const RED_EDGES = new Set(["supersedes", "merged_into", "contradicts"]);
+const SPARK_COLOR = "#FF2E52";
+/** How close (in CSS pixels) the pointer has to be to a node to hover or pick it. */
+const PICK_RADIUS = 14;
 
 type Node3 = SimNode & GraphNode & { x: number; y: number; z: number; slot: number };
 
@@ -77,10 +81,9 @@ export function MemoryGraph(props: Props) {
       camera={{ position: [0, 40, 260], fov: 42, near: 1, far: 2000 }}
       dpr={[1, 2]}
       gl={{ antialias: true, alpha: false }}
-      onPointerMissed={() => props.onSelect(null)}
     >
       <color attach="background" args={[BG]} />
-      <fog attach="fog" args={[BG, 300, 760]} />
+      <fog attach="fog" args={[BG, 420, 1300]} />
       <ambientLight intensity={0.9} />
       <hemisphereLight args={["#ffffff", "#f3e6e9", 0.6]} />
       <directionalLight position={[90, 140, 120]} intensity={1.2} />
@@ -119,9 +122,33 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       return node;
     });
     const byId = new Map(nodes.map((n) => [n.id, n]));
-    const links = graph.edges.filter((e) => byId.has(e.source) && byId.has(e.target)).map((e) => ({ ...e }));
+    // "similar" is stored per direction; A→B and B→A draw one line.
+    const seen = new Set<string>();
+    const links = graph.edges
+      .filter((e) => {
+        if (!byId.has(e.source) || !byId.has(e.target)) return false;
+        const key = e.kind === "similar" ? [e.source, e.target].sort().join("|") + "|similar" : `${e.source}|${e.target}|${e.kind}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .map((e) => ({ ...e }));
     return { nodes, byType, links, byId };
   }, [graph]);
+
+  // Every scope gets an anchor on a ring, so profile, each project and each agent form their own region.
+  const anchors = useMemo(() => {
+    const scopes = [...new Set(nodes.map((n) => n.scope).filter((s): s is string => Boolean(s)))].sort();
+    const map = new Map<string, { x: number; y: number; z: number }>();
+    const radius = scopes.length > 1 ? 55 + scopes.length * 12 : 0;
+    scopes.forEach((s, i) => {
+      // profile sits in the middle: it is what every project shares.
+      if (s === "profile" && scopes.length > 1) return void map.set(s, { x: 0, y: 0, z: 0 });
+      const a = (i / scopes.length) * Math.PI * 2;
+      map.set(s, { x: Math.cos(a) * radius, y: (hash(s) - 0.5) * radius * 0.5, z: Math.sin(a) * radius });
+    });
+    return map;
+  }, [nodes]);
 
   const sim = useMemo(() => {
     const s = forceSimulation(nodes, 3)
@@ -140,13 +167,16 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       )
       .force("charge", forceManyBody().strength((n) => ((n as Node3).type === "entity" ? -70 : -24)).distanceMax(260))
       .force("center", forceCenter(0, 0, 0))
+      .force("scopeX", forceX((n) => anchors.get((n as Node3).scope ?? "")?.x ?? 0).strength((n) => ((n as Node3).scope ? 0.06 : 0)))
+      .force("scopeY", forceY((n) => anchors.get((n as Node3).scope ?? "")?.y ?? 0).strength((n) => ((n as Node3).scope ? 0.06 : 0)))
+      .force("scopeZ", forceZ((n) => anchors.get((n as Node3).scope ?? "")?.z ?? 0).strength((n) => ((n as Node3).scope ? 0.06 : 0)))
       .alphaDecay(0.018)
       .velocityDecay(0.35)
       .stop();
     // A head start, so the first frame already shows structure.
     s.tick(previous.current.size ? 5 : 80);
     return s;
-  }, [nodes, links]);
+  }, [nodes, links, anchors]);
 
   // Frame the whole memory on first load: the camera backs off until every node fits.
   const { size } = useThree();
@@ -215,6 +245,29 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
   const edgeBase = useMemo(() => new THREE.Color(EDGE_COLOR), []);
   const red = useMemo(() => new THREE.Color("#C81040"), []);
 
+  // Only "real" relations carry sparks; history edges (supersedes and so on) stay quiet.
+  const sparkLinks = useMemo(() => links.map((l, i) => (RED_EDGES.has(l.kind) ? -1 : i)).filter((i) => i >= 0), [links]);
+  const sparks = useMemo(
+    () => Array.from({ length: Math.min(48, Math.ceil(sparkLinks.length / 2)) }, () => ({ edge: -1, t: Math.random(), speed: 0.004 + Math.random() * 0.006, forward: true })),
+    [sparkLinks],
+  );
+  // Round sparks: points are squares unless they get a round texture.
+  const dot = useMemo(() => {
+    const c = document.createElement("canvas");
+    c.width = c.height = 32;
+    const g = c.getContext("2d")!;
+    g.fillStyle = "#fff";
+    g.beginPath();
+    g.arc(16, 16, 15, 0, Math.PI * 2);
+    g.fill();
+    return new THREE.CanvasTexture(c);
+  }, []);
+  const sparkGeometry = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(Math.max(sparks.length, 1) * 3).fill(-1e6), 3));
+    return g;
+  }, [sparks]);
+
   const edgeGeometry = useMemo(() => {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(links.length * 6), 3));
@@ -268,7 +321,13 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       pos.setXYZ(i * 2 + 1, t.x, t.y, t.z);
       const active = focusSet ? focusSet.has(s.id) && focusSet.has(t.id) && (s.id === selected || t.id === selected) : highlight ? highlight.has(s.id) || highlight.has(t.id) : true;
       color.copy(RED_EDGES.has(l.kind) ? red : edgeBase);
-      const fade = focusSet || highlight ? (active ? 0.35 : 0.97) : RED_EDGES.has(l.kind) ? 0.45 : l.kind === "similar" ? 0.8 : 0.86;
+      // Stronger similarity draws a darker line, like a well-used connection.
+      const fade = focusSet || highlight
+        ? active ? 0.3 : 0.97
+        : RED_EDGES.has(l.kind) ? 0.45
+        : l.kind === "similar" ? Math.min(0.66, Math.max(0.36, 0.66 - (l.weight - 0.55) * 2))
+        : l.kind === "mentions" ? 0.62
+        : 0.7;
       color.lerp(bg, fade);
       col.setXYZ(i * 2, color.r, color.g, color.b);
       col.setXYZ(i * 2 + 1, color.r, color.g, color.b);
@@ -276,26 +335,101 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     pos.needsUpdate = true;
     col.needsUpdate = true;
     edgeGeometry.computeBoundingSphere();
+
+    // Sparks run along the edges, like signals through a network. With a selection, only along its edges.
+    if (reducedMotion || !sparkLinks.length) return;
+    const spos = sparkGeometry.getAttribute("position") as THREE.BufferAttribute;
+    const pool = focusSet ? sparkLinks.filter((i) => {
+      const l = links[i]!;
+      return (l.source as unknown as Node3).id === selected || (l.target as unknown as Node3).id === selected;
+    }) : sparkLinks;
+    // With a selection, two sparks per edge at most, so a node with few edges doesn't look crowded.
+    const active = focusSet ? Math.min(sparks.length, pool.length * 2) : sparks.length;
+    sparks.forEach((sp, i) => {
+      if (i >= active) {
+        spos.setXYZ(i, 0, 0, -1e6);
+        return;
+      }
+      sp.t += sp.speed;
+      if (sp.t >= 1 || sp.edge < 0 || (focusSet && !pool.includes(sp.edge))) {
+        sp.edge = pool.length ? pool[Math.floor(Math.random() * pool.length)]! : -1;
+        sp.t = sp.t >= 1 ? 0 : Math.random();
+        sp.forward = Math.random() < 0.5;
+      }
+      const l = sp.edge >= 0 ? links[sp.edge] : undefined;
+      const a = l?.source as unknown as Node3 | undefined;
+      const b = l?.target as unknown as Node3 | undefined;
+      if (!a || !b || typeof a !== "object" || typeof b !== "object") {
+        spos.setXYZ(i, 0, 0, -1e6);
+        return;
+      }
+      const k = sp.forward ? sp.t : 1 - sp.t;
+      spos.setXYZ(i, a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k, a.z + (b.z - a.z) * k);
+    });
+    spos.needsUpdate = true;
   });
 
-  const pick = (type: NodeType) => (e: ThreeEvent<PointerEvent>) => {
-    e.stopPropagation();
-    const n = e.instanceId === undefined ? null : byType[type][e.instanceId];
-    setHovered(n ?? null);
-    document.body.style.cursor = n ? "pointer" : "";
+  // Picking happens in screen space: the nearest node within a few pixels of the pointer.
+  // Raycasting the tiny instanced spheres missed most clicks while the layout was moving.
+  const { gl } = useThree();
+  const projected = useMemo(() => new THREE.Vector3(), []);
+  const nearestAt = (clientX: number, clientY: number): Node3 | null => {
+    const rect = gl.domElement.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    let best: Node3 | null = null;
+    let bestD = Infinity;
+    for (const n of nodes) {
+      projected.set(n.x, n.y, n.z).project(camera);
+      if (projected.z > 1) continue; // behind the camera
+      const px = ((projected.x + 1) / 2) * rect.width;
+      const py = ((1 - projected.y) / 2) * rect.height;
+      const d = Math.hypot(px - x, py - y);
+      if (d < bestD) {
+        bestD = d;
+        best = n;
+      }
+    }
+    return bestD <= PICK_RADIUS ? best : null;
   };
-  const click = (type: NodeType) => (e: ThreeEvent<MouseEvent>) => {
-    e.stopPropagation();
-    const n = e.instanceId === undefined ? null : byType[type][e.instanceId];
-    if (n) onSelect(n.id);
-  };
-  const leave = () => {
-    setHovered(null);
-    document.body.style.cursor = "";
-  };
+  const pickRef = useRef(nearestAt);
+  pickRef.current = nearestAt;
+  const selectRef = useRef(onSelect);
+  selectRef.current = onSelect;
+  useEffect(() => {
+    const el = gl.domElement;
+    let down: { x: number; y: number } | null = null;
+    const move = (e: PointerEvent) => {
+      if (e.buttons) return; // dragging the camera
+      const n = pickRef.current(e.clientX, e.clientY);
+      setHovered((h) => (h?.id === n?.id ? h : n));
+      el.style.cursor = n ? "pointer" : "";
+    };
+    const press = (e: PointerEvent) => void (down = { x: e.clientX, y: e.clientY });
+    const release = (e: PointerEvent) => {
+      // A drag rotates the camera, it is not a click.
+      if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return void (down = null);
+      down = null;
+      selectRef.current(pickRef.current(e.clientX, e.clientY)?.id ?? null);
+    };
+    const leave = () => {
+      setHovered(null);
+      el.style.cursor = "";
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerdown", press);
+    el.addEventListener("pointerup", release);
+    el.addEventListener("pointerleave", leave);
+    return () => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerdown", press);
+      el.removeEventListener("pointerup", release);
+      el.removeEventListener("pointerleave", leave);
+    };
+  }, [gl]);
 
   // Names of the most mentioned entities stay visible as landmarks.
-  const landmarks = useMemo(() => [...byType.entity].sort((a, b) => b.weight - a.weight).slice(0, 18), [byType]);
+  const landmarks = useMemo(() => [...byType.entity].sort((a, b) => b.weight - a.weight).slice(0, 12), [byType]);
   const sel = selected ? byId.get(selected) : undefined;
 
   return (
@@ -315,15 +449,17 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       <lineSegments ref={lines} geometry={edgeGeometry} frustumCulled={false}>
         <lineBasicMaterial vertexColors />
       </lineSegments>
+      {!reducedMotion && sparks.length > 0 && (
+        <points geometry={sparkGeometry} frustumCulled={false}>
+          <pointsMaterial color={SPARK_COLOR} map={dot} alphaTest={0.4} size={1.6} sizeAttenuation transparent opacity={0.9} depthWrite={false} />
+        </points>
+      )}
       <instancedMesh
         key={`note-${byType.note.length}`}
         ref={meshes.note}
         args={[undefined, undefined, Math.max(byType.note.length, 1)]}
         count={byType.note.length}
         frustumCulled={false}
-        onPointerMove={pick("note")}
-        onPointerOut={leave}
-        onClick={click("note")}
       >
         <icosahedronGeometry args={[1, 3]} />
         <meshStandardMaterial roughness={0.5} metalness={0.05} />
@@ -334,9 +470,6 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         args={[undefined, undefined, Math.max(byType.episode.length, 1)]}
         count={byType.episode.length}
         frustumCulled={false}
-        onPointerMove={pick("episode")}
-        onPointerOut={leave}
-        onClick={click("episode")}
       >
         <octahedronGeometry args={[1, 0]} />
         <meshStandardMaterial roughness={0.7} metalness={0} flatShading />
@@ -347,14 +480,17 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         args={[undefined, undefined, Math.max(byType.entity.length, 1)]}
         count={byType.entity.length}
         frustumCulled={false}
-        onPointerMove={pick("entity")}
-        onPointerOut={leave}
-        onClick={click("entity")}
       >
         <sphereGeometry args={[1, 24, 16]} />
         <meshStandardMaterial roughness={0.35} metalness={0.1} />
       </instancedMesh>
 
+      {anchors.size > 1 &&
+        [...anchors.keys()].map((scope) => (
+          <ScopeLabel key={scope} nodes={byType.note.filter((n) => n.scope === scope)} faded={Boolean(focusSet || highlight)}>
+            {scope}
+          </ScopeLabel>
+        ))}
       {landmarks.map((n) => (
         <Follow key={n.id} node={n}>
           <span className={`landmark${focusSet && !focusSet.has(n.id) ? " faded" : ""}`}>{n.label}</span>
@@ -374,6 +510,29 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         </Follow>
       )}
     </>
+  );
+}
+
+/** A scope's name, floating above the middle of its notes. */
+function ScopeLabel({ nodes, faded, children }: { nodes: Node3[]; faded: boolean; children: React.ReactNode }) {
+  const group = useRef<THREE.Group>(null);
+  useFrame(() => {
+    if (!group.current || nodes.length === 0) return;
+    let x = 0, y = -Infinity, z = 0;
+    for (const n of nodes) {
+      x += n.x;
+      z += n.z;
+      y = Math.max(y, n.y);
+    }
+    group.current.position.set(x / nodes.length, y + 8, z / nodes.length);
+  });
+  if (nodes.length === 0) return null;
+  return (
+    <group ref={group}>
+      <Html center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
+        <span className={`scope-label${faded ? " faded" : ""}`}>{children}</span>
+      </Html>
+    </group>
   );
 }
 

@@ -12,8 +12,12 @@ export const DEFAULT_REFLECTION_MODEL = "@cf/zai-org/glm-5.3";
 export const DUPLICATE_SIMILARITY = 0.93;
 /** Related enough that a model has to decide: same, update, contradiction or new. */
 export const RELATED_SIMILARITY = 0.78;
-/** Draw a "similar" edge in the graph above this. */
-export const LINK_SIMILARITY = 0.8;
+/**
+ * Draw a "similar" edge in the graph above this. Notes on related topics land at
+ * 0.55 to 0.7 with bge-m3 (unrelated ones well below 0.5), so 0.8 left the graph
+ * without a single edge.
+ */
+export const LINK_SIMILARITY = 0.55;
 
 // ------------------------------------------------------------------ vectors
 
@@ -140,6 +144,34 @@ Rules:
 - scope: profile for preferences and working style that hold across projects; project for one project; agent for quirks of one tool or agent.
 - kind: preference (likes, dislikes, style), decision (something chosen), fact (state of the world), learning (a lesson or pitfall).
 - At most 12 facts. Do not invent anything that is not in the episode.`;
+
+export const NOTE_ENTITIES_PROMPT = `You tag notes of a personal memory with the named things they are about: projects, products, tools, services, organisations, people and places. Input: numbered notes. Output only a JSON object, no prose:
+{"notes":[{"note":<number>,"entities":[{"name":"string","type":"person|project|tool|device|org|place|concept"}]}]}
+Rules:
+- Only proper names and product names (e.g. "rhizome", "Cloudflare Workers", "Node.js", "GitHub"). No generic words or ideas like "user", "app", "copy", "replies", "deploys"; a note about none gets an empty list.
+- Write each name the same way in every note, in its usual spelling, without versions ("Node 22" and "Node 26" are both "Node.js").
+- At most 5 entities per note. Do not invent anything that is not in the note.`;
+
+/** Entities per note index, from the note tagging answer. Unknown indexes and empty names are dropped. */
+export function validateNoteEntities(raw: unknown, notes: number): Extraction["entities"][] {
+  const out: Extraction["entities"][] = Array.from({ length: notes }, () => []);
+  const list = (raw as { notes?: unknown })?.notes;
+  if (!Array.isArray(list)) throw new Error("note tagging output has no notes array");
+  for (const n of list) {
+    const i = Number(n?.note);
+    if (!Number.isInteger(i) || i < 0 || i >= notes || !Array.isArray(n?.entities)) continue;
+    const seen = new Set(out[i]!.map((e) => entityKey(e.name)));
+    for (const e of n.entities) {
+      const name = typeof e?.name === "string" ? e.name.trim().slice(0, 80) : "";
+      const key = entityKey(name);
+      if (!name || !key || seen.has(key)) continue;
+      seen.add(key);
+      if (out[i]!.length >= 5) break;
+      out[i]!.push({ name, type: ENTITY_TYPES.includes(e.type) ? (e.type as EntityType) : "concept" });
+    }
+  }
+  return out;
+}
 
 export const RESOLVER_PROMPT = `You keep a personal memory consistent. For each pair, compare the NEW statement with the EXISTING memory and answer with one relation:
 - "same": both say the same thing (wording may differ).

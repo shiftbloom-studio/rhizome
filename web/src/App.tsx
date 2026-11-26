@@ -106,7 +106,9 @@ export function App() {
   const reflect = async () => {
     try {
       await api.reflect();
-      setNotice("Reflection started. New summaries appear in a minute or two.");
+      setNotice("Reflection started. New links, entities and summaries show up in a minute or two.");
+      // Pick up the new edges without a manual reload.
+      for (const ms of [45_000, 120_000]) setTimeout(() => void load(), ms);
     } catch (err) {
       setNotice(String((err as Error).message));
     }
@@ -164,7 +166,7 @@ export function App() {
           <button className="btn" type="submit" disabled={searching}>{searching ? "Searching" : "Search"}</button>
         </form>
         <div className="who">
-          <button className="btn ghost" onClick={reflect} title="Merge duplicates, update importance and rewrite the distilled profile now">Reflect now</button>
+          <button className="btn ghost" onClick={reflect} title="Merge duplicates, link related notes, tag the projects and tools they name, and rewrite the summaries now">Reflect now</button>
           <span className="label">{me.email}</span>
         </div>
       </header>

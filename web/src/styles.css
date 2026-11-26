@@ -112,6 +112,8 @@ code { font: 13px var(--mono); background: var(--blush); padding: 1px 5px; borde
 
 .landmark { font: 500 11px var(--mono); letter-spacing: 0.08em; color: var(--ink); background: rgba(255, 255, 255, 0.8); padding: 2px 7px; border-radius: 999px; white-space: nowrap; transform: translateY(-16px); display: inline-block; transition: opacity 240ms var(--ease); }
 .landmark.faded { opacity: 0.15; }
+.scope-label { font: 500 11px var(--mono); letter-spacing: 0.16em; color: var(--root); background: var(--blush); padding: 3px 9px; border-radius: 999px; white-space: nowrap; display: inline-block; transition: opacity 240ms var(--ease); }
+.scope-label.faded { opacity: 0.2; }
 .tip { width: 260px; background: #fbf8f6; border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px; transform: translate(0, -60%); margin-left: 150px; display: grid; gap: 3px; box-shadow: 0 6px 20px rgba(26, 18, 22, 0.08); }
 .tip-kind { font: 500 10px var(--mono); letter-spacing: 0.14em; color: var(--ink60); }
 .tip-text { font-size: 13px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }

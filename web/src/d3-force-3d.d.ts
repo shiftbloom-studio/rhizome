@@ -41,4 +41,8 @@ declare module "d3-force-3d" {
   export function forceManyBody(): { strength(s: number | ((n: SimNode) => number)): ReturnType<typeof forceManyBody>; distanceMax(d: number): ReturnType<typeof forceManyBody> };
   export function forceCenter(x?: number, y?: number, z?: number): unknown;
   export function forceCollide(r?: number | ((n: SimNode) => number)): unknown;
+  type Axis = { strength(s: number | ((n: SimNode) => number)): Axis };
+  export function forceX(x?: number | ((n: SimNode) => number)): Axis;
+  export function forceY(y?: number | ((n: SimNode) => number)): Axis;
+  export function forceZ(z?: number | ((n: SimNode) => number)): Axis;
 }
