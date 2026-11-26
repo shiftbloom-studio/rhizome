@@ -60,5 +60,6 @@
   // Sign-in without Cloudflare Access: AUTH_MODE=password with LOGIN_EMAIL, plus the secrets LOGIN_PASSWORD and SESSION_SECRET.
   // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT, DISPUTE_RESOLUTION ("on"/"off").
   // Optional var OPEN_LOOPS ("on"): open loops with a due date, shown under Due now in get_context. Off by default.
+  // Optional var STANDING_ORDERS ("on"): rules checked against agents' tool calls, see docs/standing-orders.md. Off by default.
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }

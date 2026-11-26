@@ -7,6 +7,7 @@ import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, runAi, type Env } from "./env";
 import { MIGRATIONS } from "./schema";
 import { correctionLines, ledgerEnabled, MAX_DELETED, MAX_REPLACED, needsCorrection, TOLD_TTL_MS, UNTOLD_TTL_MS, type Corrections, type Step } from "./ledger";
+import { evaluate, ORDER_LIMIT, ordersEnabled, parseRule, type Decision, type Order, type OrderState, type ToolCall } from "./orders";
 import { admitConversation, admitNamed, HANDLE_TTL_MS, heldTarget, isValidWallName, isWallableScope, latestWall, wallOf, WALL_LIMIT, WINDOW_MS, type Seen, type Tracked, type Walls } from "./walls";
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
@@ -1607,6 +1608,129 @@ export class MemoryObject extends DurableObject<Env> {
     return { id, itemId, scope };
   }
 
+  // ------------------------------------------------------- standing orders
+  // Rules the person stated, checked against tool calls (src/orders.ts). Off unless STANDING_ORDERS=on.
+
+  private requireOrders(): void {
+    if (!ordersEnabled(this.env)) throw new Error("standing orders are off (STANDING_ORDERS is not on)");
+  }
+
+  /** Changes whenever an order changes, for the bundle's ETag. */
+  private ordersVersion(): string {
+    return this.meta("orders_version") ?? "0";
+  }
+
+  private bumpOrders(): void {
+    this.setMeta("orders_version", String(Number(this.ordersVersion()) + 1));
+  }
+
+  /** Orders in the given scopes the client may read, oldest first. */
+  listOrders(client: Client, scopes: string[]): { version: string; orders: (Order & { strikes: number })[] } {
+    this.userId(client);
+    this.requireOrders();
+    const readable = scopes.filter((s) => can(client, "read", s));
+    if (!readable.length) return { version: this.ordersVersion(), orders: [] };
+    const rows = this.sql
+      .exec(
+        `SELECT o.*, (SELECT COUNT(*) FROM order_strikes s WHERE s.order_id = o.id) AS strikes FROM orders o
+         WHERE o.scope IN (${readable.map(() => "?").join(", ")}) ORDER BY o.created_at, o.id`,
+        ...readable,
+      )
+      .toArray();
+    return { version: this.ordersVersion(), orders: rows.map((r) => ({ ...toOrder(r), strikes: Number(r.strikes) })) };
+  }
+
+  /**
+   * Stores an order. An agent's order is only checked once the person activates it,
+   * unless it carries the person's own words (state "active").
+   */
+  addOrder(client: Client, input: { scope: string; rule: unknown; state?: OrderState }): Order {
+    this.userId(client);
+    this.requireOrders();
+    if (input.scope !== "profile" && !input.scope.startsWith("project:")) throw new Error("scope must be profile or a project");
+    if (!can(client, "write", input.scope)) throw new ForbiddenError(input.scope);
+    const rule = parseRule(input.rule);
+    const state = input.state ?? "proposed";
+    if (state !== "active" && state !== "proposed") throw new Error("state must be active or proposed");
+    const count = Number(this.sql.exec("SELECT COUNT(*) AS n FROM orders").toArray()[0]!.n);
+    if (count >= ORDER_LIMIT) throw new Error(`the limit is ${ORDER_LIMIT} standing orders`);
+    const now = Date.now();
+    const id = `ord_${newId()}`;
+    this.sql.exec(
+      "INSERT INTO orders (id, scope, says, action, rule, state, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, input.scope, rule.says, rule.action, JSON.stringify(rule.when), state, client.id, now, now,
+    );
+    this.bumpOrders();
+    this.audit(client, "order.add", { id, scope: input.scope, action: rule.action, state });
+    return toOrder(this.sql.exec("SELECT * FROM orders WHERE id = ?", id).toArray()[0]!);
+  }
+
+  /** Activates or disables an order. Only for the person (the explorer), never for an agent. */
+  setOrderState(client: Client, id: string, state: "active" | "disabled"): Order | null {
+    this.userId(client);
+    this.requireOrders();
+    const row = this.sql.exec("SELECT scope FROM orders WHERE id = ?", id).toArray()[0];
+    if (!row) return null;
+    if (!can(client, "write", String(row.scope))) throw new ForbiddenError(String(row.scope));
+    this.sql.exec("UPDATE orders SET state = ?, updated_at = ? WHERE id = ?", state, Date.now(), id);
+    this.bumpOrders();
+    this.audit(client, `order.${state === "active" ? "activate" : "disable"}`, { id });
+    return toOrder(this.sql.exec("SELECT * FROM orders WHERE id = ?", id).toArray()[0]!);
+  }
+
+  /** Deletes an order and its strikes. Only for the person (the explorer), never for an agent. */
+  deleteOrder(client: Client, id: string): { deleted: number } {
+    this.userId(client);
+    this.requireOrders();
+    const row = this.sql.exec("SELECT scope FROM orders WHERE id = ?", id).toArray()[0];
+    if (!row) return { deleted: 0 };
+    if (!can(client, "write", String(row.scope))) throw new ForbiddenError(String(row.scope));
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM order_strikes WHERE order_id = ?", id);
+      this.sql.exec("DELETE FROM orders WHERE id = ?", id);
+    });
+    this.bumpOrders();
+    this.audit(client, "order.delete", { id });
+    return { deleted: 1 };
+  }
+
+  /**
+   * Checks one tool call against the active orders in these scopes. A call an order
+   * stops or flags is recorded as a strike: order, connector, tool name and session,
+   * never the call's input.
+   */
+  checkToolCall(client: Client, scopes: string[], call: ToolCall, session?: string): Decision | null {
+    this.userId(client);
+    this.requireOrders();
+    const readable = scopes.filter((s) => can(client, "read", s));
+    if (!readable.length) return null;
+    const orders = this.sql
+      .exec(`SELECT * FROM orders WHERE state = 'active' AND scope IN (${readable.map(() => "?").join(", ")}) ORDER BY created_at, id`, ...readable)
+      .toArray()
+      .map(toOrder);
+    const decision = evaluate(orders, call);
+    if (decision) {
+      const now = Date.now();
+      this.sql.exec(
+        "INSERT INTO order_strikes (order_id, at, client_id, tool, action, session) VALUES (?, ?, ?, ?, ?, ?)",
+        decision.order, now, client.id, call.tool_name.slice(0, 200), decision.action, session?.slice(0, 200) ?? null,
+      );
+      // Strikes are kept for 90 days.
+      this.sql.exec("DELETE FROM order_strikes WHERE at < ?", now - 90 * 86_400_000);
+    }
+    return decision;
+  }
+
+  /** The latest strikes, newest first, for the explorer. */
+  listStrikes(client: Client, limit = 50) {
+    this.userId(client);
+    this.requireOrders();
+    return this.sql
+      .exec("SELECT order_id, at, client_id, tool, action, session FROM order_strikes ORDER BY seq DESC LIMIT ?", Math.min(Math.max(Math.trunc(limit) || 50, 1), 200))
+      .toArray()
+      .map((r) => ({ order: String(r.order_id), at: iso(r.at), client: String(r.client_id), tool: String(r.tool), action: String(r.action), session: r.session === null ? null : String(r.session) }));
+  }
+
   /** Every scope that holds something, for the explorer's filters. */
   scopes(client: Client): string[] {
     this.userId(client);
@@ -2600,6 +2724,21 @@ export class ForbiddenError extends Error {
     super(`no write access to scope ${scope}`);
     this.name = "ForbiddenError";
   }
+}
+
+function toOrder(r: Row): Order {
+  return {
+    id: String(r.id),
+    scope: String(r.scope),
+    says: String(r.says),
+    action: String(r.action) as Order["action"],
+    when: JSON.parse(String(r.rule)) as Order["when"],
+    state: String(r.state) as OrderState,
+    said: iso(r.created_at).slice(0, 10),
+    createdBy: String(r.created_by),
+    createdAt: iso(r.created_at),
+    updatedAt: iso(r.updated_at),
+  };
 }
 
 function iso(v: SqlStorageValue | undefined): string {

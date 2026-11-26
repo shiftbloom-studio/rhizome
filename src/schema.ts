@@ -275,4 +275,32 @@ export const MIGRATIONS: string[] = [
   );
   CREATE INDEX loops_open ON loops (scope, due_at) WHERE closed_at IS NULL;
   `,
+  // 10: standing orders (src/orders.ts): rules the person stated, checked against
+  // tool calls, and the calls they stopped. A strike keeps the tool name, never its input.
+  `
+  CREATE TABLE orders (
+    id         TEXT PRIMARY KEY,
+    scope      TEXT NOT NULL,
+    says       TEXT NOT NULL,
+    action     TEXT NOT NULL,              -- deny | ask | warn
+    rule       TEXT NOT NULL,              -- JSON: the when clauses
+    state      TEXT NOT NULL,              -- active | proposed | disabled
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX orders_scope ON orders (scope, state);
+
+  CREATE TABLE order_strikes (
+    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id  TEXT NOT NULL,
+    at        INTEGER NOT NULL,
+    client_id TEXT NOT NULL,
+    tool      TEXT NOT NULL,
+    action    TEXT NOT NULL,
+    session   TEXT
+  );
+  CREATE INDEX order_strikes_order ON order_strikes (order_id, at);
+  CREATE INDEX order_strikes_time ON order_strikes (at);
+  `,
 ];

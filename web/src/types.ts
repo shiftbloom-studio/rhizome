@@ -136,3 +136,22 @@ export interface Held {
   via: string;
   at: string;
 }
+
+export interface StandingOrder {
+  id: string;
+  scope: string;
+  says: string;
+  action: "deny" | "ask" | "warn";
+  state: "active" | "proposed" | "disabled";
+  createdBy: string;
+  createdAt: string;
+  strikes: number;
+}
+
+export interface Strike {
+  order: string;
+  at: string;
+  client: string;
+  tool: string;
+  action: string;
+}

@@ -45,6 +45,8 @@ export interface Env {
   OPEN_LOOPS?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
+  /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: off. */
+  STANDING_ORDERS?: string;
   /** Recall steps, comma separated: abstain, diversity, evidence, time, keys, turns, "all" or "none". Default: all. */
   RECALL_FEATURES?: string;
   /** How conversations are cut for search: "fixed" (1,200 characters, default) or "rounds" (one question and its answers). */

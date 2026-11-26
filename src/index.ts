@@ -18,6 +18,7 @@ import { loopsEnabled } from "./loops";
 import { mcpResponse, rpcError } from "./mcp";
 import { cleanupOAuth, oauth, resourceMetadataUrl } from "./oauth";
 import { login } from "./login";
+import { callFromHook, cwdFromHook, HOOK_FORMATS, hookOutput, ordersEnabled, projectFromPath, type HookFormat } from "./orders";
 
 export { MemoryObject } from "./memory-object";
 
@@ -82,7 +83,7 @@ app.post("/mcp", async (c) => {
     return rpcError(null, -32700, "parse error");
   }
   const stub = c.env.MEMORY.get(c.env.MEMORY.idFromName(`user:${client.userId}`));
-  const opts = { loops: loopsEnabled(c.env) };
+  const opts = { loops: loopsEnabled(c.env), orders: ordersEnabled(c.env) };
   if (!analyticsHost(c.env)) return mcpResponse(stub, client, raw, VERSION, undefined, opts);
   // Anonymous usage analytics (MCP_ANALYTICS=on): sent after the answer, never in its way.
   const stats: McpStat[] = [];
@@ -423,6 +424,59 @@ mem.post("/import", async (c) => {
 });
 
 mem.get("/stats", async (c) => c.json(await memory(c).stats(c.get("client"))));
+
+// Standing orders (src/orders.ts, docs/standing-orders.md). Off unless STANDING_ORDERS=on.
+// Agents may read, check and propose orders; only the person activates, disables or deletes them (explorer).
+mem.use("/orders/*", async (c, next) => {
+  if (!ordersEnabled(c.env)) throw new HttpError(404, "standing orders are off");
+  await next();
+});
+mem.use("/orders", async (c, next) => {
+  if (!ordersEnabled(c.env)) throw new HttpError(404, "standing orders are off");
+  await next();
+});
+
+function orderScopes(client: Client, project: string | null | undefined): string[] {
+  if (project !== undefined && project !== null && !isValidSlug(project)) throw new HttpError(400, "invalid project");
+  return ["profile", ...(project ? [`project:${project}`] : [])].filter((s) => can(client, "read", s));
+}
+
+mem.get("/orders", async (c) => {
+  const client = c.get("client");
+  const res = await memory(c).listOrders(client, orderScopes(client, c.req.query("project")));
+  const etag = `"orders-${res.version}"`;
+  c.header("ETag", etag);
+  if (c.req.header("if-none-match") === etag) return c.body(null, 304);
+  return c.json(res);
+});
+
+mem.post("/orders", async (c) => {
+  const client = c.get("client");
+  const b = await body<{ project?: string; says?: unknown; action?: unknown; when?: unknown; saidByUser?: unknown }>(c);
+  if (b.project !== undefined && (typeof b.project !== "string" || !isValidSlug(b.project))) throw new HttpError(400, "invalid project");
+  const scope = b.project ? `project:${b.project}` : "profile";
+  if (!can(client, "write", scope)) throw new HttpError(403, `no write access to scope ${scope}`);
+  const order = await memory(c).addOrder(client, { scope, rule: { says: b.says, action: b.action, when: b.when }, state: b.saidByUser === true ? "active" : "proposed" });
+  return c.json(order, 201);
+});
+
+/**
+ * The check a pre-tool-call hook asks for. The body is the hook's own input; the
+ * answer is in the format of the harness (?format=claude|codex|cursor|gemini). The
+ * project is ?project= or the name of the folder the agent works in.
+ */
+mem.post("/orders/check", async (c) => {
+  const client = c.get("client");
+  const format = (c.req.query("format") ?? "claude") as HookFormat;
+  if (!HOOK_FORMATS.includes(format)) throw new HttpError(400, `format must be one of ${HOOK_FORMATS.join(", ")}`);
+  const input = await body<Record<string, unknown>>(c, 1024 * 1024);
+  const call = callFromHook(input);
+  if (!call) throw new HttpError(400, "the body must be a hook input with tool_name and tool_input");
+  const project = c.req.query("project") ?? projectFromPath(cwdFromHook(input));
+  const session = typeof input.session_id === "string" ? input.session_id : typeof input.conversation_id === "string" ? input.conversation_id : undefined;
+  const decision = await memory(c).checkToolCall(client, orderScopes(client, project), call, session);
+  return c.json(hookOutput(format, decision));
+});
 
 app.route("/v1/memory", mem);
 
