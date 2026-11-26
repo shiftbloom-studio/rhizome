@@ -12,6 +12,7 @@ import { admitConversation, admitNamed, HANDLE_TTL_MS, heldTarget, isValidWallNa
 import { can, type Client } from "./scopes";
 import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
+import { DUE_SHOWN, dueSection, isLoopId, isValidDue, LOOP_PREFIX, loopsEnabled, MAX_OPEN_LOOPS, type DueLoop } from "./loops";
 import { assignFactKeys, confidence, diversify, keywordCoverage, keywordTerms, parseFeatures, shouldAbstain, SIMILARITY_FLOOR } from "./recall";
 import { parseTimeWindow } from "./timewindow";
 import {
@@ -530,7 +531,10 @@ export class MemoryObject extends DurableObject<Env> {
       }
     }
     const blocks = this.listBlocks(client, scopes);
-    let used = blocks.reduce((n, b) => n + estimateTokens(b.value) + 8, 0);
+    // Open loops that are due lead the context and come out of the same budget.
+    const due = loopsEnabled(this.env) ? this.dueLoops(scopes, now) : { loops: [], total: 0 };
+    const dueText = dueSection(due.loops, due.total);
+    let used = blocks.reduce((n, b) => n + estimateTokens(b.value) + 8, 0) + (dueText ? estimateTokens(dueText) : 0);
     const marks = scopes.map(() => "?").join(", ");
     const candidates = scopes.length
       ? this.sql
@@ -552,6 +556,7 @@ export class MemoryObject extends DurableObject<Env> {
       notes.push(n);
     }
     const lines: string[] = [];
+    if (dueText) lines.push(dueText);
     for (const b of blocks) lines.push(`## ${b.label} (${b.scope})\n${b.value}`);
     if (notes.length) {
       lines.push("## Remembered notes");
@@ -561,7 +566,7 @@ export class MemoryObject extends DurableObject<Env> {
     // Ledger: corrections first, then this call's notes count as given.
     const fixes = track && this.ledgerOn ? this.takeCorrections(client, scopes, now) : null;
     if (track && this.ledgerOn) this.recordDeliveries(client, notes, now);
-    if (track) this.recordReads(client, track, [...notes.map((n) => n.scope), ...blocks.map((b) => b.scope), ...(fixes?.scopes ?? [])], now);
+    if (track) this.recordReads(client, track, [...notes.map((n) => n.scope), ...blocks.map((b) => b.scope), ...(fixes?.scopes ?? []), ...due.loops.map((l) => l.scope)], now);
     return {
       text,
       blocks,
@@ -926,6 +931,7 @@ export class MemoryObject extends DurableObject<Env> {
   /** Hard delete of one item, or of an episode with all its chunks and its raw copy. */
   async forget(client: Client, id: string): Promise<{ deleted: number }> {
     this.userId(client);
+    if (isLoopId(id)) return this.forgetLoop(client, id);
     const episode = this.sql.exec("SELECT scope, r2_key FROM episodes WHERE id = ?", id).toArray()[0];
     const now = Date.now();
     if (episode) {
@@ -983,10 +989,13 @@ export class MemoryObject extends DurableObject<Env> {
       .map(toItem);
     const next = items.length ? items[items.length - 1]!.id : null;
     const blocks = after === "" ? this.sql.exec("SELECT * FROM blocks").toArray().map(toBlock) : [];
+    const loops = after === "" ? this.sql.exec("SELECT * FROM loops ORDER BY created_at").toArray().map(toLoop) : [];
     // Only what this client may read, e.g. another agent's private scope stays out.
+    const readableLoops = loops.filter((l) => can(client, "read", l.scope));
     return {
       items: items.filter((i) => can(client, "read", i.scope)),
       blocks: blocks.filter((b) => can(client, "read", b.scope)),
+      ...(readableLoops.length ? { loops: readableLoops } : {}),
       next,
     };
   }
@@ -1623,6 +1632,77 @@ export class MemoryObject extends DurableObject<Env> {
     if (!pending) this.enqueue("reflect", at === undefined ? "all" : `at:${at}`);
     await this.kick(1_000);
     return { scheduled: true };
+  }
+
+  // ------------------------------------------------------------ open loops
+
+  /**
+   * Opens a loop: something to come back to from `dueAt` on (see loops.ts). A
+   * conversation that was given walled memory opens it inside that wall (walls rule 3).
+   */
+  openLoop(client: Client, input: { scope: string; content: string; dueAt?: number; track?: Tracked }): { id: string; scope: string; dueAt: string | null } {
+    this.userId(client);
+    if (!loopsEnabled(this.env)) throw new Error("open loops are not allowed here");
+    const content = input.content.trim();
+    if (!content) throw new Error("loop is empty");
+    // Out of Date's range a due time would break every later get_context of the scope.
+    if (input.dueAt !== undefined && !isValidDue(input.dueAt)) throw new Error("due must be a time between 1970 and 9999");
+    if (!can(client, "write", input.scope)) throw new ForbiddenError(input.scope);
+    const now = Date.now();
+    const scope = (input.track ? this.writeInside(client, input.track, input.scope, now) : null) ?? input.scope;
+    const open = Number(this.sql.exec("SELECT COUNT(*) AS n FROM loops WHERE closed_at IS NULL").toArray()[0]?.n ?? 0);
+    if (open >= MAX_OPEN_LOOPS) throw new Error(`open loop limit is ${MAX_OPEN_LOOPS}: close some first`);
+    const id = LOOP_PREFIX + newId();
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        "INSERT INTO loops (id, scope, content, due_at, client_id, agent, provider, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        id, scope, content, input.dueAt ?? null, client.id, client.agent, client.provider, now,
+      );
+      this.audit(client, "loop.open", { id, scope });
+    });
+    return { id, scope, dueAt: input.dueAt === undefined ? null : new Date(input.dueAt).toISOString() };
+  }
+
+  /** Closes an open loop. Null when there is no open loop with this id that this connection may write to. */
+  closeLoop(client: Client, id: string, outcome?: string): { id: string; scope: string } | null {
+    this.userId(client);
+    if (!loopsEnabled(this.env)) throw new Error("open loops are not allowed here");
+    const row = this.sql.exec("SELECT scope FROM loops WHERE id = ? AND closed_at IS NULL", id).toArray()[0];
+    if (!row) return null;
+    const scope = String(row.scope);
+    // A loop this connection may not write to is treated as not there.
+    if (!can(client, "write", scope)) return null;
+    const text = outcome?.trim() || null;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("UPDATE loops SET closed_at = ?, closed_by = ?, outcome = ? WHERE id = ?", Date.now(), client.id, text, id);
+      this.audit(client, "loop.close", { id });
+    });
+    return { id, scope };
+  }
+
+  /** Open loops of these scopes that are due now, soonest first, and how many there are. */
+  private dueLoops(scopes: string[], now: number): { loops: DueLoop[]; total: number } {
+    if (!scopes.length) return { loops: [], total: 0 };
+    const marks = scopes.map(() => "?").join(", ");
+    const where = `closed_at IS NULL AND scope IN (${marks}) AND (due_at IS NULL OR due_at <= ?)`;
+    const total = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM loops WHERE ${where}`, ...scopes, now).toArray()[0]?.n ?? 0);
+    if (!total) return { loops: [], total: 0 };
+    const loops = this.sql
+      .exec(`SELECT id, scope, content, due_at FROM loops WHERE ${where} ORDER BY COALESCE(due_at, created_at), id LIMIT ?`, ...scopes, now, DUE_SHOWN)
+      .toArray()
+      .map((r) => ({ id: String(r.id), scope: String(r.scope), content: String(r.content), dueAt: r.due_at == null ? null : Number(r.due_at) }));
+    return { loops, total };
+  }
+
+  private forgetLoop(client: Client, id: string): { deleted: number } {
+    const row = this.sql.exec("SELECT scope FROM loops WHERE id = ?", id).toArray()[0];
+    if (!row) return { deleted: 0 };
+    if (!can(client, "write", String(row.scope))) throw new ForbiddenError(String(row.scope));
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM loops WHERE id = ?", id);
+      this.audit(client, "forget.loop", { id });
+    });
+    return { deleted: 1 };
   }
 
   // ----------------------------------------------------------------- alarm
@@ -2534,6 +2614,20 @@ function toOrder(r: Row): Order {
 
 function iso(v: SqlStorageValue | undefined): string {
   return new Date(Number(v)).toISOString();
+}
+
+function toLoop(r: Row) {
+  return {
+    id: String(r.id),
+    scope: String(r.scope),
+    content: String(r.content),
+    dueAt: r.due_at == null ? null : iso(r.due_at),
+    agent: String(r.agent),
+    provider: String(r.provider),
+    createdAt: iso(r.created_at),
+    closedAt: r.closed_at == null ? null : iso(r.closed_at),
+    outcome: r.outcome == null ? null : String(r.outcome),
+  };
 }
 
 function toItem(r: Row): MemoryItem {

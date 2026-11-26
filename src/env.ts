@@ -32,6 +32,17 @@ export interface Env {
    * on its next get_context or recall, when that memory was replaced or deleted. Default: off.
    */
   LEDGER?: string;
+  /**
+   * "on": anonymous MCP usage analytics to PostHog (tool name, outcome, latency, sizes,
+   * client software). Needs POSTHOG_KEY and POSTHOG_HOST. See src/analytics.ts. Default: off.
+   */
+  MCP_ANALYTICS?: string;
+  /** PostHog project API key (phc_...). Set as a secret or deploy variable, never committed. */
+  POSTHOG_KEY?: string;
+  /** PostHog ingestion host, e.g. https://eu.i.posthog.com or https://us.i.posthog.com. */
+  POSTHOG_HOST?: string;
+  /** "on": open loops. Agents can open a loop with a due time, get_context leads with what is due, close_loop ends it. Default: off. */
+  OPEN_LOOPS?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
   /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: off. */

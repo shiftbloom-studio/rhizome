@@ -37,7 +37,10 @@
     "RECALL_FEATURES": "all",
     "CHUNKING": "rounds",
     // Nightly reflection settles disputed notes by trust and time (see README).
-    "DISPUTE_RESOLUTION": "on"
+    "DISPUTE_RESOLUTION": "on",
+    // Anonymous MCP usage analytics to PostHog, off unless MCP_ANALYTICS is "on" (see README).
+    "MCP_ANALYTICS": "<MCP_ANALYTICS?>",
+    "POSTHOG_HOST": "<POSTHOG_HOST?>"
   },
   "ai": { "binding": "AI" },
   "durable_objects": { "bindings": [{ "name": "MEMORY", "class_name": "MemoryObject" }] },
@@ -53,7 +56,10 @@
     { "name": "LOGIN_RATE_LIMITER", "namespace_id": "4202", "simple": { "limit": 10, "period": 60 } }
   ]
   // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Enables the /v1/admin endpoints.
+  // Secret: POSTHOG_KEY (wrangler secret put POSTHOG_KEY), the PostHog project API key for MCP_ANALYTICS.
   // Sign-in without Cloudflare Access: AUTH_MODE=password with LOGIN_EMAIL, plus the secrets LOGIN_PASSWORD and SESSION_SECRET.
-  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT, DISPUTE_RESOLUTION ("on"/"off"). STANDING_ORDERS ("on": rules checked against agents' tool calls, see docs/standing-orders.md).
+  // Optional vars: EMBEDDING_MODEL, RERANK_MODEL, EXTRACTION_MODEL, REFLECTION_MODEL, EXTRACTION ("off"), EXTRACTION_DAILY_LIMIT, DISPUTE_RESOLUTION ("on"/"off").
+  // Optional var OPEN_LOOPS ("on"): open loops with a due date, shown under Due now in get_context. Off by default.
+  // Optional var STANDING_ORDERS ("on"): rules checked against agents' tool calls, see docs/standing-orders.md. Off by default.
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }

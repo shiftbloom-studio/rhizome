@@ -182,7 +182,7 @@ describe("hook formats", () => {
 type ToolBody = { result?: { content: { text: string }[]; isError?: boolean; structuredContent?: Record<string, unknown> }; error?: { message: string } };
 let rpcId = 0;
 async function rpc(mo: MemoryObject, client: Client, method: string, params: Record<string, unknown>, orders: boolean) {
-  const res = await mcpResponse(mo as unknown as MemoryApi, client, { jsonrpc: "2.0", id: ++rpcId, method, params }, "test", { orders });
+  const res = await mcpResponse(mo as unknown as MemoryApi, client, { jsonrpc: "2.0", id: ++rpcId, method, params }, "test", undefined, { orders });
   return (await res.json()) as ToolBody;
 }
 const tool = (mo: MemoryObject, client: Client, name: string, args: Record<string, unknown>, orders = true) => rpc(mo, client, "tools/call", { name, arguments: args }, orders);

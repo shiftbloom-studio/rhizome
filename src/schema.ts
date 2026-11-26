@@ -257,7 +257,25 @@ export const MIGRATIONS: string[] = [
   ) WITHOUT ROWID;
   CREATE INDEX deliveries_pending ON deliveries (client_id, corrected_at);
   `,
-  // 9: standing orders (src/orders.ts): rules the person stated, checked against
+  // 9: open loops (see loops.ts). due_at works like a note's valid_from: the loop
+  // applies from then on (NULL = the next time its scope is loaded); closed_at ends it.
+  `
+  CREATE TABLE loops (
+    id         TEXT PRIMARY KEY,
+    scope      TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    due_at     INTEGER,
+    client_id  TEXT NOT NULL,
+    agent      TEXT NOT NULL,
+    provider   TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    closed_at  INTEGER,
+    closed_by  TEXT,
+    outcome    TEXT
+  );
+  CREATE INDEX loops_open ON loops (scope, due_at) WHERE closed_at IS NULL;
+  `,
+  // 10: standing orders (src/orders.ts): rules the person stated, checked against
   // tool calls, and the calls they stopped. A strike keeps the tool name, never its input.
   `
   CREATE TABLE orders (
