@@ -192,4 +192,15 @@ export const MIGRATIONS: string[] = [
           AND ((c.src = items.id AND c.dst = items.superseded_by) OR (c.dst = items.id AND c.src = items.superseded_by))
       );
   `,
+  // 4: fact keys. Episode chunks are also found through the facts extracted
+  // from them (recall feature "keys"). Keyed by the chunk's rowid.
+  `
+  CREATE VIRTUAL TABLE chunk_keys USING fts5 (
+    keys,
+    tokenize = 'unicode61 remove_diacritics 2'
+  );
+  CREATE TRIGGER items_keys_ad AFTER DELETE ON items WHEN old.kind = 'chunk' BEGIN
+    DELETE FROM chunk_keys WHERE rowid = old.rowid;
+  END;
+  `,
 ];

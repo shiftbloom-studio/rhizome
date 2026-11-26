@@ -7,9 +7,9 @@ import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANK_MODEL, runAi, type Env } from "./env";
 import { MIGRATIONS } from "./schema";
 import { can, type Client } from "./scopes";
-import { chunk, estimateTokens, ftsQuery, rrf, transcript } from "./text";
+import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
-import { confidence, diversify, keywordCoverage, keywordTerms, parseFeatures, shouldAbstain, SIMILARITY_FLOOR } from "./recall";
+import { assignFactKeys, confidence, diversify, keywordCoverage, keywordTerms, parseFeatures, shouldAbstain, SIMILARITY_FLOOR } from "./recall";
 import { parseTimeWindow } from "./timewindow";
 import {
   DEFAULT_EXTRACTION_MODEL,
@@ -57,6 +57,8 @@ export interface EpisodeInput {
   messages?: { role: string; content: string }[];
   text?: string;
   metadata?: Record<string, unknown>;
+  /** How a conversation is cut for search: "fixed" (1,200 characters) or "rounds". Default: the CHUNKING variable, else "fixed". */
+  chunking?: "fixed" | "rounds";
 }
 
 export interface NoteInput {
@@ -83,6 +85,11 @@ export interface RecallInput {
   features?: string[];
   /** Time that words like "last week" are read against (epoch milliseconds). Default: now. */
   referenceTime?: number;
+  /**
+   * Recall as of this time (epoch milliseconds): notes that were true then,
+   * including ones replaced since, and excerpts from before it.
+   */
+  asOf?: number;
 }
 
 export interface RecallEvidence {
@@ -108,6 +115,8 @@ export interface RecallResult {
   abstained?: boolean;
   /** The time window recall was limited to, if any. */
   window?: { from: string; to: string | null; source: "agent" | "query"; text?: string };
+  /** Set when recall ran as of a past time. */
+  asOf?: string;
 }
 
 export interface MemoryItem {
@@ -181,6 +190,32 @@ const MAX_JOB_ATTEMPTS = 4;
 const MAX_CANDIDATES = 5000;
 const RECALLABLE = "('active', 'disputed')";
 const SYSTEM_EXTRACTION = "system:extraction";
+
+/**
+ * SQL condition on table alias `t` for what recall may return, with its
+ * parameters. A window limits by event time. As of a past time, excerpts must
+ * be from before it and notes must have been true then, including notes replaced
+ * since; merged duplicates and the losing side of a settled dispute carry no end
+ * of validity and stay out.
+ */
+function recallCondition(t: string, window?: { from: number; to: number }, asOf?: number): { sql: string; args: number[] } {
+  const parts: string[] = [];
+  const args: number[] = [];
+  if (asOf === undefined) parts.push(`${t}.status IN ${RECALLABLE}`);
+  else {
+    parts.push(`(${t}.status IN ${RECALLABLE} OR (${t}.status = 'superseded' AND ${t}.valid_to IS NOT NULL))`);
+    parts.push(
+      `(CASE WHEN ${t}.kind = 'chunk' THEN ${t}.t_event <= ?
+             ELSE (${t}.valid_from IS NULL OR ${t}.valid_from <= ?) AND (${t}.valid_to IS NULL OR ${t}.valid_to > ?) END)`,
+    );
+    args.push(asOf, asOf, asOf);
+  }
+  if (window) {
+    parts.push(`${t}.t_event >= ? AND ${t}.t_event < ?`);
+    args.push(window.from, window.to);
+  }
+  return { sql: parts.join(" AND "), args };
+}
 const SYSTEM_REFLECTION = "system:reflection";
 
 export class MemoryObject extends DurableObject<Env> {
@@ -285,7 +320,8 @@ export class MemoryObject extends DurableObject<Env> {
       }),
       { httpMetadata: { contentType: "application/json" } },
     );
-    const parts = chunk(text);
+    const chunking = input.chunking ?? (this.env.CHUNKING === "rounds" ? "rounds" : "fixed");
+    const parts = chunking === "rounds" && input.messages?.length ? roundChunks(input.messages) : chunk(text);
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(
         `INSERT INTO episodes (id, scope, session_id, client_id, agent, provider, model, t_event, created_at, r2_key, chars, preview)
@@ -478,7 +514,7 @@ export class MemoryObject extends DurableObject<Env> {
     if (input.from !== undefined || input.to !== undefined) {
       window = { from: input.from ?? 0, to: input.to ?? Number.MAX_SAFE_INTEGER, source: "agent" };
     } else if (features.has("time")) {
-      const parsed = parseTimeWindow(input.query, input.referenceTime ?? started);
+      const parsed = parseTimeWindow(input.query, input.referenceTime ?? input.asOf ?? started);
       if (parsed) window = { from: parsed.from, to: parsed.to, source: "query", text: parsed.text };
     }
 
@@ -487,34 +523,49 @@ export class MemoryObject extends DurableObject<Env> {
       Promise.all(vs.map((v) => this.vectorSearch(userId, v, scopes).catch(() => [] as string[]))),
     );
 
+    const asOf = input.asOf;
     const search = (w: RecallWindow | undefined) => {
-      const time = w ? " AND items.t_event >= ? AND items.t_event < ?" : "";
-      const timeArgs = w ? [w.from, w.to] : [];
+      const cond = recallCondition("items", w, asOf);
       const fts = queries.map((q) => {
         const match = ftsQuery(q);
         return match
           ? this.sql
               .exec(
                 `SELECT items.id AS id FROM items_fts JOIN items ON items.rowid = items_fts.rowid
-                 WHERE items_fts MATCH ? AND items.scope IN (${marks}) AND items.status IN ${RECALLABLE}${time}
+                 WHERE items_fts MATCH ? AND items.scope IN (${marks}) AND ${cond.sql}
                  ORDER BY bm25(items_fts) LIMIT 50`,
                 match,
                 ...scopes,
-                ...timeArgs,
+                ...cond.args,
               )
               .toArray()
               .map((r) => String(r.id))
           : [];
       });
+      // Feature "keys": excerpts found through the facts extracted from them.
+      const keys = features.has("keys")
+        ? queries.map((q) => {
+            const match = ftsQuery(q);
+            return match
+              ? this.sql
+                  .exec(
+                    `SELECT items.id AS id FROM chunk_keys JOIN items ON items.rowid = chunk_keys.rowid
+                     WHERE chunk_keys MATCH ? AND items.kind = 'chunk' AND items.scope IN (${marks}) AND ${cond.sql}
+                     ORDER BY bm25(chunk_keys) LIMIT 50`,
+                    match,
+                    ...scopes,
+                    ...cond.args,
+                  )
+                  .toArray()
+                  .map((r) => String(r.id))
+              : [];
+          })
+        : [];
       const recent = this.sql
-        .exec(
-          `SELECT id FROM items WHERE scope IN (${marks}) AND status IN ${RECALLABLE}${time.replaceAll("items.", "")} ORDER BY t_event DESC LIMIT 10`,
-          ...scopes,
-          ...timeArgs,
-        )
+        .exec(`SELECT id FROM items WHERE scope IN (${marks}) AND ${recallCondition("items", w, asOf).sql} ORDER BY t_event DESC LIMIT 10`, ...scopes, ...cond.args)
         .toArray()
         .map((r) => String(r.id));
-      return { fts, recent };
+      return { fts: [...fts, ...keys], recent };
     };
 
     let { fts: ftsLists, recent: recentIds } = search(window);
@@ -522,34 +573,38 @@ export class MemoryObject extends DurableObject<Env> {
     const qvecs = await queryVectors;
     // Inside a window the stored embeddings are scored exactly: the vector index
     // can neither filter by time nor see writes of the last minute or so.
-    let windowVecLists: string[][] = window ? qvecs.map((v) => this.exactSearch(v, scopes, window!)) : [];
+    // The same holds for recall as of a past time.
+    const exact = (w: RecallWindow | undefined) => (w || asOf !== undefined ? qvecs.map((v) => this.exactSearch(v, scopes, recallCondition("i", w, asOf))) : []);
+    let windowVecLists: string[][] = exact(window);
     if (window?.source === "query" && ftsLists.every((l) => l.length === 0) && windowVecLists.every((l) => l.length === 0)) {
       window = undefined;
       ({ fts: ftsLists, recent: recentIds } = search(undefined));
-      windowVecLists = [];
+      windowVecLists = exact(undefined);
     }
 
-    // Superseded or merged memories are replaced by their current version.
-    const current = (ids: string[]) => ids.map((id) => this.currentVersion(id));
+    // Superseded or merged memories are replaced by their current version, unless
+    // recall runs as of a past time: then the version that was true back then counts.
+    const current = (ids: string[]) => (asOf !== undefined ? ids : ids.map((id) => this.currentVersion(id)));
     const fused = rrf([...vecLists.map(current), ...windowVecLists.map(current), ...ftsLists.map(current), recentIds.slice(0, 5)]);
     const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 24);
     const vectorCount = vecLists.reduce((n, l) => n + l.length, 0) + windowVecLists.reduce((n, l) => n + l.length, 0);
     const ftsCount = ftsLists.reduce((n, l) => n + l.length, 0);
     const sources = { vector: vectorCount, fts: ftsCount, recent: recentIds.length };
+    const asOfOut = asOf !== undefined ? { asOf: iso(asOf) } : {};
     const windowOut = window && { from: iso(window.from), to: window.to >= Number.MAX_SAFE_INTEGER ? null : iso(window.to), source: window.source, ...(window.text ? { text: window.text } : {}) };
     if (ranked.length === 0) {
-      return { items: [], text: "", tookMs: Date.now() - started, sources, ...(features.has("abstain") ? { abstained: true } : {}), ...(windowOut ? { window: windowOut } : {}) };
+      return { items: [], text: "", tookMs: Date.now() - started, sources, ...(features.has("abstain") ? { abstained: true } : {}), ...(windowOut ? { window: windowOut } : {}), ...asOfOut };
     }
 
     const idMarks = ranked.map(() => "?").join(", ");
-    const time = window ? " AND t_event >= ? AND t_event < ?" : "";
+    const cond = recallCondition("items", window, asOf);
     const rows = new Map(
       this.sql
         .exec(
-          `SELECT * FROM items WHERE id IN (${idMarks}) AND scope IN (${marks}) AND status IN ${RECALLABLE}${time}`,
+          `SELECT * FROM items WHERE id IN (${idMarks}) AND scope IN (${marks}) AND ${cond.sql}`,
           ...ranked.map(([id]) => id),
           ...scopes,
-          ...(window ? [window.from, window.to] : []),
+          ...cond.args,
         )
         .toArray()
         .map((r) => [String(r.id), toItem(r)] as const),
@@ -566,7 +621,7 @@ export class MemoryObject extends DurableObject<Env> {
 
     if (features.has("abstain") && shouldAbstain(candidates)) {
       this.audit(client, "recall", { scopes, results: 0, abstained: true });
-      return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}) };
+      return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}), ...asOfOut };
     }
 
     const maxRrf = Math.max(...candidates.map((c) => c.score ?? 0), 1e-9);
@@ -644,6 +699,7 @@ export class MemoryObject extends DurableObject<Env> {
       sources,
       ...(features.has("abstain") ? { abstained: false } : {}),
       ...(windowOut ? { window: windowOut } : {}),
+      ...asOfOut,
     };
   }
 
@@ -656,17 +712,16 @@ export class MemoryObject extends DurableObject<Env> {
     return res.matches.map((m) => m.id);
   }
 
-  /** Top 50 by exact cosine over the stored embeddings of the items inside a time window. */
-  private exactSearch(vector: number[], scopes: string[], window: { from: number; to: number }): string[] {
+  /** Top 50 by exact cosine over the stored embeddings of the items that pass `cond` (on alias i). */
+  private exactSearch(vector: number[], scopes: string[], cond: { sql: string; args: number[] }): string[] {
     const rows = this.sql
       .exec(
         `SELECT i.id, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id AND e.model = ?
-         WHERE i.scope IN (SELECT value FROM json_each(?)) AND i.status IN ${RECALLABLE} AND i.t_event >= ? AND i.t_event < ?
+         WHERE i.scope IN (SELECT value FROM json_each(?)) AND ${cond.sql}
          ORDER BY i.t_event DESC LIMIT ?`,
         this.embeddingModel,
         JSON.stringify(scopes),
-        window.from,
-        window.to,
+        ...cond.args,
         MAX_CANDIDATES,
       )
       .toArray()
@@ -1363,7 +1418,66 @@ export class MemoryObject extends DurableObject<Env> {
         now, SYSTEM_EXTRACTION, JSON.stringify({ episodeId, model, ...counts, labelled, resolved: ask.length, related: related.length, entities: extraction.entities.length }),
       );
     });
+    this.storeFactKeys(episodeId, facts.map((f) => f.statement), vectors);
     if (created.length) await this.kick(100);
+  }
+
+  /** Fact keys for up to 200 episodes that have derived notes but no keys yet. Returns how many got keys. */
+  private backfillFactKeys(): number {
+    const episodes = this.sql
+      .exec(
+        `SELECT ep.id FROM episodes ep
+         WHERE EXISTS (SELECT 1 FROM links l WHERE l.dst = ep.id AND l.kind = 'derived_from')
+           AND NOT EXISTS (SELECT 1 FROM items c JOIN chunk_keys k ON k.rowid = c.rowid WHERE c.episode_id = ep.id)
+         ORDER BY ep.t_event DESC LIMIT 200`,
+      )
+      .toArray();
+    let keyed = 0;
+    for (const ep of episodes) {
+      const notes = this.sql
+        .exec(
+          `SELECT n.content, e.vec FROM links l JOIN items n ON n.id = l.src AND n.kind = 'note'
+           LEFT JOIN embeddings e ON e.item_id = n.id AND e.model = ?
+           WHERE l.dst = ? AND l.kind = 'derived_from' LIMIT 50`,
+          this.embeddingModel,
+          ep.id,
+        )
+        .toArray();
+      if (notes.length === 0) continue;
+      const vectors = notes.map((n) => (n.vec ? Array.from(decodeVector(n.vec as ArrayBuffer)) : undefined));
+      // assignFactKeys uses cosine only when every fact and excerpt has an embedding.
+      const statements = notes.map((n) => String(n.content));
+      this.storeFactKeys(String(ep.id), statements, vectors.every(Boolean) ? (vectors as number[][]) : []);
+      keyed++;
+    }
+    return keyed;
+  }
+
+  /**
+   * Fact keys: each extracted fact is filed under the excerpt of its episode it
+   * most likely came from (closest stored embedding, or keyword overlap when the
+   * excerpt has none yet), so recall can find excerpts through their facts. No
+   * model call.
+   */
+  private storeFactKeys(episodeId: string, statements: string[], vectors: (number[] | undefined)[]): void {
+    if (statements.length === 0) return;
+    const chunks = this.sql
+      .exec(
+        `SELECT c.rowid AS rid, c.content, e.vec FROM items c LEFT JOIN embeddings e ON e.item_id = c.id AND e.model = ?
+         WHERE c.episode_id = ? AND c.kind = 'chunk'`,
+        this.embeddingModel,
+        episodeId,
+      )
+      .toArray()
+      .map((r) => ({ rid: Number(r.rid), content: String(r.content), vec: r.vec ? decodeVector(r.vec as ArrayBuffer) : null }));
+    if (chunks.length === 0) return;
+    const keys = assignFactKeys(statements, vectors, chunks);
+    this.ctx.storage.transactionSync(() => {
+      for (const [rid, list] of keys) {
+        this.sql.exec("DELETE FROM chunk_keys WHERE rowid = ?", rid);
+        this.sql.exec("INSERT INTO chunk_keys (rowid, keys) VALUES (?, ?)", rid, list.join("\n"));
+      }
+    });
   }
 
   /**
@@ -1609,6 +1723,9 @@ export class MemoryObject extends DurableObject<Env> {
 
     // 4. entities for notes that did not come from an episode (remembered, imported, written in the explorer)
     report.tagged = this.extractionEnabled ? await this.tagNoteEntities() : 0;
+
+    // 4b. fact keys for episodes extracted before keys existed, from the notes derived from them (no model call)
+    report.keyed = this.backfillFactKeys();
 
     // 5. distilled profile and project summaries
     const model = this.env.REFLECTION_MODEL ?? DEFAULT_REFLECTION_MODEL;

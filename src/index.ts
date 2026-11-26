@@ -287,6 +287,7 @@ mem.post("/recall", async (c) => {
     queries?: unknown;
     from?: unknown;
     to?: unknown;
+    asOf?: unknown;
     features?: unknown;
   }>(c);
   const query = str(b.query, "query", 2000)?.trim();
@@ -303,12 +304,16 @@ mem.post("/recall", async (c) => {
   }
   let from: number | undefined;
   let to: number | undefined;
+  let asOf: number | undefined;
   try {
     from = parseRangeBound(b.from, false);
     to = parseRangeBound(b.to, true);
+    asOf = parseRangeBound(b.asOf, true);
   } catch {
-    throw new HttpError(400, "from and to must be ISO 8601 dates or times");
+    throw new HttpError(400, "from, to and asOf must be ISO 8601 dates or times");
   }
+  // A date as asOf means the end of that day.
+  if (asOf !== undefined && typeof b.asOf === "string" && /^\d{4}-\d{2}-\d{2}$/.test(b.asOf.trim())) asOf -= 1;
   const scopes = recallScopes(client, b.scopes, b.project);
   const res = await memory(c).recall(client, {
     query,
@@ -319,6 +324,7 @@ mem.post("/recall", async (c) => {
     queries: b.queries as string[] | undefined,
     from,
     to,
+    asOf,
     features: b.features as string[] | undefined,
   });
   return c.json({ ...res, scopes });

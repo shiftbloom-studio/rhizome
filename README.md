@@ -98,7 +98,7 @@ Until the chosen mode is fully configured, the explorer API answers 404 and nobo
 | Tool | What it does |
 | --- | --- |
 | `get_context` | Profile, working style and, with a `project`, its summary and most trusted notes. For the start of a task |
-| `recall` | Hybrid search across the profile, the agent's own notes and every project it may read, or one `project`. Optional `queries` (other wordings or parts of the question) and a `from`/`to` time range |
+| `recall` | Hybrid search across the profile, the agent's own notes and every project it may read, or one `project`. Optional `queries` (other wordings or parts of the question), a `from`/`to` time range and `as_of` |
 | `remember` | Stores one note. `said_by_user: true` marks it as something the person said, which wins conflicts |
 | `save_conversation` | Stores a conversation verbatim; notes are extracted from it in the background |
 | `import_memory_file` | Imports a `CLAUDE.md`, `AGENTS.md`, Hermes `MEMORY.md` or `USER.md`, or any Markdown notes. Each bullet or paragraph becomes a note, and a second import of the same file adds nothing |
@@ -121,7 +121,7 @@ All memory endpoints take `Authorization: Bearer <client api key>`.
 | --- | --- | --- |
 | `POST` | `/v1/memory/episodes` | Store a conversation turn or any text (`messages` or `text`, optional `scope`, `sessionId`, `model`, `tEvent`) |
 | `POST` | `/v1/memory/notes` | Store a note (`content`, `kind`: preference, decision, fact, learning, note; `trust`) |
-| `POST` | `/v1/memory/recall` | Hybrid search (`query`, optional `scopes`, `project`, `limit`, `budgetTokens`, `queries`, `from`, `to`, `features`) |
+| `POST` | `/v1/memory/recall` | Hybrid search (`query`, optional `scopes`, `project`, `limit`, `budgetTokens`, `queries`, `from`, `to`, `asOf`, `features`) |
 | `GET` | `/v1/memory/context` | Cache-friendly core for a system prompt: blocks plus the most trusted notes. Supports `ETag` |
 | `GET` | `/v1/memory/blocks` | List working-memory blocks |
 | `PUT` | `/v1/memory/blocks/:label` | Create or replace a block (`scope`, `value`, `charLimit`) |
@@ -135,11 +135,16 @@ All memory endpoints take `Authorization: Bearer <client api key>`.
 
 Recall leaves out superseded and archived notes, and returns disputed ones with a lower score. Every result carries a `confidence` between 0 and 1. A `from`/`to` range (ISO dates; a date as `to` includes that day) limits recall to memories from that time and scores their stored embeddings exactly.
 
+`asOf` (`as_of` on MCP) answers as of a past date or time: notes that were true then, including ones replaced since, and conversation excerpts from before it. A date means the end of that day.
+
+Set `CHUNKING=rounds` to cut new conversations into rounds (a question with its answers, short rounds joined) instead of fixed 1,200-character excerpts.
+
 Optional recall steps are off until you turn them on, per request with `features` or for every request with the `RECALL_FEATURES` variable (comma separated, or `all`):
 
 * `abstain`: returns nothing (`abstained: true`) when no result shares a keyword with the query and none is semantically close.
 * `diversity`: at most one excerpt per conversation, and near-identical results make room for different ones.
 * `evidence`: a note brings the conversation excerpt it was extracted from, when the token budget allows.
+* `keys`: conversation excerpts are also found through the facts extracted from them. New extractions file each fact under its excerpt; nightly reflection fills in older episodes.
 * `time`: English and German time words in the query ("last week", "letzten Monat", "im März", "vor 3 Tagen", "since Monday") become a time window. When nothing falls inside it, recall runs without it.
 
 ```sh

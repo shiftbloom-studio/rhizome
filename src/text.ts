@@ -66,3 +66,35 @@ export function rrf(lists: string[][], k = 60): Map<string, number> {
 export function transcript(messages: { role: string; content: string }[]): string {
   return messages.map((m) => `[${m.role}] ${m.content}`).join("\n");
 }
+
+/**
+ * Splits a conversation into units of one round each: a user message with the
+ * replies that follow it. Rounds keep a question and its answer together, which
+ * fixed-size chunks cut apart. Short rounds are joined with the next one up to
+ * `max` characters, and a round longer than `max` is cut like plain text.
+ */
+export function roundChunks(messages: { role: string; content: string }[], max = 1200, overlap = 150, minRound = 300): string[] {
+  const rounds: string[] = [];
+  let current: { role: string; content: string }[] = [];
+  for (const m of messages) {
+    if (m.role === "user" && current.some((c) => c.role !== "user")) {
+      rounds.push(transcript(current));
+      current = [];
+    }
+    current.push(m);
+  }
+  if (current.length) rounds.push(transcript(current));
+
+  const out: string[] = [];
+  let pending = "";
+  for (const round of rounds.map((r) => r.trim()).filter(Boolean)) {
+    if (pending && pending.length + 1 + round.length <= max && (pending.length < minRound || round.length < minRound)) {
+      pending = `${pending}\n${round}`;
+      continue;
+    }
+    if (pending) out.push(...chunk(pending, max, overlap));
+    pending = round;
+  }
+  if (pending) out.push(...chunk(pending, max, overlap));
+  return out;
+}

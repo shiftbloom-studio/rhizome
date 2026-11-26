@@ -14,8 +14,9 @@ import { cosine } from "./intel";
  * - diversity: at most one excerpt per episode, then MMR on the stored embeddings.
  * - evidence: a note brings its best source excerpt when the token budget allows.
  * - time: English and German time expressions in the query become a time window.
+ * - keys: excerpts are also found through the facts extracted from them.
  */
-export const RECALL_FEATURES = ["abstain", "diversity", "evidence", "time"] as const;
+export const RECALL_FEATURES = ["abstain", "diversity", "evidence", "time", "keys"] as const;
 export type RecallFeature = (typeof RECALL_FEATURES)[number];
 
 /** Parses a comma list such as "abstain,diversity" or "all". Unknown names are ignored. */
@@ -155,5 +156,41 @@ export function diversify<T extends DiversityCandidate>(candidates: T[], lambda 
     });
     out.push(rest.splice(best, 1)[0]!);
   }
+  return out;
+}
+
+// ------------------------------------------------------------ fact keys
+
+/**
+ * Files each fact under the excerpt it most likely came from: the closest
+ * stored embedding when both sides have one, otherwise the best keyword
+ * overlap. Returns the facts per excerpt key; facts that match no excerpt fall
+ * back to the first one, since they came from the same episode.
+ */
+export function assignFactKeys<K>(
+  statements: string[],
+  vectors: (ArrayLike<number> | undefined)[],
+  chunks: { rid: K; content: string; vec: ArrayLike<number> | null }[],
+): Map<K, string[]> {
+  const out = new Map<K, string[]>();
+  if (chunks.length === 0) return out;
+  // One measure for all excerpts of a fact: cosine only when every excerpt has an embedding.
+  const allEmbedded = chunks.every((c) => c.vec);
+  statements.forEach((statement, i) => {
+    const v = allEmbedded ? vectors[i] : undefined;
+    const terms = keywordTerms(statement);
+    let best = chunks[0]!;
+    let bestScore = -Infinity;
+    for (const c of chunks) {
+      const score = v && c.vec ? cosine(v, c.vec) : keywordCoverage(terms, c.content);
+      if (score > bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+    const list = out.get(best.rid) ?? [];
+    list.push(statement);
+    out.set(best.rid, list);
+  });
   return out;
 }

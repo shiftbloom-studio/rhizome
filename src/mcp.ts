@@ -17,7 +17,7 @@ export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "202
 export interface MemoryApi {
   recall(
     client: Client,
-    input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number },
+    input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number; asOf?: number },
   ): Promise<{ items: MemoryItem[] }>;
   context(client: Client, scopes: string[], budgetTokens?: number): Promise<{ text: string }> | { text: string };
   addNote(client: Client, input: { scope: string; content: string; kind?: NoteKind; trust?: Trust }): Promise<{ id: string }>;
@@ -81,6 +81,10 @@ export const TOOLS = [
         },
         from: { type: "string", description: "Optional: only memories from this date or time on (ISO 8601, e.g. 2026-11-01)." },
         to: { type: "string", description: "Optional: only memories up to this date or time (ISO 8601; a date includes that whole day)." },
+        as_of: {
+          type: "string",
+          description: "Optional: answer as of this date or time (ISO 8601): what was true then, including notes that were replaced later.",
+        },
       },
       required: ["query"],
       additionalProperties: false,
@@ -228,13 +232,17 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       const queries = args.queries === undefined ? undefined : subQueries(args.queries);
       let from: number | undefined;
       let to: number | undefined;
+      let asOf: number | undefined;
       try {
         from = parseRangeBound(args.from, false);
         to = parseRangeBound(args.to, true);
+        asOf = parseRangeBound(args.as_of, true);
       } catch {
-        throw new ToolError("from and to must be ISO 8601 dates or times, e.g. 2026-11-01");
+        throw new ToolError("from, to and as_of must be ISO 8601 dates or times, e.g. 2026-11-01");
       }
-      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to });
+      // A date as as_of means the end of that day.
+      if (asOf !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(String(args.as_of).trim())) asOf -= 1;
+      const res = await memory.recall(client, { query, scopes, limit, budgetTokens: 4000, queries, from, to, asOf });
       if (!res.items.length) return text("No matching memories.");
       return text(res.items.map(line).join("\n"), {
         results: res.items.map((i) => ({
