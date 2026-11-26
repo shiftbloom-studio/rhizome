@@ -63,9 +63,9 @@ function hash(id: string): number {
 
 // Sizes vary a little with weight and importance, but stay close enough that a dense graph doesn't turn into a few big balls.
 function baseSize(n: GraphNode): number {
-  if (n.type === "entity") return 1.6 + Math.min(1.2, Math.log2(1 + n.weight) * 0.3);
+  if (n.type === "entity") return 1.5 + Math.min(0.9, Math.log2(1 + n.weight) * 0.22);
   if (n.type === "episode") return 1.1;
-  return 1.5 + n.importance * 1.4;
+  return 1.3 + n.importance * 0.8;
 }
 
 /**
@@ -117,7 +117,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
 
   // Simulation nodes keep their position across graph reloads, so a refresh doesn't scramble the layout.
   const previous = useRef(new Map<string, { x: number; y: number; z: number }>());
-  const { nodes, byType, links, byId, degree, spread } = useMemo(() => {
+  const { nodes, byType, links, shown, byId, degree, spread } = useMemo(() => {
     const byType: Record<NodeType, Node3[]> = { note: [], episode: [], entity: [] };
     const startSpread = layoutSpread(graph.nodes.length, graph.edges.length / 2);
     const nodes: Node3[] = graph.nodes.map((n) => {
@@ -147,12 +147,33 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
         return true;
       })
       .map((e) => ({ ...e }));
+    const spread = layoutSpread(nodes.length, links.length);
+    // In a dense memory every note keeps only its strongest few "similar" links, in the layout and in the
+    // picture. The others appear when you select a note or search, so nothing is lost, it just stops
+    // pulling everything into one knot.
+    const keep = spread > 1.3 ? 3 : Infinity;
+    const kept = new Map<string, number>();
+    const shown = new Array<boolean>(links.length).fill(true);
+    links
+      .map((l, i) => ({ l, i }))
+      .filter(({ l }) => l.kind === "similar")
+      .sort((a, b) => b.l.weight - a.l.weight)
+      .forEach(({ l, i }) => {
+        const a = kept.get(l.source) ?? 0;
+        const b = kept.get(l.target) ?? 0;
+        if (a >= keep && b >= keep) return void (shown[i] = false);
+        kept.set(l.source, a + 1);
+        kept.set(l.target, b + 1);
+      });
     const degree = new Map<string, number>();
-    for (const l of links) {
+    links.forEach((l, i) => {
+      if (!shown[i]) return;
       degree.set(l.source, (degree.get(l.source) ?? 0) + 1);
       degree.set(l.target, (degree.get(l.target) ?? 0) + 1);
-    }
-    return { nodes, byType, links, byId, degree, spread: layoutSpread(nodes.length, links.length) };
+    });
+    // Resolve every end to its node up front: the layout only sees the shown links, but all of them are drawn on demand.
+    for (const l of links) Object.assign(l, { source: byId.get(l.source), target: byId.get(l.target) });
+    return { nodes, byType, links, shown, byId, degree, spread };
   }, [graph]);
 
   // Every scope gets an anchor on a ring, so profile, each project and each agent form their own region.
@@ -179,7 +200,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     const s = forceSimulation(nodes, 3)
       .force(
         "link",
-        forceLink<Node3>(links as never)
+        forceLink<Node3>(links.filter((_, i) => shown[i]) as never)
           .id((n) => n.id)
           .distance((l) => {
             const kind = (l as unknown as GraphEdge).kind;
@@ -201,7 +222,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     // A head start, so the first frame already shows structure.
     s.tick(previous.current.size ? 5 : 80);
     return s;
-  }, [nodes, links, anchors, degree, spread]);
+  }, [nodes, links, shown, anchors, degree, spread]);
 
   // Frame the whole memory on first load: the camera backs off until every node fits.
   const { size } = useThree();
@@ -210,7 +231,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     // A small memory fits whole; a dense one frames its core and lets the outskirts run past the edges,
     // so it keeps its spacing and you zoom out or pan (right drag) to see the rest.
     const d = nodes.map((n) => Math.hypot(n.x, n.y, n.z)).sort((a, b) => a - b);
-    const share = 0.92 - Math.min(0.27, Math.max(0, spread - 1) * 0.18);
+    const share = 0.92 - Math.min(0.42, Math.max(0, spread - 1) * 0.3);
     const radius = d[Math.floor(d.length * share)] ?? 100;
     const fov = ((camera as THREE.PerspectiveCamera).fov * Math.PI) / 180;
     const distance = Math.min(1200 * spread, Math.max(120, (radius * 1.25) / Math.sin(fov / 2)));
@@ -286,7 +307,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
   const red = useMemo(() => new THREE.Color("#C81040"), []);
 
   // Only "real" relations carry sparks; history edges (supersedes and so on) stay quiet.
-  const sparkLinks = useMemo(() => links.map((l, i) => (RED_EDGES.has(l.kind) ? -1 : i)).filter((i) => i >= 0), [links]);
+  const sparkLinks = useMemo(() => links.map((l, i) => (RED_EDGES.has(l.kind) || !shown[i] ? -1 : i)).filter((i) => i >= 0), [links, shown]);
   const sparks = useMemo(
     () => Array.from({ length: Math.min(48, Math.ceil(sparkLinks.length / 2)) }, () => ({ edge: -1, t: Math.random(), speed: 0.004 + Math.random() * 0.006, forward: true })),
     [sparkLinks],
@@ -328,9 +349,9 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     }
 
     const age = reducedMotion ? 1 : Math.min(1, (now - born.current) / 900);
-    const nodeGrow = Math.sqrt(spread);
+    const nodeGrow = Math.cbrt(spread);
     // With many links, the plain ones draw lighter, so the nodes stay readable through them.
-    const thin = Math.min(0.2, (spread - 1) * 0.1);
+    const thin = Math.min(0.22, (spread - 1) * 0.15);
     const dimmed = (id: string) => (focusSet ? !focusSet.has(id) : highlight ? !highlight.has(id) : false);
     for (const type of ["note", "episode", "entity"] as NodeType[]) {
       const mesh = meshes[type].current;
@@ -338,7 +359,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       for (const n of byType[type]) {
         // Unfurl from the centre, staggered a little per node.
         const local = Math.max(0, Math.min(1, (age - (n.slot % 40) * 0.006) / 0.75));
-        // Nodes grow a little with the world (slower than the distances), so they stay visible from further out.
+        // Nodes grow a little with the world (much slower than the distances), so they stay visible from further out.
         let scale = baseSize(n) * nodeGrow * bloomEase(local);
         if (n.status === "disputed" && !reducedMotion) scale *= 1 + 0.12 * Math.sin(now / 420);
         if (n.id === selected) scale *= 1.6;
@@ -361,9 +382,11 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       const s = l.source as unknown as Node3;
       const t = l.target as unknown as Node3;
       if (typeof s !== "object" || typeof t !== "object") return;
-      pos.setXYZ(i * 2, s.x, s.y, s.z);
-      pos.setXYZ(i * 2 + 1, t.x, t.y, t.z);
       const active = focusSet ? focusSet.has(s.id) && focusSet.has(t.id) && (s.id === selected || t.id === selected) : highlight ? highlight.has(s.id) || highlight.has(t.id) : true;
+      // A hidden link collapses to a point unless it belongs to the selection or a search hit.
+      const draw = shown[i] || ((focusSet || highlight) && active);
+      pos.setXYZ(i * 2, s.x, s.y, s.z);
+      pos.setXYZ(i * 2 + 1, draw ? t.x : s.x, draw ? t.y : s.y, draw ? t.z : s.z);
       color.copy(RED_EDGES.has(l.kind) ? red : edgeBase);
       // Stronger similarity draws a darker line, like a well-used connection.
       const fade = focusSet || highlight
@@ -495,7 +518,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
       </lineSegments>
       {!reducedMotion && sparks.length > 0 && (
         <points geometry={sparkGeometry} frustumCulled={false}>
-          <pointsMaterial color={SPARK_COLOR} map={dot} alphaTest={0.4} size={1.6 * Math.sqrt(spread)} sizeAttenuation transparent opacity={0.9} depthWrite={false} />
+          <pointsMaterial color={SPARK_COLOR} map={dot} alphaTest={0.4} size={1.6} sizeAttenuation transparent opacity={0.9} depthWrite={false} />
         </points>
       )}
       <instancedMesh
