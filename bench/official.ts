@@ -143,6 +143,12 @@ export interface OpenAiOptions {
 
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** OpenAI's own messages quote part of a wrong key ("sk-proj-ab***yz"): no part of a key goes into an error. */
+function redact(message: string, apiKey: string): string {
+  const out = apiKey ? message.split(apiKey).join("[key]") : message;
+  return out.replace(/\bsk-[A-Za-z0-9_*.-]+/g, "[key]");
+}
+
 /** How long OpenAI asks to wait (retry-after-ms, retry-after), else doubling from 2 s; at most a minute. */
 function waitMs(headers: Headers, attempt: number): number {
   const ms = Number(headers.get("retry-after-ms"));
@@ -167,7 +173,7 @@ export async function chatCompletion(request: ChatRequest, opts: OpenAiOptions):
         body: JSON.stringify(request),
       });
     } catch (err) {
-      if (attempt >= tries) throw new OpenAiError(`OpenAI could not be reached: ${String((err as Error)?.message ?? err)}`, 0, true);
+      if (attempt >= tries) throw new OpenAiError(redact(`OpenAI could not be reached: ${String((err as Error)?.message ?? err)}`, opts.apiKey), 0, true);
       await sleep(Math.min(60_000, 2_000 * 2 ** (attempt - 1)));
       continue;
     }
@@ -199,7 +205,7 @@ export async function chatCompletion(request: ChatRequest, opts: OpenAiOptions):
       // not JSON: keep the start of the text
     }
     const retryable = (res.status === 429 && code !== "insufficient_quota") || res.status === 408 || res.status === 409 || res.status >= 500;
-    if (!retryable || attempt >= tries) throw new OpenAiError(`OpenAI answered HTTP ${res.status}${code ? ` (${code})` : ""}: ${message}`, res.status, retryable);
+    if (!retryable || attempt >= tries) throw new OpenAiError(redact(`OpenAI answered HTTP ${res.status}${code ? ` (${code})` : ""}: ${message}`, opts.apiKey), res.status, retryable);
     await sleep(waitMs(res.headers, attempt));
   }
 }

@@ -173,6 +173,18 @@ describe("OpenAI calls", () => {
     }
   });
 
+  it("keeps the parts of a key OpenAI quotes out of its errors", async () => {
+    const apiKey = "sk-proj-abcdef1234567890wxyz";
+    const fetch = vi.fn(async () => reply({ error: { code: "invalid_api_key", message: "Incorrect API key provided: sk-proj-ab************wxyz. You can find your API key at https://platform.openai.com/account/api-keys." } }, 401));
+    const err = (await chatCompletion(judgeRequest("p"), { apiKey, fetch: fetch as unknown as typeof globalThis.fetch, sleep: async () => {} }).catch((e: unknown) => e)) as OpenAiError;
+    expect(err.message).toContain("HTTP 401 (invalid_api_key)");
+    expect(err.message).not.toMatch(/sk-|wxyz/);
+    const echo = vi.fn(async () => { throw new Error(`socket closed, Bearer ${apiKey}`); });
+    const down = (await chatCompletion(judgeRequest("p"), { apiKey, tries: 1, fetch: echo as unknown as typeof globalThis.fetch, sleep: async () => {} }).catch((e: unknown) => e)) as OpenAiError;
+    expect(down.message).not.toContain(apiKey);
+    expect(down.message).not.toContain("sk-");
+  });
+
   it("gives up after its tries when OpenAI stays unreachable", async () => {
     const fetch = vi.fn(async () => {
       throw new TypeError("network down");
