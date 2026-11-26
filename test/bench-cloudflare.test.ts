@@ -264,6 +264,23 @@ describe("Vectorize", () => {
       local.close();
     }
   });
+
+  it("probes with a vector that still exists when the last one was deleted", async () => {
+    const local = new LocalVectorIndex(join(dir, "vectors.sqlite"));
+    const vectors = new TrackedVectors({
+      upsert: (v: VectorizeVector[]) => local.upsert(v as never),
+      deleteByIds: (ids: string[]) => local.deleteByIds(ids),
+      query: (v: number[], o: VectorizeQueryOptions) => local.query(v, o as never),
+    } as unknown as Vectorize);
+    try {
+      await vectors.upsert([{ id: "a", values: [1, 0, 0], namespace: "n", metadata: { scope: "profile", kind: "chunk" } }]);
+      await vectors.upsert([{ id: "b", values: [0, 1, 0], namespace: "n", metadata: { scope: "profile", kind: "note" } }]);
+      await vectors.deleteByIds(["b"]);
+      await vectors.searchable(200, 1);
+    } finally {
+      local.close();
+    }
+  });
 });
 
 describe("benchmark Worker", () => {

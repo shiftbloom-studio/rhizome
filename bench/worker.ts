@@ -302,20 +302,26 @@ type VectorIndex = Pick<Vectorize, "upsert" | "deleteByIds" | "query"> & Partial
  * writes, so the question can wait until Vectorize has applied them.
  */
 export class TrackedVectors {
-  private lastUpsert: VectorizeVector | null = null;
+  /** The question's vectors not deleted since, in write order: the last one is the probe. */
+  private readonly live = new Map<string, VectorizeVector>();
   private lastMutation: string | null = null;
 
   constructor(private readonly index: VectorIndex) {}
 
   async upsert(vectors: VectorizeVector[]): Promise<VectorizeAsyncMutation> {
     const res = await this.index.upsert(vectors);
-    this.lastUpsert = vectors.at(-1) ?? this.lastUpsert;
+    for (const v of vectors) {
+      this.live.delete(v.id);
+      this.live.set(v.id, v);
+    }
     this.lastMutation = res?.mutationId ? String(res.mutationId) : null;
     return res;
   }
 
   async deleteByIds(ids: string[]): Promise<VectorizeAsyncMutation> {
     const res = await this.index.deleteByIds(ids);
+    // A deleted vector can never be found again, so it must not stay the probe.
+    for (const id of ids) this.live.delete(id);
     this.lastMutation = res?.mutationId ? String(res.mutationId) : null;
     return res;
   }
@@ -331,7 +337,7 @@ export class TrackedVectors {
    * agent asking later. Deletes still pending do not matter: recall skips ids it no longer has.
    */
   async searchable(timeoutMs: number, pollMs = 2_000): Promise<void> {
-    const probe = this.lastUpsert;
+    const probe = [...this.live.values()].at(-1);
     if (!probe) return;
     const scope = probe.metadata?.scope;
     const until = Date.now() + timeoutMs;
