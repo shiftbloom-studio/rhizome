@@ -121,7 +121,7 @@ A question gets three tries, each on a fresh memory; one that fails every time i
 
 ## On GitHub
 
-The Benchmark workflow (Actions > Benchmark > Run workflow) runs the same command on a GitHub-hosted runner. It needs the repository secrets `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`, keeps the AI cache between runs, writes the summary to the job page and uploads the run directory as an artifact. One job stops starting questions after 300 minutes; run the workflow again to go on from the cache.
+The Benchmark workflow (Actions > Benchmark > Run workflow) runs the same command on a GitHub-hosted runner. It runs from `main` only and needs the secrets `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` in the `production` environment (Settings > Environments), keeps the AI cache between runs, writes the summary to the job page and uploads the run directory as an artifact. One job stops starting questions after 300 minutes; run the workflow again to go on from the cache.
 
 ## How this differs from production
 

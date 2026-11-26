@@ -1,8 +1,9 @@
 name: Benchmark
 
 # LongMemEval against the memory code, started by hand (Actions > Benchmark >
-# Run workflow). Needs the repository secrets CLOUDFLARE_ACCOUNT_ID and
-# CLOUDFLARE_API_TOKEN (Workers AI Read and Edit). Workers AI answers are
+# Run workflow) on main. Needs the secrets CLOUDFLARE_ACCOUNT_ID and
+# CLOUDFLARE_API_TOKEN (Workers AI Read and Edit) in the production
+# environment. Workers AI answers are
 # cached between runs, so a rerun only pays for inputs that changed.
 # See bench/README.md.
 on:
@@ -45,7 +46,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           if [ -z "$CLOUDFLARE_ACCOUNT_ID" ] || [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "::error::Add the repository secrets CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN (Workers AI Read and Edit)."
+            echo "::error::Add the secrets CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN (Workers AI Read and Edit) to the production environment."
             exit 1
           fi
       - uses: actions/checkout@v7
