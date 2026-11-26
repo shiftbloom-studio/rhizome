@@ -2,7 +2,7 @@
 
 Long-term memory for your AI agents. One shared memory across Claude, ChatGPT and friends, served over MCP from Cloudflare.
 
-![The rhizome explorer: 115 notes linked by similarity and tied to the projects and tools they name](docs/explorer-graph.png)
+![The rhizome explorer: 115 notes linked by similarity and tied to the projects and tools they name, with scopes, legend and memory stats](docs/explorer-graph.png)
 
 **Live:** [rhizome.shiftbloom.studio](https://rhizome.shiftbloom.studio) (explorer behind Cloudflare Access, MCP at `/mcp`) · **License:** AGPL-3.0-or-later
 
