@@ -1,6 +1,6 @@
 {
   "name": "rhizome",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Personal long-horizon memory for AI agents, shared across agents and providers. Runs on Cloudflare, or on any machine with Node and SQLite.",
   "license": "AGPL-3.0-or-later",
