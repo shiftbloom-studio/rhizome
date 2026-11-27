@@ -32,8 +32,8 @@ describe("flag config", () => {
     expect(out).toMatchObject({ LEDGER: "off", STANDING_ORDERS: "on", OPEN_LOOPS: "off", DISPUTE_RESOLUTION: "on" });
     expect(env.STANDING_ORDERS).toBe("");
     // Without POSTHOG_FLAGS every unset var is on, whatever values are passed.
-    expect(applyFlags({ LEDGER: undefined, OPEN_LOOPS: "off" }, { LEDGER: false })).toEqual({ LEDGER: "on", OPEN_LOOPS: "off", STANDING_ORDERS: "on", DISPUTE_RESOLUTION: "on", RECORDS: "on" });
-    const all = { LEDGER: "off", STANDING_ORDERS: "off", OPEN_LOOPS: "off", DISPUTE_RESOLUTION: "off", RECORDS: "off" };
+    expect(applyFlags({ LEDGER: undefined, OPEN_LOOPS: "off" }, { LEDGER: false })).toEqual({ LEDGER: "on", OPEN_LOOPS: "off", STANDING_ORDERS: "on", DISPUTE_RESOLUTION: "on", DREAMING: "on", RECORDS: "on" });
+    const all = { LEDGER: "off", STANDING_ORDERS: "off", OPEN_LOOPS: "off", DISPUTE_RESOLUTION: "off", DREAMING: "off", RECORDS: "off" };
     expect(applyFlags(all, null)).toBe(all);
   });
 });

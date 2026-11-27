@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "../src/text";
+import { byCodeUnit, chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript, trimChars, trimEndChars } from "../src/text";
 
 describe("chunk", () => {
   it("keeps short text in one chunk", () => {
@@ -65,5 +65,24 @@ describe("roundChunks", () => {
   });
   it("treats several user messages in a row as one round", () => {
     expect(roundChunks([m("user", "a"), m("user", "b"), m("assistant", "c")])).toEqual(["[user] a\n[user] b\n[assistant] c"]);
+  });
+});
+
+describe("trimChars", () => {
+  it("strips the given characters from both ends only", () => {
+    expect(trimChars("--a-b--", "-")).toBe("a-b");
+    expect(trimChars("----", "-")).toBe("");
+    expect(trimEndChars("C:\\work\\rhizome\\//", "\\/")).toBe("C:\\work\\rhizome");
+  });
+  it("stays fast on long runs", () => {
+    const long = `${"-".repeat(100_000)}x${"-".repeat(100_000)}`;
+    expect(trimChars(long, "-")).toBe("x");
+  });
+});
+
+describe("byCodeUnit", () => {
+  it("sorts like a plain sort", () => {
+    const list = ["b", "B", "a", "ä", "10", "9", "A"];
+    expect([...list].sort(byCodeUnit)).toEqual([...list].sort());
   });
 });

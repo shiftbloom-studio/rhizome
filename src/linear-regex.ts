@@ -198,7 +198,7 @@ class Parser {
       const hex = this.src.slice(this.i, this.i + len);
       if (hex.length !== len || !/^[0-9a-fA-F]+$/.test(hex)) throw new PatternError(`\\${c} needs ${len} hex digits`);
       this.i += len;
-      code = parseInt(hex, 16);
+      code = Number.parseInt(hex, 16);
     } else if (/[A-Za-z]/.test(c)) throw new PatternError(`unknown escape \\${c}`);
     else code = c.charCodeAt(0);
     const t: Test = (x) => x === code;

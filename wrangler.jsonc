@@ -67,6 +67,7 @@
   // Optional var LEDGER ("off"): tells connectors when a memory they were given is replaced. On by default.
   // Optional var RECORDS ("off"): every note filed as a typed row for the recall step "records" and query_records. On by default. RECORDS_MODEL picks the model.
   // Optional var VECTOR_FILTERS ("on"): recall in a time window also filters Vectorize by event day. Needs the metadata index "day" (number, see README).
-  // LEDGER, OPEN_LOOPS, STANDING_ORDERS, DISPUTE_RESOLUTION and RECORDS, when unset, follow PostHog flags with POSTHOG_FLAGS=on (src/flags.ts).
+  // Optional vars DREAMING ("off"), DREAM_MODEL, DREAM_DAILY_LIMIT: the care pass over all notes (see README). On by default.
+  // LEDGER, OPEN_LOOPS, STANDING_ORDERS, DISPUTE_RESOLUTION, DREAMING and RECORDS, when unset, follow PostHog flags with POSTHOG_FLAGS=on (src/flags.ts).
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }
