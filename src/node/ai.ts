@@ -30,7 +30,8 @@ type Input = {
   contexts?: { text: string }[];
 };
 
-async function post(url: string, body: unknown, apiKey: string | undefined, timeoutMs: number): Promise<unknown> {
+/** label names the call in errors (the model), so the URL with its account ID never reaches logs or results. */
+async function post(url: string, body: unknown, apiKey: string | undefined, timeoutMs: number, label: string): Promise<unknown> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
@@ -38,7 +39,7 @@ async function post(url: string, body: unknown, apiKey: string | undefined, time
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`${new URL(url).pathname}: HTTP ${res.status} ${text.slice(0, 300)}`);
+  if (!res.ok) throw new Error(`${label}: HTTP ${res.status} ${text.slice(0, 300)}`);
   return JSON.parse(text) as unknown;
 }
 
@@ -49,19 +50,19 @@ export class LocalAi {
     const timeout = this.cfg.timeoutMs ?? 180_000;
     if (this.cfg.provider === "cloudflare") {
       const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.cfg.accountId ?? "")}/ai/run/${model}`;
-      const res = (await post(url, input, this.cfg.apiKey, timeout)) as { result?: unknown; success?: boolean };
+      const res = (await post(url, input, this.cfg.apiKey, timeout, model)) as { result?: unknown; success?: boolean };
       return res.result;
     }
 
     const base = trimEndChars(this.cfg.baseUrl ?? "", "/");
     if (input.text !== undefined) {
       const texts = Array.isArray(input.text) ? input.text : [input.text];
-      const res = (await post(`${base}/embeddings`, { model, input: texts }, this.cfg.apiKey, timeout)) as { data: { index: number; embedding: number[] }[] };
+      const res = (await post(`${base}/embeddings`, { model, input: texts }, this.cfg.apiKey, timeout, model)) as { data: { index: number; embedding: number[] }[] };
       return { data: [...res.data].sort((a, b) => a.index - b.index).map((d) => d.embedding) };
     }
     if (input.query !== undefined && input.contexts) {
       if (!this.cfg.rerankUrl) throw new Error("no reranker configured (AI_RERANK_URL)");
-      const res = (await post(this.cfg.rerankUrl, { model, query: input.query, documents: input.contexts.map((c) => c.text) }, this.cfg.apiKey, timeout)) as {
+      const res = (await post(this.cfg.rerankUrl, { model, query: input.query, documents: input.contexts.map((c) => c.text) }, this.cfg.apiKey, timeout, model)) as {
         results?: { index: number; relevance_score?: number; score?: number }[];
       };
       return { response: (res.results ?? []).map((r) => ({ id: r.index, score: r.relevance_score ?? r.score ?? 0 })) };
@@ -72,6 +73,7 @@ export class LocalAi {
         { model, messages: input.messages, max_tokens: input.max_tokens, temperature: input.temperature },
         this.cfg.apiKey,
         timeout,
+        model,
       )) as { choices?: { message?: { content?: string } }[] };
       // Reasoning models may wrap their thoughts in <think> tags before the answer.
       const content = (res.choices?.[0]?.message?.content ?? "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
