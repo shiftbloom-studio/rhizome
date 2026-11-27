@@ -19,13 +19,13 @@ const MIN_ENTRY_CHARS = 8;
 
 const BULLET = /^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?/;
 // The closing "#"s of a heading are stripped in headingText, not here: a regex for them backtracks on long lines.
-const HEADING = /^(#{1,6})\s+(.*)$/;
+const HEADING = /^(#{1,6})\s(.*)$/;
 const FENCE = /^\s*(```|~~~)/;
 
 /** Splits a memory file into note texts, in file order, without duplicates. */
 export function parseMemoryFile(content: string, format: ImportFormat): string[] {
   const text = content.replace(/\r\n?/g, "\n").slice(0, MAX_IMPORT_CHARS);
-  const entries = format === "hermes" && /^[^\S\n]*§[^\S\n]*$/m.test(text) ? hermesEntries(text) : markdownEntries(text);
+  const entries = format === "hermes" && text.split("\n").some(isHermesSeparator) ? hermesEntries(text) : markdownEntries(text);
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of entries) {
@@ -39,7 +39,21 @@ export function parseMemoryFile(content: string, format: ImportFormat): string[]
 }
 
 function hermesEntries(text: string): string[] {
-  return text.split(/^[^\S\n]*§[^\S\n]*$/m).map((e) => e.trim());
+  const entries: string[] = [];
+  let current: string[] = [];
+  for (const line of text.split("\n")) {
+    if (isHermesSeparator(line)) {
+      entries.push(current.join("\n").trim());
+      current = [];
+    } else current.push(line);
+  }
+  entries.push(current.join("\n").trim());
+  return entries;
+}
+
+/** A line that holds only "§", with optional whitespace around it. */
+function isHermesSeparator(line: string): boolean {
+  return line.trim() === "§";
 }
 
 function markdownEntries(text: string): string[] {
