@@ -21,15 +21,15 @@
   },
   "dependencies": {
     "@hono/node-server": "^2.1.11",
-    "hono": "^4.12.0"
+    "hono": "^4.13.23"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261123.1",
-    "@types/node": "^26.0.0",
+    "@cloudflare/workers-types": "^5.20261127.1",
+    "@types/node": "^26.6.11",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vitest": "^5.1.1",
-    "wrangler": "^4.168.0"
+    "vitest": "^5.1.2",
+    "wrangler": "^4.169.0"
   },
   "engines": {
     "node": ">=26"
