@@ -15,13 +15,15 @@ import ast
 import json
 import math
 import os
-import subprocess
 import sys
 
 from scipy.stats import kendalltau
 
 root = os.path.abspath(sys.argv[1])
-commit = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+# The checkout is detached at the commit, so .git/HEAD holds its id.
+commit = open(os.path.join(root, ".git", "HEAD"), encoding="utf-8").read().strip()
+if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+    raise SystemExit("check out the BEAM commit first (git -C BEAM checkout <commit>), so HEAD is detached")
 
 
 def constants(path):
