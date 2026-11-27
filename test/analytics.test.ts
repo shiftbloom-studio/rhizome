@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { describe, expect, it, vi } from "vitest";
-import { analyticsHost, buildBatch, dailyPseudonym, sendStats, type McpStat } from "../src/analytics";
+import { analyticsHost, buildBatch, conversationPseudonym, dailyPseudonym, sendStats, type McpStat } from "../src/analytics";
 import type { Env } from "../src/env";
 import { legalPage } from "../src/legal";
 import { mcpResponse, type MemoryApi } from "../src/mcp";
@@ -66,6 +66,27 @@ describe("mcp observe hook", () => {
     expect(stats).toEqual([{ kind: "initialize", clientName: "claude-code", clientVersion: "2.1.0", protocolVersion: "2025-11-25" }]);
   });
 
+  it("takes only a known intent category and the conversation handle from the arguments", async () => {
+    const stats = await observed({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "recall", arguments: { query: SECRET_QUERY, conversation: " conv-1 ", intent: "answer_question" } } });
+    expect(stats[0]).toMatchObject({ conversation: "conv-1", intent: "answer_question" });
+    const free = await observed({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "recall", arguments: { query: "x", intent: SECRET_QUERY } } });
+    expect(free[0]).not.toHaveProperty("intent");
+    expect(free[0]).not.toHaveProperty("conversation");
+  });
+
+  it("offers the intent argument only when analytics is on", async () => {
+    const list = async (intent: boolean) => {
+      const res = await mcpResponse(memory, client, { jsonrpc: "2.0", id: 9, method: "tools/list" }, "test", undefined, { intent });
+      return ((await res.json()) as { result: { tools: { inputSchema: { properties: Record<string, unknown> } }[] } }).result.tools;
+    };
+    for (const t of await list(false)) expect(t.inputSchema.properties).not.toHaveProperty("intent");
+    for (const t of await list(true)) expect(t.inputSchema.properties.intent).toMatchObject({ type: "string", enum: expect.arrayContaining(["other"]) });
+    // The intent argument does not change what a tool answers.
+    const plain = await mcpResponse(memory, client, { jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "recall", arguments: { query: "x" } } }, "test");
+    const tagged = await mcpResponse(memory, client, { jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "recall", arguments: { query: "x", intent: "other" } } }, "test");
+    expect(await tagged.json()).toEqual(await plain.json());
+  });
+
   it("does nothing without a hook", async () => {
     const res = await mcpResponse(memory, client, { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "recall", arguments: { query: "x" } } }, "test");
     expect(res.status).toBe(200);
@@ -92,6 +113,34 @@ describe("buildBatch", () => {
     expect(props[2]).toMatchObject({ $mcp_tool_name: "unknown", $mcp_is_error: true, $mcp_error_type: "validation" });
     const json = JSON.stringify(batch);
     for (const leak of [client.id, client.userId, client.name, "anthropic"]) expect(json).not.toContain(leak);
+  });
+
+  it("sends the intent category and a hashed conversation id", async () => {
+    const batch = await buildBatch(
+      [
+        { kind: "tool_call", tool: "recall", ok: true, durationMs: 1, responseBytes: 1, conversation: "session-abc", intent: "answer_question" },
+        { kind: "tool_call", tool: "remember", ok: true, durationMs: 1, responseBytes: 1, conversation: "session-abc", intent: "not-a-category" as never },
+        { kind: "tool_call", tool: "recall", ok: true, durationMs: 1, responseBytes: 1 },
+      ],
+      client,
+      { serverVersion: "1.0.0", now },
+    );
+    const props = batch.map((e) => e.properties as Record<string, unknown>);
+    expect(props[0]).toMatchObject({ $mcp_intent: "answer_question", $mcp_intent_source: "context_parameter" });
+    expect(props[0]!.$mcp_conversation_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(props[1]!.$mcp_conversation_id).toBe(props[0]!.$mcp_conversation_id);
+    expect(props[1]).not.toHaveProperty("$mcp_intent");
+    expect(props[2]).not.toHaveProperty("$mcp_conversation_id");
+    expect(JSON.stringify(batch)).not.toContain("session-abc");
+    // The same handle under another connector is another conversation.
+    const other = await buildBatch([{ kind: "tool_call", tool: "recall", ok: true, durationMs: 1, responseBytes: 1, conversation: "session-abc" }], { ...client, id: "other" }, { serverVersion: "1", now });
+    expect((other[0]!.properties as Record<string, unknown>).$mcp_conversation_id).not.toBe(props[0]!.$mcp_conversation_id);
+  });
+
+  it("rotates the conversation id every UTC day", async () => {
+    const a = await conversationPseudonym(client, "session-abc", now);
+    expect(await conversationPseudonym(client, "session-abc", now + 3600_000)).toBe(a);
+    expect(await conversationPseudonym(client, "session-abc", now + 86_400_000)).not.toBe(a);
   });
 
   it("rotates the pseudonym every UTC day", async () => {

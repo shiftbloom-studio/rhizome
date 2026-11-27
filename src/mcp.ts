@@ -58,6 +58,8 @@ export interface McpOptions {
   loops?: boolean;
   /** Standing orders are on (STANDING_ORDERS=on): their tools are listed and get_context names the active ones. */
   orders?: boolean;
+  /** Usage analytics is on (MCP_ANALYTICS=on): every tool offers the optional intent category. */
+  intent?: boolean;
 }
 
 interface JsonRpcRequest {
@@ -87,6 +89,27 @@ const conversationProp = {
   maxLength: 200,
   description: "Handle of this conversation: the one get_context returned, or your own session id. Pass the same value on every memory call of the conversation.",
 };
+/** Why a tool is called, as a fixed category. Free text is never asked for, so nothing about the memory reaches analytics. */
+export const INTENTS = [
+  "task_start",
+  "answer_question",
+  "check_before_acting",
+  "save_preference",
+  "save_decision",
+  "save_correction",
+  "save_fact",
+  "session_summary",
+  "cleanup",
+  "other",
+] as const;
+export type Intent = (typeof INTENTS)[number];
+const intentProp = {
+  type: "string",
+  enum: INTENTS,
+  description: "Optional, for anonymous usage statistics only: the closest reason for this call. Never changes the result.",
+};
+const isIntent = (v: unknown): v is Intent => typeof v === "string" && (INTENTS as readonly string[]).includes(v);
+
 const scopeProp = {
   type: "string",
   enum: ["profile", "project", "private"],
@@ -613,13 +636,21 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
     }
     case "ping":
       return {};
-    case "tools/list":
-      return { tools: [...TOOLS, ...(opts.loops ? LOOP_TOOLS : []), ...(opts.orders ? ORDER_TOOLS : [])] };
+    case "tools/list": {
+      const tools = [...TOOLS, ...(opts.loops ? LOOP_TOOLS : []), ...(opts.orders ? ORDER_TOOLS : [])];
+      if (!opts.intent) return { tools };
+      return {
+        tools: tools.map((t) => ({ ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, intent: intentProp } } })),
+      };
+    }
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
       const args = params.arguments && typeof params.arguments === "object" ? (params.arguments as Record<string, unknown>) : {};
       const started = Date.now();
-      // Only the tool name, the outcome, the time taken and the size of the answer are reported.
+      // Only the tool name, the outcome, the time taken, the size of the answer, the intent
+      // category and the conversation handle (hashed in analytics.ts) are reported.
+      const conversation = typeof args.conversation === "string" ? args.conversation.trim().slice(0, 200) : "";
+      const intent = isIntent(args.intent) ? args.intent : undefined;
       const report = (result: ToolResult | null, errorType?: "validation" | "internal") =>
         observe?.({
           kind: "tool_call",
@@ -628,6 +659,8 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
           errorType,
           durationMs: Date.now() - started,
           responseBytes: result ? JSON.stringify(result).length : 0,
+          ...(conversation ? { conversation } : {}),
+          ...(intent ? { intent } : {}),
         });
       try {
         const result = await callTool(memory, client, name, args, opts);
