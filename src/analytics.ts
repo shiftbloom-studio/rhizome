@@ -64,13 +64,13 @@ export async function dailyPseudonym(client: Client, now = Date.now()): Promise<
 }
 
 /**
- * Groups the calls of one conversation. It is a hash of the connector's id and the
- * handle the agent passes as conversation, so neither is sent and it cannot be
- * turned back into them. Unlike the daily pseudonym it stays the same for the whole
- * conversation.
+ * Groups the calls of one conversation. It is a hash of the connector's id, the
+ * handle the agent passes as conversation and the UTC day, so neither id is sent, it
+ * cannot be turned back into them, and like the daily pseudonym it does not link days.
  */
-export async function conversationPseudonym(client: Client, conversation: string): Promise<string> {
-  const h = await sha256Hex(`rhizome-mcp-conversation:${client.id}:${conversation}`);
+export async function conversationPseudonym(client: Client, conversation: string, now = Date.now()): Promise<string> {
+  const day = new Date(now).toISOString().slice(0, 10);
+  const h = await sha256Hex(`rhizome-mcp-conversation:${client.id}:${day}:${conversation}`);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }
 
@@ -98,7 +98,7 @@ export async function buildBatch(
   const conversations = new Map<string, string>();
   for (const s of stats) {
     if (s.kind === "tool_call" && s.conversation && !conversations.has(s.conversation)) {
-      conversations.set(s.conversation, await conversationPseudonym(client, s.conversation));
+      conversations.set(s.conversation, await conversationPseudonym(client, s.conversation, now));
     }
   }
   return stats.map((s) => {

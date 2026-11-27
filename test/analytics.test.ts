@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { describe, expect, it, vi } from "vitest";
-import { analyticsHost, buildBatch, dailyPseudonym, sendStats, type McpStat } from "../src/analytics";
+import { analyticsHost, buildBatch, conversationPseudonym, dailyPseudonym, sendStats, type McpStat } from "../src/analytics";
 import type { Env } from "../src/env";
 import { legalPage } from "../src/legal";
 import { mcpResponse, type MemoryApi } from "../src/mcp";
@@ -135,6 +135,12 @@ describe("buildBatch", () => {
     // The same handle under another connector is another conversation.
     const other = await buildBatch([{ kind: "tool_call", tool: "recall", ok: true, durationMs: 1, responseBytes: 1, conversation: "session-abc" }], { ...client, id: "other" }, { serverVersion: "1", now });
     expect((other[0]!.properties as Record<string, unknown>).$mcp_conversation_id).not.toBe(props[0]!.$mcp_conversation_id);
+  });
+
+  it("rotates the conversation id every UTC day", async () => {
+    const a = await conversationPseudonym(client, "session-abc", now);
+    expect(await conversationPseudonym(client, "session-abc", now + 3600_000)).toBe(a);
+    expect(await conversationPseudonym(client, "session-abc", now + 86_400_000)).not.toBe(a);
   });
 
   it("rotates the pseudonym every UTC day", async () => {
