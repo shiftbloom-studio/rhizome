@@ -314,7 +314,7 @@ On Node the costs are your machine's. On Cloudflare, measured list prices on Wor
 | M1 | Store and find: gateway, MemoryObject with scopes, R2, Vectorize, hybrid recall, API keys |
 | **0.2** | **First parts of M4, M6 and M9: extraction with conflict resolution, links, decay, nightly reflection, 3D memory explorer behind Access** |
 | **M2** | **Remote MCP server with OAuth for Claude, ChatGPT and other MCP clients; import of CLAUDE.md and Hermes memory files (0.3)** |
-| M3 | Evaluation harness (LongMemEval, LOCOMO, own data) in CI. LongMemEval retrieval runs from [`bench/`](bench/README.md) |
+| M3 | Evaluation harness (LongMemEval, LOCOMO, own data) in CI. LongMemEval runs from the [`bench` branch](https://github.com/shiftbloom-studio/rhizome/tree/bench/bench) |
 | M4 | Fact extraction and update resolver (add, update, invalidate) via Queues |
 | M5 | Bi-temporal knowledge graph, entity resolution, as-of queries |
 | M6 | Reflection and dreaming: profile distillation, decay, communities, block rewriting |
