@@ -15,11 +15,13 @@ import { parseResults } from "../bench/metrics";
 import { evalResultLine, hypothesisLine, judgePrompt, type QaRecord } from "../bench/official";
 import {
   AiGate,
+  AiOutputCache,
   BenchMemory,
   BenchWorkflow,
   DATA_PREFIX,
   EmbeddingCache,
   TrackedVectors,
+  aiCacheKey,
   embeddingCacheKey,
   pacedAi,
   questionKey,
@@ -224,6 +226,18 @@ describe("run params", () => {
   it("take a reader for LongMemEval's own evaluation", () => {
     expect(runSettings(undefined, env).reader).toBeNull();
     expect(runSettings({ reader: "gpt-4o-2024-08-06" }, env).reader).toBe("gpt-4o-2024-08-06");
+    expect(runSettings({ reader: "gpt-4o-2024-08-06" }, env).readerEffort).toBeNull();
+    // Reasoning readers think at medium effort unless the run says otherwise.
+    expect(runSettings({ reader: "gpt-6.1-terra" }, env).readerEffort).toBe("medium");
+    expect(runSettings({ reader: "gpt-6.1-terra", readerEffort: "high" }, env).readerEffort).toBe("high");
+    expect(() => runSettings({ reader: "gpt-6.1-terra", readerEffort: "extreme" }, env)).toThrow(/readerEffort must be one of/);
+    expect(() => runSettings({ reader: "gpt-4o-2024-08-06", readerEffort: "low" }, env)).toThrow(/needs a reasoning reader/);
+  });
+
+  it("keep the paid models' answers unless told not to", () => {
+    expect(runSettings(undefined, env).aiCache).toBe(true);
+    expect(runSettings({ aiCache: false }, env).aiCache).toBe(false);
+    expect(() => runSettings({ aiCache: "no" }, env)).toThrow(/aiCache/);
   });
 });
 
@@ -305,6 +319,45 @@ describe("Workers AI", () => {
     await other.load();
     await runAi(other.wrap(ai), "@cf/other/model", { text: ["one"] });
     expect(sent.at(-1)).toEqual(["one"]);
+  });
+});
+
+describe("AI cache", () => {
+  it("answers a paid model's repeated request from the bucket, and leaves other models alone", async () => {
+    const objects = new Map<string, string>();
+    const bucket = {
+      get: async (k: string) => (objects.has(k) ? { json: async () => JSON.parse(objects.get(k)!) } : null),
+      put: async (k: string, v: string) => void objects.set(k, v),
+    } as unknown as R2Bucket;
+    let calls = 0;
+    const ai = { run: async (model: string) => ({ response: `${model} ${++calls}` }) } as unknown as Ai;
+    const paid = "@cf/deepseek-ai/deepseek-v4.1-flash-1017";
+    const input = { messages: [{ role: "user", content: "x" }], max_tokens: 10, temperature: 0 };
+
+    const first = new AiOutputCache(bucket);
+    expect(await runAi(first.wrap(ai), paid, input)).toEqual({ response: `${paid} 1` });
+    // Key order does not matter, the request does.
+    const next = new AiOutputCache(bucket);
+    expect(await runAi(next.wrap(ai), paid, { temperature: 0, max_tokens: 10, messages: [{ role: "user", content: "x" }] })).toEqual({ response: `${paid} 1` });
+    expect(await runAi(next.wrap(ai), paid, { ...input, max_tokens: 11 })).toEqual({ response: `${paid} 2` });
+    expect([next.hits, next.misses]).toEqual([1, 1]);
+    // Free models (reranker, embeddings) are not kept.
+    await runAi(next.wrap(ai), "@cf/baai/bge-reranker-base", { query: "q", contexts: [] });
+    await runAi(next.wrap(ai), "@cf/baai/bge-reranker-base", { query: "q", contexts: [] });
+    expect(calls).toBe(4);
+    expect(objects.size).toBe(2);
+    expect(await aiCacheKey(paid, input)).toMatch(/^cache\/ai\/%40cf%2Fdeepseek-ai%2Fdeepseek-v4\.1-flash-1017\/[0-9a-f]{64}\.json$/);
+  });
+
+  it("still answers when the bucket fails", async () => {
+    const bucket = { get: async () => Promise.reject(new Error("R2 down")), put: async () => Promise.reject(new Error("R2 down")) } as unknown as R2Bucket;
+    const ai = { run: async () => ({ response: "ok" }) } as unknown as Ai;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await runAi(new AiOutputCache(bucket).wrap(ai), "@cf/zai-org/glm-5.3", { messages: [] })).toEqual({ response: "ok" });
+    } finally {
+      errors.mockRestore();
+    }
   });
 });
 

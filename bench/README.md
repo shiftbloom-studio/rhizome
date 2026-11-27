@@ -111,6 +111,8 @@ The first run copies LongMemEval-S from Hugging Face into the bucket (`data/`), 
 | `paidRpm` | Requests a minute to each paid model, for all questions together. Default 15: the account allows 20, and the deployed rhizome needs some of them. |
 | `baseline` | The id of an earlier run, compared with this one in `comparison.md`. |
 | `reader` | An OpenAI model, e.g. `"gpt-4o-2024-08-06"`: LongMemEval's own evaluation, see below. Needs the Worker secret `OPENAI_API_KEY`. |
+| `readerEffort` | Reasoning effort of a reasoning reader (o-series, GPT-5 and later): `none`, `low`, `medium`, `high`, `xhigh` or `max`. Default `medium` for those readers; GPT-4o takes none. |
+| `aiCache` | Default `true`: every answer of the paid models (extraction, reflection, dispute verdicts) is kept in the bucket under `cache/ai/`, one object per request, and reused when the same request comes again. Runs replay the same sessions in the same order at temperature 0, so a rerun that changes only recall gets every paid call from the cache, at no cost and without the per-minute limit; changes to extraction or reflection pay only for the requests that differ. `results.jsonl` records each question's hits and misses. `false` sends every call. |
 | `embeddingCache` | Default `true`: every question's embeddings are kept in the bucket under `cache/embeddings/` and reused, so a rerun embeds only texts it has not seen. A full run fills about 1 GB. `false` embeds everything again. |
 
 The instance's output is the summary. The files go to `runs/<id>/` in the bucket: `config.json`, `results.jsonl`, `summary.json`, `summary.md` and, with `baseline`, `comparison.md`.
@@ -126,7 +128,7 @@ Every run also writes LongMemEval's own session-level retrieval scores (`recall_
 
 With `reader`, every question is also answered and judged the way LongMemEval's own scripts do it ([xiaowu0162/LongMemEval](https://github.com/xiaowu0162/LongMemEval) at commit `9e0b455`), so the score compares with published LongMemEval results:
 
-1. rhizome recalls as its recall tool does for an agent (8 items in 4,000 tokens) and the reader gets that text in the prompt of `src/generation/run_generation.py` with its default reading method (`con`: answer step by step, at most 800 tokens, temperature 0), with the question's date as the current date.
+1. rhizome recalls as its recall tool does for an agent (8 items in 4,000 tokens) and the reader gets that text in the prompt of `src/generation/run_generation.py` with its default reading method (`con`: answer step by step, at most 800 tokens, temperature 0), with the question's date as the current date. A reasoning reader (e.g. `gpt-6.1-terra`) gets the same prompt with `reasoning_effort` (`readerEffort`) and up to 16,000 output tokens, since its reasoning counts against the limit; it takes no temperature unless the effort is `none`.
 2. GPT-4o (`gpt-4o-2024-08-06`) judges the answer with the prompt of `src/evaluation/evaluate_qa.py` for the question's type, temperature 0, at most 10 tokens. A reply with "yes" in it counts as correct.
 3. `official.md` and `official.json` hold the averages of `src/evaluation/print_qa_metrics.py`: accuracy per question type, task-averaged, overall and on abstention questions.
 

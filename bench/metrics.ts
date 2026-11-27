@@ -114,6 +114,8 @@ export interface ResultRecord {
   top?: string[];
   /** LongMemEval's own session-level scores (bench/official.ts), for the questions its averages count. */
   official?: Record<string, number>;
+  /** Calls to the paid models (extraction, reflection) answered from the bench's AI cache, and those sent. */
+  aiCache?: { hits: number; misses: number };
   error?: string;
 }
 

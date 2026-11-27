@@ -19,6 +19,15 @@ export const DEFAULT_API_LIMIT = 1000;
 
 export class RetryableError extends Error {}
 
+/** JSON with sorted object keys, so equal inputs always give the same cache key. */
+export function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : v,
+  );
+}
+
 export function isRetryable(err: unknown): boolean {
   if (err instanceof RetryableError) return true;
   const e = err as { name?: string; message?: string } | undefined;

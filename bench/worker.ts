@@ -14,13 +14,15 @@ import { DEFAULT_EMBEDDING_MODEL, runAi, type Env } from "../src/env";
 import { MemoryObject, type EpisodeInput } from "../src/memory-object";
 import { RECALL_FEATURES } from "../src/recall";
 import { DEFAULT_GRANTS, type Client } from "../src/scopes";
-import { PAID_MODELS, isRetryableAiError } from "./limits";
+import { PAID_MODELS, isRetryableAiError, stableJson } from "./limits";
 import { DATASET_URL, JsonArraySplitter, isAbstention, select, validateQuestion, type Question, type Selection } from "./longmemeval";
 import { compareRuns, comparisonMarkdown, parseResults, summarize, summaryMarkdown, type ResultRecord, type Summary } from "./metrics";
 import {
   EVAL_RESULTS_SUFFIX,
   JUDGE_MODEL,
   OpenAiError,
+  READER_EFFORTS,
+  REASONING_READER,
   UPSTREAM,
   chatCompletion,
   evalResultLine,
@@ -38,6 +40,7 @@ import {
   type OpenAiOptions,
   type QaMetrics,
   type QaRecord,
+  type ReaderEffort,
 } from "./official";
 import { MEMORY_VARS, askQuestion, type AgentView } from "./question";
 
@@ -157,6 +160,17 @@ export interface RunParams {
    */
   reader?: string;
   /**
+   * Reasoning effort of a reasoning reader (o-series, GPT-5 and later): none, low, medium,
+   * high, xhigh or max. Default medium for those, none for other readers (GPT-4o).
+   */
+  readerEffort?: string;
+  /**
+   * Keep every answer of the paid models (extraction, reflection) in the BENCH bucket
+   * (cache/ai/) and reuse it when the same request comes again, so a rerun pays for and
+   * waits on only what changed. Default true.
+   */
+  aiCache?: boolean;
+  /**
    * Keep every question's embeddings in the BENCH bucket (cache/embeddings/) and reuse
    * them, so a rerun embeds only texts it has not seen. Default true.
    */
@@ -179,6 +193,9 @@ export interface RunSettings {
   paidRpm: number;
   /** null: no answers, retrieval scores only. */
   reader: string | null;
+  /** null: the reader takes no reasoning effort. */
+  readerEffort: ReaderEffort | null;
+  aiCache: boolean;
   embeddingCache: boolean;
 }
 
@@ -205,6 +222,8 @@ const PARAMS = new Set([
   "baseline",
   "paidRpm",
   "reader",
+  "readerEffort",
+  "aiCache",
   "embeddingCache",
 ]);
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
@@ -280,6 +299,10 @@ export function runSettings(raw: unknown, env: Partial<Record<MemoryVar, string>
   if (typeof paidRpm !== "number" || !(paidRpm > 0) || !Number.isFinite(paidRpm)) bad("paidRpm must be a positive number");
   const reader = (p.reader ?? null) as string | null;
   if (reader !== null && (typeof reader !== "string" || !MODEL_ID.test(reader))) bad("reader must be an OpenAI model id, e.g. gpt-4o-2024-08-06");
+  const effort = p.readerEffort ?? null;
+  if (effort !== null && (typeof effort !== "string" || !(READER_EFFORTS as readonly string[]).includes(effort))) bad(`readerEffort must be one of ${READER_EFFORTS.join(", ")}`);
+  if (effort !== null && (reader === null || !REASONING_READER.test(reader))) bad("readerEffort needs a reasoning reader (o-series, GPT-5 or later)");
+  const readerEffort = (effort ?? (reader !== null && REASONING_READER.test(reader) ? "medium" : null)) as ReaderEffort | null;
 
   const extraction = flag("extraction", p.extraction);
   const concurrency = wholeNumber("concurrency", p.concurrency, 1, MAX_CONCURRENCY) ?? (extraction ? 4 : 8);
@@ -302,6 +325,8 @@ export function runSettings(raw: unknown, env: Partial<Record<MemoryVar, string>
     baseline,
     paidRpm,
     reader,
+    readerEffort,
+    aiCache: p.aiCache === undefined || p.aiCache === null ? true : flag("aiCache", p.aiCache),
     embeddingCache: p.embeddingCache === undefined || p.embeddingCache === null ? true : flag("embeddingCache", p.embeddingCache),
   };
 }
@@ -441,6 +466,60 @@ export class EmbeddingCache {
   }
 }
 
+/** Where one answer of a paid model is kept between runs. */
+export const aiCacheKey = async (model: string, input: unknown) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${model}\n${stableJson(input)}`));
+  return `cache/ai/${encodeURIComponent(model)}/${Buffer.from(digest).toString("hex")}.json`;
+};
+
+/**
+ * The answers of the paid models (extraction, reflection, dispute verdicts), kept in the
+ * BENCH bucket, one object per request. Every run replays the same sessions in the same
+ * order at temperature 0, so the requests repeat as long as the ingest code does: a rerun
+ * that changes only recall answers every paid call from here, at no cost and without
+ * waiting for the paid models' per-minute limit. A request that differs (new prompt, other
+ * related notes) misses and is paid once. Losing the cache only costs the calls again.
+ */
+export class AiOutputCache {
+  hits = 0;
+  misses = 0;
+
+  constructor(
+    private readonly bucket: Pick<R2Bucket, "get" | "put">,
+    /** Which models' answers to keep. Default: the paid ones. */
+    private readonly cached: (model: string) => boolean = (model) => PAID_MODELS.test(model),
+  ) {}
+
+  /** Workers AI with the paid models' calls answered from the cache where it can. Hits skip the pacing of `ai` too. */
+  wrap(ai: Ai): Ai {
+    const run = async (model: string, input: unknown): Promise<unknown> => {
+      if (!this.cached(model)) return runAi<unknown>(ai, model, input);
+      const key = await aiCacheKey(model, input);
+      try {
+        const hit = await this.bucket.get(key);
+        if (hit) {
+          const out = (await hit.json()) as { output?: unknown };
+          if (out && "output" in out) {
+            this.hits++;
+            return out.output;
+          }
+        }
+      } catch (err) {
+        console.error("bench: could not read the AI cache", String(err));
+      }
+      this.misses++;
+      const output = await runAi<unknown>(ai, model, input);
+      try {
+        await this.bucket.put(key, JSON.stringify({ model, output }), { httpMetadata: { contentType: "application/json" } });
+      } catch (err) {
+        console.error("bench: could not write the AI cache", String(err));
+      }
+      return output;
+    };
+    return { run } as unknown as Ai;
+  }
+}
+
 // ------------------------------------------------------------------ Vectorize
 
 type VectorIndex = Pick<Vectorize, "upsert" | "deleteByIds" | "query"> & Partial<Pick<Vectorize, "describe">>;
@@ -526,6 +605,8 @@ export interface QuestionJob {
   agentView?: boolean;
   /** Reuse and keep the question's embeddings (EmbeddingCache). */
   embeddingCache?: boolean;
+  /** Reuse and keep the paid models' answers (AiOutputCache). */
+  aiCache?: boolean;
 }
 
 function benchClient(userId: string): Client {
@@ -552,6 +633,8 @@ export class BenchMemory extends MemoryObject {
     const model = job.vars.EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL;
     const cache = job.embeddingCache ? new EmbeddingCache(this.bench.BENCH, embeddingCacheKey(job.key, model), model) : null;
     await cache?.load();
+    const outputs = job.aiCache ? new AiOutputCache(this.bench.BENCH) : null;
+    const ai = outputs ? outputs.wrap(paced) : paced;
     this.env = {
       ...job.vars,
       EXTRACTION: job.extraction ? "on" : "off",
@@ -559,13 +642,13 @@ export class BenchMemory extends MemoryObject {
       EXTRACTION_DAILY_LIMIT: "1000000",
       EPISODES: this.bench.EPISODES,
       VECTORS: vectors,
-      AI: cache ? cache.wrap(paced) : paced,
+      AI: cache ? cache.wrap(ai) : ai,
     } as unknown as Env;
     try {
       const object = await this.bench.BENCH.get(job.key);
       if (!object) throw new Error(`no question at ${job.key}`);
       const q = validateQuestion(await object.json(), 0);
-      return await askQuestion(this, benchClient(job.userId), q, {
+      const record = await askQuestion(this, benchClient(job.userId), q, {
         features: job.features,
         chunking: job.chunking,
         asOf: job.asOf,
@@ -574,6 +657,7 @@ export class BenchMemory extends MemoryObject {
         afterIngest: () => vectors.searchable(job.vectorTimeoutMs),
         agentView: job.agentView,
       });
+      return outputs ? { ...record, aiCache: { hits: outputs.hits, misses: outputs.misses } } : record;
     } finally {
       await cache?.save();
       await this.wipe();
@@ -679,12 +763,13 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
           asOf: settings.asOf,
           selection: settings.selection,
           embeddingCache: settings.embeddingCache,
+          aiCache: settings.aiCache,
         },
         questions: questions.length,
         concurrency: settings.concurrency,
         paidRpm: settings.paidRpm,
         baseline: settings.baseline,
-        ...(settings.reader ? { official: { reader: settings.reader, judge: JUDGE_MODEL, upstream: UPSTREAM } } : {}),
+        ...(settings.reader ? { official: { reader: settings.reader, readerEffort: settings.readerEffort, judge: JUDGE_MODEL, upstream: UPSTREAM } } : {}),
         meta: { worker: this.env.CF_VERSION_METADATA ?? null, dataset: { source: dataset.source, bytes: dataset.bytes, stored: dataset.stored } },
       };
       await put("config.json", JSON.stringify(config, null, 2) + "\n", "application/json");
@@ -719,6 +804,7 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
             vectorTimeoutMs,
             ...(settings.reader ? { agentView: true } : {}),
             ...(settings.embeddingCache ? { embeddingCache: true } : {}),
+            ...(settings.aiCache ? { aiCache: true } : {}),
           };
           return (await memory.benchRun(job)) as ResultRecord & { view?: AgentView };
         });
@@ -735,11 +821,11 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
       const context = { contextItems: view.items, contextTokens: view.tokens };
       try {
         const read = await step.do(`answer ${q.question_id}`, QA_STEP, () =>
-          openAiStep(readerRequest(settings.reader!, readerPrompt(view.text, view.questionDate, view.question)), openai),
+          openAiStep(readerRequest(settings.reader!, readerPrompt(view.text, view.questionDate, view.question), settings.readerEffort), openai),
         );
         if ("error" in read) return { ...base, ...context, error: `reader: ${read.error}` };
         const hypothesis = read.content.trim();
-        const reader = { hypothesis, readerModel: read.model, readerFinish: read.finishReason, readerTokens: { prompt: read.promptTokens, completion: read.completionTokens } };
+        const reader = { hypothesis, readerModel: read.model, readerFinish: read.finishReason, readerTokens: { prompt: read.promptTokens, completion: read.completionTokens, ...(read.reasoningTokens !== undefined ? { reasoning: read.reasoningTokens } : {}) } };
         const prompt = judgePrompt(view.type, view.question, view.answer, hypothesis, isAbstentionId(q.question_id));
         const verdict = await step.do(`judge ${q.question_id}`, QA_STEP, () => openAiStep(judgeRequest(prompt), openai));
         if ("error" in verdict) return { ...base, ...context, ...reader, error: `judge: ${verdict.error}` };
@@ -796,9 +882,9 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
         await put(`hypotheses.jsonl${EVAL_RESULTS_SUFFIX}`, lines(judged.map((a) => evalResultLine(a.id, a.hypothesis, a.label))), "application/x-ndjson");
         await put("qa.jsonl", lines(answers.map((a) => JSON.stringify(a))), "application/x-ndjson");
         await put("contexts.jsonl", lines(questions.flatMap((q, i) => (views[i] ? [JSON.stringify({ question_id: q.question_id, items: views[i]!.items, tokens: views[i]!.tokens, text: views[i]!.text })] : []))), "application/x-ndjson");
-        const report = { runId, reader: settings.reader, dataset: dataset.sha256, records: answers, metrics, ...(summary.official ? { retrieval: summary.official } : {}) };
+        const report = { runId, reader: settings.reader, readerEffort: settings.readerEffort, dataset: dataset.sha256, records: answers, metrics, ...(summary.official ? { retrieval: summary.official } : {}) };
         await put("official.md", officialMarkdown(report), "text/markdown; charset=utf-8");
-        await put("official.json", JSON.stringify({ reader: settings.reader, judge: JUDGE_MODEL, upstream: UPSTREAM, metrics, retrieval: summary.official ?? null }, null, 2) + "\n", "application/json");
+        await put("official.json", JSON.stringify({ reader: settings.reader, readerEffort: settings.readerEffort, judge: JUDGE_MODEL, upstream: UPSTREAM, metrics, retrieval: summary.official ?? null }, null, 2) + "\n", "application/json");
         output.official = { reader: settings.reader, judged: judged.length, failed: answers.length - judged.length, metrics };
       }
       return output;
