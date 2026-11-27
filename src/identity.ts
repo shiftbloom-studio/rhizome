@@ -147,7 +147,7 @@ export function sessionKey(env: Env): string {
 }
 
 function b64url(text: string): string {
-  return btoa(String.fromCharCode(...new TextEncoder().encode(text))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(String.fromCharCode(...new TextEncoder().encode(text))).replace(/\+/g, "-").replace(/\//g, "_").replace(/={1,2}$/, "");
 }
 
 function unb64url(input: string): string {

@@ -12,7 +12,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     // The session ended. With the built-in sign-in the server names its page; behind
     // Cloudflare Access or a sign-in proxy, reloading goes through sign-in again.
     const { signIn } = (await res.json().catch(() => ({}))) as { signIn?: string | null };
-    if (signIn) window.location.assign(`${signIn}?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+    if (signIn?.startsWith("/") && !signIn.startsWith("//") && !signIn.startsWith("/\\")) window.location.assign(`${signIn}?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
     else window.location.reload();
     throw new Error("signed out");
   }

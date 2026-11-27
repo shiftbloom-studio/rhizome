@@ -7,6 +7,8 @@
 // Each bullet or paragraph becomes one note. A heading is kept as context, so
 // "- run npm test" under "## Testing" becomes "Testing: run npm test".
 
+import { trimEndChars } from "./text";
+
 export type ImportFormat = "claude-md" | "hermes" | "markdown";
 export const IMPORT_FORMATS: ImportFormat[] = ["claude-md", "hermes", "markdown"];
 
@@ -16,13 +18,14 @@ const MAX_ENTRY_CHARS = 2000;
 const MIN_ENTRY_CHARS = 8;
 
 const BULLET = /^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?/;
-const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
+// The closing "#"s of a heading are stripped in headingText, not here: a regex for them backtracks on long lines.
+const HEADING = /^(#{1,6})\s+(.*)$/;
 const FENCE = /^\s*(```|~~~)/;
 
 /** Splits a memory file into note texts, in file order, without duplicates. */
 export function parseMemoryFile(content: string, format: ImportFormat): string[] {
   const text = content.replace(/\r\n?/g, "\n").slice(0, MAX_IMPORT_CHARS);
-  const entries = format === "hermes" && /^\s*§\s*$/m.test(text) ? hermesEntries(text) : markdownEntries(text);
+  const entries = format === "hermes" && /^[^\S\n]*§[^\S\n]*$/m.test(text) ? hermesEntries(text) : markdownEntries(text);
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of entries) {
@@ -36,7 +39,7 @@ export function parseMemoryFile(content: string, format: ImportFormat): string[]
 }
 
 function hermesEntries(text: string): string[] {
-  return text.split(/^\s*§\s*$/m).map((e) => e.trim());
+  return text.split(/^[^\S\n]*§[^\S\n]*$/m).map((e) => e.trim());
 }
 
 function markdownEntries(text: string): string[] {
@@ -69,7 +72,7 @@ function markdownEntries(text: string): string[] {
       flush();
       const level = h[1]!.length;
       headings.length = level;
-      headings[level - 1] = h[2]!.trim();
+      headings[level - 1] = headingText(h[2]!);
       for (let i = 0; i < level - 1; i++) headings[i] ??= "";
       continue;
     }
@@ -98,4 +101,9 @@ function clean(s: string): string {
   const fenced = lines.some((l) => FENCE.test(l));
   // Prose collapses to one line; code blocks keep their line breaks.
   return (fenced ? lines.map((l) => l.trimEnd()).join("\n") : lines.map((l) => l.trim()).join(" ")).replace(/ ; /g, "; ").replace(/([.!?:]); /g, "$1 ").replace(/[ \t]{2,}/g, " ").trim();
+}
+
+/** A heading's text without trailing whitespace and closing "#"s, like "Title ##". */
+function headingText(raw: string): string {
+  return trimEndChars(raw.trimEnd(), "#").trim();
 }

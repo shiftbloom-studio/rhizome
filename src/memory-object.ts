@@ -11,7 +11,7 @@ import { correctionLines, ledgerEnabled, MAX_DELETED, MAX_REPLACED, needsCorrect
 import { evaluate, ORDER_LIMIT, ordersEnabled, parseRule, type Decision, type Order, type OrderState, type ToolCall } from "./orders";
 import { admitConversation, admitNamed, HANDLE_TTL_MS, heldTarget, isValidWallName, isWallableScope, latestWall, wallOf, WALL_LIMIT, WINDOW_MS, type Seen, type Tracked, type Walls } from "./walls";
 import { can, type Client } from "./scopes";
-import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
+import { byCodeUnit, chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
 import { DUE_SHOWN, dueSection, isLoopId, isValidDue, LOOP_PREFIX, loopsEnabled, MAX_OPEN_LOOPS, type DueLoop } from "./loops";
 import {
@@ -1391,7 +1391,7 @@ export class MemoryObject extends DurableObject<Env> {
       for (const s of wanted) this.sql.exec("INSERT INTO walls (scope, wall, created_at) VALUES (?, ?, ?)", s, name, now);
     });
     this.audit(client, "wall", { name, scopes: wanted });
-    return { name, scopes: wanted.sort() };
+    return { name, scopes: wanted.sort(byCodeUnit) };
   }
 
   private scopeOf(itemId: string): string | null {
@@ -2605,7 +2605,7 @@ export class MemoryObject extends DurableObject<Env> {
           const current = this.currentVersion(o.id);
           if (current === id || !live(current)) continue;
           if (current !== o.id) this.link(id, current, "contradicts", o.weight, now);
-          pairs.set([id, current].sort().join("|"), [id, current]);
+          pairs.set([id, current].sort(byCodeUnit).join("|"), [id, current]);
         }
       }
     });

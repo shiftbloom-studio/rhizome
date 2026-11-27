@@ -134,7 +134,7 @@ export function Walls({ scopes, onNotice, onChanged }: { scopes: string[]; onNot
             })}
           </div>
           <div className="row">
-            <button className="btn" disabled={busy || !valid}>{editing ? "Update wall" : "Save wall"}</button>
+            <button type="submit" className="btn" disabled={busy || !valid}>{editing ? "Update wall" : "Save wall"}</button>
           </div>
         </form>
       ) : (
