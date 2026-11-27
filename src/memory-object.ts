@@ -2936,9 +2936,13 @@ export class MemoryObject extends DurableObject<Env> {
       report.kinds += done.kinds;
       report.rollups += done.rollups;
       pools.delete(scope);
+      const embedFirst = done.rollups + done.rewritten > 0;
       if (plan.rejected.length) {
         this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'dream.rejected', ?)", now, SYSTEM_DREAMING, JSON.stringify(plan.rejected.slice(0, 20)));
       }
+      // New or reworded notes have no embedding until the outbox runs: stop here, so the next run
+      // (after the outbox) can put a fresh rollup into the neighbourhoods of its remaining notes.
+      if (embedFirst) break;
     }
     if (report.done) {
       // Wall-clock time, compared with created_at to see whether new notes came in since.

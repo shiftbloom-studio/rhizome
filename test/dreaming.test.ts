@@ -267,9 +267,14 @@ describe("dreaming in the MemoryObject", () => {
     await settle();
     const rollup = db.prepare("SELECT id FROM items WHERE origin = 'reflection'").get() as { id: string };
     const member = db.prepare("SELECT dst FROM links WHERE src = ? AND kind = 'rolls_up' LIMIT 1").get(rollup.id) as { dst: string };
+    const listing = (db.prepare("SELECT src FROM links WHERE dst = ? AND kind = 'rolls_up'").all(member.dst) as { src: string }[]).map((r) => r.src);
     await mo.forget(claude, member.dst);
-    expect(db.prepare("SELECT COUNT(*) AS n FROM items WHERE origin = 'reflection'").get()).toEqual({ n: 0 });
-    expect(db.prepare("SELECT COUNT(*) AS n FROM links WHERE src = ? OR dst = ?").get(rollup.id, rollup.id)).toEqual({ n: 0 });
+    // Every rollup that listed the note is gone with its links; rollups that never listed it may stay.
+    for (const id of listing) {
+      expect(db.prepare("SELECT COUNT(*) AS n FROM items WHERE id = ?").get(id)).toEqual({ n: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS n FROM links WHERE src = ? OR dst = ?").get(id, id)).toEqual({ n: 0 });
+    }
+    expect(db.prepare("SELECT COUNT(*) AS n FROM links WHERE dst = ? AND kind = 'rolls_up'").get(member.dst)).toEqual({ n: 0 });
   });
 
   it("waits until the person has been away, then dreams on its own", async () => {
