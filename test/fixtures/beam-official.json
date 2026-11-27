@@ -1,0 +1,169 @@
+{
+ "upstream": {
+  "repo": "https://github.com/mohammadtavakoli78/BEAM",
+  "commit": "b2da22eac88bb0874c64665f13457eb99835774a"
+ },
+ "readerPrompt": "\nYou are an assistant that MUST answer questions using ONLY the information provided in the context below. \n\nSTRICT INSTRUCTIONS:\n1. Answer ONLY based on the provided context\n2. Do NOT use your internal knowledge\n\nCONTEXT:\nCONTEXT TEXT\n\nQUESTION:\nQUESTION TEXT\n\nANSWER REQUIREMENTS:\n- Be direct and concise\n- Only output the answer to the question without any explanation \n\nRESPONSE:\n",
+ "judgePrompt": "\nYou are an expert evaluator tasked with judging whether the LLM's response demonstrates compliance with the specified RUBRIC CRITERION.\n\n## EVALUATION INPUTS\n- RUBRIC CRITERION (what to check): RUBRIC ITEM\n- RESPONSE TO EVALUATE: RESPONSE TEXT\n\n## EVALUATION RUBRIC:\nThe rubric defines a specific requirement, constraint, or expected behavior that the LLM response should demonstrate. \n\n**IMPORTANT**: Pay careful attention to whether the rubric specifies:\n- **Positive requirements** (things the response SHOULD include/do)\n- **Negative constraints** (things the response SHOULD NOT include/do, often indicated by \"no\", \"not\", \"avoid\", \"absent\")\n\n## RESPONSIVENESS REQUIREMENT\nA compliant response must be **on-topic** and attempt to answer it.\n- If the response does not address the QUESTION, score **0.0** and stop.\n- For negative constraints, both must hold: (a) the response is responsive to the QUESTION, and (b) the prohibited element is absent.\n\n## SEMANTIC TOLERANCE RULES:\nJudge by meaning, not exact wording.\n- Accept **paraphrases** and **synonyms** that preserve intent.\n- **Case/punctuation/whitespace** differences must be ignored.\n- **Numbers/currencies/dates** may appear in equivalent forms (e.g., “$68,000”, “68k”, “68,000 USD”, or “sixty-eight thousand dollars”). Treat them as equal when numerically equivalent.\n- If the rubric expects a number or duration, prefer **normalized comparison** (extract and compare values) over string matching.\n\n## STYLE NEUTRALITY (prevents style contamination):\nIgnore tone, politeness, length, and flourish unless the rubric explicitly requires a format/structure (e.g., “itemized list”, “no citations”, “one sentence”).\n- Do **not** penalize hedging, voice, or verbosity if content satisfies the rubric.\n- Only evaluate format when the rubric **explicitly** mandates it.\n\n## SCORING SCALE:\n- **1.0 (Complete Compliance)**: Fully complies with the rubric criterion.\n  - Positive: required element present, accurate, properly executed (allowing semantic equivalents).\n  - Negative: prohibited element **absent** AND response is **responsive**.\n  \n- **0.5 (Partial Compliance)**: Partially complies.\n  - Positive: element present but minor inaccuracies/incomplete execution.\n  - Negative: generally responsive and mostly avoids the prohibited element but with minor/edge violations.\n  \n- **0.0 (No Compliance)**: Fails to comply.\n  - Positive: required element missing or incorrect.\n  - Negative: prohibited element present **or** response is non-responsive/evasive even if the element is absent.\n\n## EVALUATION INSTRUCTIONS:\n1. **Understand the Requirement**: Determine if the rubric is asking for something to be present (positive) or absent (negative/constraint).\n\n2. **Parse Compound Statements**: If the rubric contains multiple elements connected by \"and\" or commas, evaluate whether:\n   - **All elements** must be present for full compliance (1.0)\n   - **Some elements** present indicates partial compliance (0.5)\n   - **No elements** present indicates no compliance (0.0)\n   \n3. **Check Compliance**: \n   - For positive requirements: Look for the presence and quality of the required element\n   - For negative constraints: Look for the absence of the prohibited element\n\n4. **Assign Score**: Based on compliance with the specific rubric criterion according to the scoring scale above.\n\n5. **Provide Reasoning**: Explain whether the rubric criterion was satisfied and justify the score.\n\n## OUTPUT FORMAT:\nReturn your evaluation in JSON format with two fields:\n\n{\n   \"score\": [your score: 1.0, 0.5, or 0.0],\n   \"reason\": \"[detailed explanation of whether the rubric criterion was satisfied and why this justified the assigned score]\"\n}\n\nNOTE: ONLY output the json object, without any explanation before or after that\n",
+ "equivalence": [
+  {
+   "role": "system",
+   "content": "\n            You are a binary classifier.\n            If the TWO snippets describe the SAME event/fact, reply **YES**\n            Otherwise reply **NO**. No extra words.\n            DO NOT provide any exaplanation.\n        "
+  },
+  {
+   "role": "user",
+   "content": "First snippet: First event \n\n                       Second snippet: Second event\n                    "
+  }
+ ],
+ "ordering": [
+  {
+   "reference": [
+    "A",
+    "B",
+    "C"
+   ],
+   "system": [
+    "A",
+    "B",
+    "C"
+   ],
+   "score": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "tau_norm": 1.0,
+    "final_score": 1.0
+   }
+  },
+  {
+   "reference": [
+    "A",
+    "B",
+    "C"
+   ],
+   "system": [
+    "C",
+    "A",
+    "B"
+   ],
+   "score": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "tau_norm": 0.3333333333333333,
+    "final_score": 0.3333333333333333
+   }
+  },
+  {
+   "reference": [
+    "A",
+    "B",
+    "C"
+   ],
+   "system": [
+    "",
+    "intro",
+    "A",
+    "C",
+    "B"
+   ],
+   "score": {
+    "precision": 0.6,
+    "recall": 1.0,
+    "f1": 0.7499999999999999,
+    "tau_norm": 0.23647686165263504,
+    "final_score": 0.17735764623947625
+   }
+  },
+  {
+   "reference": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "system": [
+    "C",
+    "A",
+    "D"
+   ],
+   "score": {
+    "precision": 1.0,
+    "recall": 0.75,
+    "f1": 0.8571428571428571,
+    "tau_norm": 0.5,
+    "final_score": 0.42857142857142855
+   }
+  },
+  {
+   "reference": [
+    "A",
+    "B"
+   ],
+   "system": [
+    "x"
+   ],
+   "score": {
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0,
+    "tau_norm": 0.09175170953613698,
+    "final_score": 0.0
+   }
+  },
+  {
+   "reference": [
+    "A",
+    "B",
+    "C"
+   ],
+   "system": [
+    "A",
+    "A again",
+    "B",
+    "C"
+   ],
+   "score": {
+    "precision": 0.75,
+    "recall": 1.0,
+    "f1": 0.8571428571428571,
+    "tau_norm": 0.6666666666666667,
+    "final_score": 0.5714285714285715
+   }
+  },
+  {
+   "reference": [
+    "A",
+    "B",
+    "C"
+   ],
+   "system": [
+    "C",
+    "B",
+    "A"
+   ],
+   "score": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "tau_norm": 0.0,
+    "final_score": 0.0
+   }
+  },
+  {
+   "reference": [
+    "A"
+   ],
+   "system": [
+    "A"
+   ],
+   "score": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "tau_norm": null,
+    "final_score": null
+   }
+  }
+ ]
+}

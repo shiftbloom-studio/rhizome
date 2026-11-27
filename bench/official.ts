@@ -104,7 +104,7 @@ export const judgedCorrect = (reply: string) => reply.trim().toLowerCase().inclu
 
 export interface ChatRequest {
   model: string;
-  messages: { role: "user"; content: string }[];
+  messages: { role: "system" | "user"; content: string }[];
   n: 1;
   temperature?: 0;
   max_tokens?: number;

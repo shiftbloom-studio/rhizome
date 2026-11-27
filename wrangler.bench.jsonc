@@ -31,7 +31,11 @@
     ]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BenchMemory", "AiGate"] }],
-  "workflows": [{ "name": "rhizome-bench", "binding": "RUNS", "class_name": "BenchWorkflow" }],
+  "workflows": [
+    { "name": "rhizome-bench", "binding": "RUNS", "class_name": "BenchWorkflow" },
+    // BEAM (bench/beam.ts): one step per conversation, then per question an answer and a verdict.
+    { "name": "rhizome-bench-beam", "binding": "BEAM_RUNS", "class_name": "BeamWorkflow" }
+  ],
   "r2_buckets": [
     { "binding": "BENCH", "bucket_name": "rhizome-bench" },
     { "binding": "EPISODES", "bucket_name": "rhizome-bench" }

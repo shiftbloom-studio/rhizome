@@ -43,6 +43,30 @@ import {
   type ReaderEffort,
 } from "./official";
 import { MEMORY_VARS, askQuestion, type AgentView } from "./question";
+import {
+  BEAM_ABILITIES,
+  BEAM_CONVERSATIONS,
+  BEAM_JUDGE_MODEL,
+  BEAM_TIERS,
+  BEAM_UPSTREAM,
+  beamConversationKey,
+  beamMarkdown,
+  beamMetrics,
+  beamReaderPrompt,
+  beamReaderRequest,
+  importConversation,
+  judgeAnswer,
+  runConversation,
+  type BeamAbility,
+  type BeamAnswer,
+  type BeamConversation,
+  type BeamMetrics,
+  type BeamQuestion,
+  type BeamSession,
+  type BeamTier,
+  type BeamView,
+  type ConversationRecord,
+} from "./beam";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -623,10 +647,8 @@ export class BenchMemory extends MemoryObject {
     this.bench = env;
   }
 
-  /** Runs one question on this empty memory, then deletes everything it stored, also when it fails. */
-  async benchRun(job: QuestionJob): Promise<ResultRecord & { view?: AgentView }> {
-    if (this.running) throw new Error("this memory is already running a question");
-    this.running = true;
+  /** Points the memory code at the benchmark's services for one job: paced and cached Workers AI, the tracked index. */
+  private async setUp(job: QuestionJob) {
     const vectors = new TrackedVectors(this.bench.VECTORS);
     const gate = this.bench.AI_GATE.get(this.bench.AI_GATE.idFromName("workers-ai"));
     const paced = pacedAi(this.bench.AI, (model) => gate.reserve(model, job.paidRpm));
@@ -644,6 +666,14 @@ export class BenchMemory extends MemoryObject {
       VECTORS: vectors,
       AI: cache ? cache.wrap(ai) : ai,
     } as unknown as Env;
+    return { vectors, cache, outputs };
+  }
+
+  /** Runs one question on this empty memory, then deletes everything it stored, also when it fails. */
+  async benchRun(job: QuestionJob): Promise<ResultRecord & { view?: AgentView }> {
+    if (this.running) throw new Error("this memory is already running a question");
+    this.running = true;
+    const { vectors, cache, outputs } = await this.setUp(job);
     try {
       const object = await this.bench.BENCH.get(job.key);
       if (!object) throw new Error(`no question at ${job.key}`);
@@ -656,6 +686,40 @@ export class BenchMemory extends MemoryObject {
         idleTimeoutMs: job.idleTimeoutMs,
         afterIngest: () => vectors.searchable(job.vectorTimeoutMs),
         agentView: job.agentView,
+      });
+      return outputs ? { ...record, aiCache: { hits: outputs.hits, misses: outputs.misses } } : record;
+    } finally {
+      await cache?.save();
+      await this.wipe();
+      this.running = false;
+    }
+  }
+
+  /**
+   * Runs one BEAM conversation on this empty memory (bench/beam.ts): all its turns, then
+   * the recall for each of its questions. Deletes everything it stored, also when it fails.
+   */
+  async beamRun(job: QuestionJob & { questions?: string[] }): Promise<ConversationRecord & { aiCache?: { hits: number; misses: number } }> {
+    if (this.running) throw new Error("this memory is already running a question");
+    this.running = true;
+    const { vectors, cache, outputs } = await this.setUp(job);
+    try {
+      const object = await this.bench.BENCH.get(job.key);
+      if (!object) throw new Error(`no conversation at ${job.key}`);
+      const conversation = await object.json<BeamConversation>();
+      const loadPart = async (key: string) => {
+        const part = await this.bench.BENCH.get(key);
+        if (!part) throw new Error(`no sessions at ${key}`);
+        return part.json<BeamSession[]>();
+      };
+      const record = await runConversation(this, benchClient(job.userId), conversation, loadPart, {
+        features: job.features,
+        chunking: job.chunking,
+        asOf: job.asOf,
+        reflect: job.reflect,
+        idleTimeoutMs: job.idleTimeoutMs,
+        afterIngest: () => vectors.searchable(job.vectorTimeoutMs),
+        ...(job.questions ? { questions: job.questions } : {}),
       });
       return outputs ? { ...record, aiCache: { hits: outputs.hits, misses: outputs.misses } } : record;
     } finally {
@@ -888,6 +952,260 @@ export class BenchWorkflow extends WorkflowEntrypoint<BenchEnv, RunParams> {
         output.official = { reader: settings.reader, judged: judged.length, failed: answers.length - judged.length, metrics };
       }
       return output;
+    });
+  }
+}
+
+// -------------------------------------------------------------------- BEAM
+
+/** A BEAM run's params (bench/beam.ts): the instance's params of the Workflow rhizome-bench-beam. */
+export interface BeamParams extends Omit<RunParams, "questions" | "types" | "sample" | "seed" | "limit" | "baseline"> {
+  /** "100K" (default), "500K", "1M" or "10M". */
+  tier?: string;
+  /** Conversation numbers of the tier, as a list or comma separated. Default: all of the tier. */
+  conversations?: number[] | string;
+  /** Only these abilities' questions, as a list or comma separated. */
+  abilities?: string[] | string;
+  /** The first n conversations, after `conversations`. */
+  limit?: number;
+  /** The judge's OpenAI model. Default gpt-4.1-mini, BEAM's own. */
+  judge?: string;
+}
+
+export interface BeamSettings {
+  tier: BeamTier;
+  conversations: number[];
+  abilities: BeamAbility[] | null;
+  judge: string;
+  /** Everything a LongMemEval run takes too; concurrency counts conversations. */
+  common: RunSettings;
+}
+
+const BEAM_PARAMS = new Set(["tier", "conversations", "abilities", "limit", "judge"]);
+const NOT_FOR_BEAM = new Set(["questions", "types", "sample", "seed", "baseline"]);
+
+/** Checks a BEAM run's params and fills in the defaults, so a typo fails before any conversation runs. */
+export function beamSettings(raw: unknown, env: Partial<Record<MemoryVar, string>>): BeamSettings {
+  let p = (raw ?? {}) as Record<string, unknown>;
+  if (typeof raw === "string") {
+    try {
+      p = raw.trim() ? JSON.parse(raw) : {};
+    } catch {
+      bad("params must be a JSON object");
+    }
+  }
+  if (!p || typeof p !== "object" || Array.isArray(p)) bad("params must be a JSON object");
+  const common: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(p)) {
+    if (NOT_FOR_BEAM.has(key)) bad(`"${key}" is a LongMemEval param; BEAM runs pick conversations with tier, conversations, abilities and limit`);
+    if (!BEAM_PARAMS.has(key)) common[key] = value;
+  }
+  const tier = (p.tier ?? "100K") as BeamTier;
+  if (!(BEAM_TIERS as readonly string[]).includes(tier)) bad(`tier must be one of ${BEAM_TIERS.join(", ")}`);
+  const count = BEAM_CONVERSATIONS[tier];
+  let conversations = Array.from({ length: count }, (_, i) => i + 1);
+  if (p.conversations !== undefined && p.conversations !== null) {
+    const list = typeof p.conversations === "string" ? p.conversations.split(",").map((x) => Number(x.trim())) : p.conversations;
+    if (!Array.isArray(list) || !list.length || !list.every((n) => Number.isInteger(n) && n >= 1 && n <= count)) bad(`conversations must be numbers from 1 to ${count} for ${tier}`);
+    conversations = [...new Set(list as number[])];
+  }
+  const limit = wholeNumber("limit", p.limit, 1, count);
+  if (limit !== undefined) conversations = conversations.slice(0, limit);
+  const abilities = names("abilities", p.abilities) ?? null;
+  for (const a of abilities ?? []) if (!(BEAM_ABILITIES as readonly string[]).includes(a)) bad(`unknown ability "${a}" (known: ${BEAM_ABILITIES.join(", ")})`);
+  const judge = p.judge ?? BEAM_JUDGE_MODEL;
+  if (typeof judge !== "string" || !MODEL_ID.test(judge)) bad("judge must be an OpenAI model id, e.g. gpt-4.1-mini");
+  // A conversation's embeddings are kept as one object; above 100K they no longer fit a Durable Object's memory well.
+  if (common.embeddingCache === undefined) common.embeddingCache = tier === "100K";
+  if (common.concurrency === undefined) common.concurrency = Math.min(4, conversations.length);
+  return { tier, conversations, abilities: abilities as BeamAbility[] | null, judge, common: runSettings(common, env) };
+}
+
+export interface BeamOutput {
+  runId: string;
+  tier: BeamTier;
+  conversations: number;
+  failed: number;
+  metrics: BeamMetrics;
+  markdown: string;
+}
+
+/** What the run keeps of a conversation between steps: no raw questions, no sessions. */
+type BeamEntry = Pick<BeamConversation, "id" | "n" | "sessions" | "messages" | "characters" | "sha256" | "source"> & { key: string; questions: BeamQuestion[] };
+
+/** The view of a question without its text, which goes to runs/<id>/contexts/. */
+type BeamViewMeta = Omit<BeamView, "text">;
+
+/** Questions of one conversation answered and judged at a time. */
+const BEAM_QUESTION_LANES = 4;
+
+/** A BEAM run: the instance id names it, and its files go to runs/<id>/ in the BENCH bucket. */
+export class BeamWorkflow extends WorkflowEntrypoint<BenchEnv, BeamParams> {
+  async run(event: Readonly<WorkflowEvent<BeamParams>>, step: WorkflowStep): Promise<BeamOutput> {
+    const runId = event.instanceId;
+    const settings = beamSettings(event.payload, this.env);
+    const { common, tier } = settings;
+    if (common.reader && !this.env.OPENAI_API_KEY) bad("reader needs the Worker secret OPENAI_API_KEY");
+    const openai: OpenAiOptions = { apiKey: this.env.OPENAI_API_KEY ?? "", ...(this.env.OPENAI_BASE_URL ? { baseUrl: this.env.OPENAI_BASE_URL } : {}) };
+    const put = (file: string, body: string, type: string) => this.env.BENCH.put(runFile(runId, file), body, { httpMetadata: { contentType: type } });
+
+    const entries: BeamEntry[] = [];
+    for (const n of settings.conversations) {
+      entries.push(
+        await step.do(`dataset ${tier}/${n}`, DATASET_STEP, async () => {
+          const c = await importConversation(this.env.BENCH, tier, n);
+          const questions = settings.abilities ? c.questions.filter((q) => settings.abilities!.includes(q.ability)) : c.questions;
+          return { id: c.id, n: c.n, sessions: c.sessions, messages: c.messages, characters: c.characters, sha256: c.sha256, source: c.source, key: beamConversationKey(tier, n), questions };
+        }),
+      );
+    }
+
+    await step.do("config", FILES_STEP, async () => {
+      const config = {
+        runId,
+        created: new Date().toISOString(),
+        benchmark: "beam",
+        upstream: BEAM_UPSTREAM,
+        tier,
+        conversations: entries.map((e) => ({ id: e.id, sessions: e.sessions, messages: e.messages, characters: e.characters, sha256: e.sha256, source: e.source, questions: e.questions.length })),
+        settings: {
+          ai: "workers-ai",
+          vars: common.vars,
+          extraction: common.extraction,
+          reflect: common.reflect,
+          features: common.features,
+          chunking: common.chunking,
+          asOf: common.asOf,
+          abilities: settings.abilities,
+          embeddingCache: common.embeddingCache,
+          aiCache: common.aiCache,
+        },
+        concurrency: common.concurrency,
+        paidRpm: common.paidRpm,
+        ...(common.reader ? { reader: common.reader, readerEffort: common.readerEffort, judge: settings.judge } : {}),
+        meta: { worker: this.env.CF_VERSION_METADATA ?? null },
+      };
+      await put("config.json", JSON.stringify(config, null, 2) + "\n", "application/json");
+      return null;
+    });
+
+    const ingest = async (e: BeamEntry): Promise<{ record?: Omit<ConversationRecord, "views"> & { views: BeamViewMeta[]; aiCache?: { hits: number; misses: number } }; error?: string }> => {
+      // With extraction a turn is one or two calls of the paid model, shared with the other conversations.
+      const idleTimeoutMs = common.extraction ? Math.max(3_600_000, ((3 * e.sessions * common.concurrency) / common.paidRpm) * 60_000) : Math.max(900_000, e.sessions * 2_000);
+      const vectorTimeoutMs = 600_000;
+      const config: WorkflowStepConfig = { retries: { limit: 2, delay: "1 minute", backoff: "exponential" }, timeout: (common.reflect ? 2 : 1) * idleTimeoutMs + vectorTimeoutMs + 1_800_000 };
+      try {
+        type Ingested = Omit<ConversationRecord, "views"> & { views: BeamViewMeta[]; aiCache?: { hits: number; misses: number } };
+        const record = await step.do(`conversation ${e.id}`, config, async (ctx): Promise<Ingested> => {
+          const tag = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+          const memory = this.env.MEMORY.get(this.env.MEMORY.idFromName(`${runId}:${e.id}:${ctx.attempt}:${tag}`));
+          const out = (await memory.beamRun({
+            key: e.key,
+            userId: `${e.id}-${tag}`,
+            vars: common.vars,
+            ...(common.features ? { features: common.features } : {}),
+            ...(common.chunking ? { chunking: common.chunking } : {}),
+            extraction: common.extraction,
+            reflect: common.reflect,
+            asOf: common.asOf,
+            paidRpm: common.paidRpm,
+            idleTimeoutMs,
+            vectorTimeoutMs,
+            ...(common.embeddingCache ? { embeddingCache: true } : {}),
+            ...(common.aiCache ? { aiCache: true } : {}),
+            questions: e.questions.map((q) => q.id),
+          })) as ConversationRecord & { aiCache?: { hits: number; misses: number } };
+          // The texts can pass a step's 1 MiB; they go to the bucket, the step keeps the rest.
+          await put(`contexts/${e.id}.json`, JSON.stringify(Object.fromEntries(out.views.map((v) => [v.id, v.text]))), "application/json");
+          return { ...out, views: out.views.map(({ text: _text, ...meta }) => meta) };
+        });
+        return { record: record as Ingested };
+      } catch (err) {
+        return { error: String((err as Error)?.message ?? err).slice(0, 500) };
+      }
+    };
+
+    const answerOne = async (e: BeamEntry, q: BeamQuestion, view: BeamViewMeta | undefined, text: string | undefined, failed: string | undefined): Promise<BeamAnswer> => {
+      const base: BeamAnswer = { id: q.id, conversation: e.id, ability: q.ability, question: q.question };
+      if (!view || text === undefined) return { ...base, error: failed ? `no recall: ${failed}` : "no recall" };
+      const context = { contextItems: view.items, contextTokens: view.tokens, evidence: view.evidence, evidenceCovered: view.evidenceCovered };
+      if (!common.reader) return { ...base, ...context };
+      try {
+        const read = await step.do(`answer ${q.id}`, QA_STEP, () => openAiStep(beamReaderRequest(common.reader!, beamReaderPrompt(text, q.question), common.readerEffort), openai));
+        if ("error" in read) return { ...base, ...context, error: `reader: ${read.error}` };
+        const hypothesis = read.content.trim();
+        const reader = { hypothesis, readerModel: read.model, readerTokens: { prompt: read.promptTokens, completion: read.completionTokens, ...(read.reasoningTokens !== undefined ? { reasoning: read.reasoningTokens } : {}) } };
+        const verdict = await step.do(`judge ${q.id}`, QA_STEP, async () => {
+          try {
+            return await judgeAnswer(q.ability, q.rubric, hypothesis, settings.judge, openai);
+          } catch (err) {
+            if (err instanceof OpenAiError && !err.retryable) return { error: err.message.slice(0, 500) };
+            throw err;
+          }
+        });
+        if ("error" in verdict) return { ...base, ...context, ...reader, error: `judge: ${verdict.error}` };
+        return { ...base, ...context, ...reader, verdict };
+      } catch (err) {
+        return { ...base, ...context, error: String((err as Error)?.message ?? err).slice(0, 500) };
+      }
+    };
+
+    const records: { id: string; record?: unknown; error?: string }[] = new Array(entries.length);
+    const answers: BeamAnswer[][] = new Array(entries.length);
+    let next = 0;
+    const lane = async () => {
+      for (let i = next++; i < entries.length; i = next++) {
+        const e = entries[i]!;
+        const { record, error } = await ingest(e);
+        records[i] = record ? record : { id: e.id, error };
+        const texts = record ? await (await this.env.BENCH.get(runFile(runId, `contexts/${e.id}.json`)))?.json<Record<string, string>>() : undefined;
+        const views = new Map((record?.views ?? []).map((v) => [v.id, v]));
+        const out: BeamAnswer[] = new Array(e.questions.length);
+        let q = 0;
+        const questionLane = async () => {
+          for (let j = q++; j < e.questions.length; j = q++) {
+            const question = e.questions[j]!;
+            out[j] = await answerOne(e, question, views.get(question.id), texts?.[question.id], error ?? (record && !texts ? "contexts missing" : undefined));
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(BEAM_QUESTION_LANES, e.questions.length) }, questionLane));
+        answers[i] = out;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(common.concurrency, entries.length) }, lane));
+
+    return step.do("summary", FILES_STEP, async () => {
+      const all = answers.flat();
+      const metrics = beamMetrics(all);
+      const markdown = beamMarkdown({ runId, tier, reader: common.reader, readerEffort: common.readerEffort, judge: settings.judge, metrics });
+      await put("conversations.jsonl", lines(records.map((r) => JSON.stringify(r))), "application/x-ndjson");
+      await put("answers.jsonl", lines(all.map((a) => JSON.stringify(a))), "application/x-ndjson");
+      await put("beam.md", markdown, "text/markdown; charset=utf-8");
+      await put("beam.json", JSON.stringify({ tier, upstream: BEAM_UPSTREAM, reader: common.reader, readerEffort: common.readerEffort, judge: settings.judge, metrics }, null, 2) + "\n", "application/json");
+      if (common.reader) {
+        // BEAM's own files, per conversation: the answers as answer_generation.py writes them, and the
+        // verdicts as run_evaluation.py writes them, so src/evaluation/report_results.py can read them.
+        for (let i = 0; i < entries.length; i++) {
+          const e = entries[i]!;
+          const object = await this.env.BENCH.get(e.key);
+          if (!object) continue;
+          const raw = (await object.json<BeamConversation>()).raw;
+          const byId = new Map(answers[i]!.map((a) => [a.id, a]));
+          const answered: Record<string, unknown[]> = {};
+          const evaluated: Record<string, unknown[]> = {};
+          for (const q of e.questions) {
+            const a = byId.get(q.id);
+            if (!a?.verdict) continue;
+            (answered[q.ability] ??= []).push({ ...(raw[q.ability]?.[q.index] as object), llm_response: a.hypothesis });
+            const v = a.verdict;
+            (evaluated[q.ability] ??= []).push({ ...(v.ordering ?? {}), llm_judge_score: v.llm_judge_score, llm_judge_responses: v.items.map((it) => ({ score: it.score, reason: it.reason ?? "" })) });
+          }
+          await put(`upstream/${tier}/${e.n}/rhizome.json`, JSON.stringify(answered, null, 4), "application/json");
+          await put(`upstream/${tier}/${e.n}/evaluation-results-rhizome.json`, JSON.stringify(evaluated, null, 4), "application/json");
+        }
+      }
+      const failed = records.filter((r) => r.error).length;
+      return { runId, tier, conversations: entries.length, failed, metrics, markdown };
     });
   }
 }
