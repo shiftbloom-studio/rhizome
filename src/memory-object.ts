@@ -1765,7 +1765,7 @@ export class MemoryObject extends DurableObject<Env> {
 
   /**
    * Schedules a reflection run (consolidation, decay, profile distillation). Called nightly and from the explorer.
-   * `at` runs it as of that time instead of now, for histories replayed from the past (bench/).
+   * `at` runs it as of that time instead of now, for histories replayed from the past (the benchmark on the bench branch).
    */
   async requestReflection(client?: Client, at?: number): Promise<{ scheduled: boolean }> {
     if (client) this.userId(client);

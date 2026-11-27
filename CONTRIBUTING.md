@@ -33,7 +33,7 @@ npm run build:node   # bundle the Node server
 
 CI runs both on every pull request.
 
-To measure a change to extraction or recall, run the LongMemEval benchmark in `bench/` before and after it and compare the two runs ([bench/README.md](bench/README.md)).
+To measure a change to extraction or recall, run the LongMemEval benchmark on the `bench` branch before and after it and compare the two runs ([bench/README.md](https://github.com/shiftbloom-studio/rhizome/blob/bench/bench/README.md)).
 
 ## Pull requests
 
