@@ -96,7 +96,7 @@ export function validateRecords(raw: unknown, notes: number): (TypedRecord | nul
     if (!category) return;
     const type = (RECORD_TYPES as readonly string[]).includes(r.type as string) ? (r.type as RecordType) : "other";
     const tags = Array.isArray(r.tags) ? ([...new Set(r.tags.map(normalizeLabel))].filter((t) => t && t !== category).slice(0, 3) as string[]) : [];
-    const q = typeof r.quantity === "number" ? r.quantity : typeof r.quantity === "string" && /\d/.test(r.quantity) ? Number(r.quantity.replace(/[^\d.-]/g, "")) : NaN;
+    const q = typeof r.quantity === "number" ? r.quantity : typeof r.quantity === "string" && /\d/.test(r.quantity) ? Number(r.quantity.replace(/[^\d.-]/g, "")) : Number.NaN;
     const quantity = Number.isFinite(q) ? q : null;
     out[i] = { type, category, tags, quantity, unit: quantity === null ? null : short(r.unit, 20), date: parseDay(r.date) };
   });

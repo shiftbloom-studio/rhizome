@@ -657,7 +657,7 @@ async function recordsTool(memory: MemoryApi, client: Client, args: Record<strin
     : op === "sum"
       ? `Sum (${what}): ${(result.sums as { unit: string | null; total: number }[]).map((s) => `${s.total}${s.unit ? ` ${s.unit}` : ""}`).join(", ") || "no amounts"}` +
         (result.withoutQuantity ? `; ${result.withoutQuantity} of ${res.total} rows have no amount.` : ".")
-      : op === "latest" ? `Latest (${what}): ${shown.length ? res.rows.reduce((a, b) => (b.date > a.date ? b : a)).id : "none"}.`
+      : op === "latest" ? `Latest (${what}): ${(result.latest as string | null) ?? "none"}.`
         : `${res.total} records (${what})${res.total > shown.length ? `, ${shown.length} shown` : ""}, oldest first.`;
   const body = shown.length ? `\n${shown.map(recordLine).join("\n")}` : "";
   return text(summary + body, { labels: res.labels, total: res.total, ...result, rows: shown.map(recordOut) });
