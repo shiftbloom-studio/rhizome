@@ -42,6 +42,8 @@ class Cursor<T extends Record<string, unknown>> implements Iterable<T> {
 class LocalStorage {
   private alarmTimer: NodeJS.Timeout | null = null;
   private retries = 0;
+  /** The alarm handler while it runs: like Durable Objects, only one runs at a time. */
+  private running: Promise<void> | null = null;
   readonly sql;
 
   constructor(
@@ -112,9 +114,26 @@ class LocalStorage {
 
   private async fire(at: number) {
     this.alarmTimer = null;
+    // Like Durable Objects, never two handlers at once: an alarm the running handler set
+    // (or that came due meanwhile) waits until it has finished.
+    if (this.running) {
+      await this.running;
+      const next = await this.getAlarm();
+      if (next !== null && !this.alarmTimer && !this.running) this.schedule(next);
+      return;
+    }
     // Like Durable Objects: the alarm is cleared before the handler runs, and the handler may set a new one.
     if ((await this.getAlarm()) !== at) return;
     this.db.exec("DELETE FROM _node_alarm");
+    this.running = this.handle();
+    try {
+      await this.running;
+    } finally {
+      this.running = null;
+    }
+  }
+
+  private async handle() {
     try {
       await this.runAlarm();
       this.retries = 0;

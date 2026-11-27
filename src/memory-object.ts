@@ -2029,6 +2029,12 @@ export class MemoryObject extends DurableObject<Env> {
   private async extract(episodeId: string): Promise<void> {
     const ep = this.sql.exec("SELECT * FROM episodes WHERE id = ?", episodeId).toArray()[0];
     if (!ep) return; // forgotten in the meantime
+    // An alarm cut off after the notes were written but before its job was deleted runs the
+    // job again: the episode would be extracted twice, against its own notes, and pay twice.
+    const done = this.sql
+      .exec("SELECT 1 FROM audit WHERE action IN ('extract', 'extract.none') AND json_extract(detail, '$.episodeId') = ? LIMIT 1", episodeId)
+      .toArray().length;
+    if (done) return;
     const obj = await this.env.EPISODES.get(String(ep.r2_key));
     if (!obj) return;
     const raw = (await obj.json()) as { messages?: { role: string; content: string }[] | null; text?: string | null };
