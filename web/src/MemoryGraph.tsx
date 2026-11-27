@@ -16,6 +16,9 @@ import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeome
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import type { Graph, GraphEdge, GraphNode, NodeType } from "./types";
 
+/** Code-unit order, the same order as a plain .sort() on strings. */
+const byCodeUnit = (a: string, b: string): number => Number(a > b) - Number(a < b);
+
 export const BG = "#FAF6F4";
 export const TRUST_COLOR: Record<string, string> = {
   user_explicit: "#C81040",
@@ -152,7 +155,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
     const links = graph.edges
       .filter((e) => {
         if (!byId.has(e.source) || !byId.has(e.target)) return false;
-        const key = e.kind === "similar" ? [e.source, e.target].sort().join("|") + "|similar" : `${e.source}|${e.target}|${e.kind}`;
+        const key = e.kind === "similar" ? [e.source, e.target].sort(byCodeUnit).join("|") + "|similar" : `${e.source}|${e.target}|${e.kind}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -189,7 +192,7 @@ function Scene({ graph, highlight, selected, onSelect, reducedMotion, rightPanel
 
   // Every scope gets an anchor on a ring, so profile, each project and each agent form their own region.
   const anchors = useMemo(() => {
-    const scopes = [...new Set(nodes.map((n) => n.scope).filter((s): s is string => Boolean(s)))].sort();
+    const scopes = [...new Set(nodes.map((n) => n.scope).filter((s): s is string => Boolean(s)))].sort(byCodeUnit);
     const map = new Map<string, { x: number; y: number; z: number }>();
     const radius = scopes.length > 1 ? (55 + scopes.length * 12) * spread : 0;
     scopes.forEach((s, i) => {

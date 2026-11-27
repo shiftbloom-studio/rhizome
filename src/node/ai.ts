@@ -7,6 +7,8 @@
 //
 // Reranking is optional with "openai": without AI_RERANK_URL recall keeps its fused order.
 
+import { trimEndChars } from "../text";
+
 export interface AiConfig {
   provider: "openai" | "cloudflare";
   /** openai: base URL including /v1, e.g. http://localhost:11434/v1 */
@@ -51,7 +53,7 @@ export class LocalAi {
       return res.result;
     }
 
-    const base = (this.cfg.baseUrl ?? "").replace(/\/+$/, "");
+    const base = trimEndChars(this.cfg.baseUrl ?? "", "/");
     if (input.text !== undefined) {
       const texts = Array.isArray(input.text) ? input.text : [input.text];
       const res = (await post(`${base}/embeddings`, { model, input: texts }, this.cfg.apiKey, timeout)) as { data: { index: number; embedding: number[] }[] };

@@ -16,6 +16,7 @@
 // On by default; STANDING_ORDERS=off turns them off (src/flags.ts).
 
 import { BudgetError, linearRegex, PatternError, type Budget, type LinearRegex } from "./linear-regex";
+import { trimEndChars } from "./text";
 
 export const ORDER_ACTIONS = ["deny", "ask", "warn"] as const;
 export type OrderAction = (typeof ORDER_ACTIONS)[number];
@@ -272,7 +273,8 @@ export function reasonFor(order: Pick<Order, "id" | "says" | "said" | "action">)
 }
 
 /** The strictest decision over all active orders that match the call, or null when none does. */
-export function evaluate(orders: Order[], call: ToolCall, budget: Budget = { left: CHECK_BUDGET }): Decision | null {
+export function evaluate(orders: Order[], call: ToolCall, budget?: Budget): Decision | null {
+  budget ??= { left: CHECK_BUDGET };
   let hit: Order | null = null;
   for (const order of orders) {
     if (order.state !== "active") continue;
@@ -324,7 +326,7 @@ export function cwdFromHook(input: unknown): string | null {
 /** The last part of a path, lowercased, when it is a valid project slug. */
 export function projectFromPath(path: string | null): string | null {
   if (!path) return null;
-  const last = path.replace(/[\\/]+$/, "").split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  const last = trimEndChars(path, "\\/").split(/[\\/]/).pop()?.toLowerCase() ?? "";
   return /^[a-z0-9][a-z0-9._-]{0,47}$/.test(last) ? last : null;
 }
 

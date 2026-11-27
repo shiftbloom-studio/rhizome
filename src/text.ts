@@ -43,7 +43,7 @@ export function ftsQuery(input: string): string | null {
     .toLowerCase()
     .normalize("NFKC")
     .split(/[^\p{L}\p{N}_-]+/u)
-    .map((w) => w.replace(/^-+|-+$/g, ""))
+    .map((w) => trimChars(w, "-"))
     .filter((w) => w.length > 1)
     .slice(0, 24);
   if (words.length === 0) return null;
@@ -97,4 +97,28 @@ export function roundChunks(messages: { role: string; content: string }[], max =
   }
   if (pending) out.push(...chunk(pending, max, overlap));
   return out;
+}
+
+/**
+ * Strips any of `chars` from both ends of `text`. A loop instead of a
+ * /^-+|-+$/ style regex, so long runs of those characters stay linear.
+ */
+export function trimChars(text: string, chars: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && chars.includes(text.charAt(start))) start++;
+  while (end > start && chars.includes(text.charAt(end - 1))) end--;
+  return text.slice(start, end);
+}
+
+/** Strips any of `chars` from the end of `text`, in linear time. */
+export function trimEndChars(text: string, chars: string): string {
+  let end = text.length;
+  while (end > 0 && chars.includes(text.charAt(end - 1))) end--;
+  return text.slice(0, end);
+}
+
+/** Code-unit order, the same order as a plain .sort() on strings, as an explicit comparator. */
+export function byCodeUnit(a: string, b: string): number {
+  return Number(a > b) - Number(a < b);
 }
