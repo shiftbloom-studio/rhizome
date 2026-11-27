@@ -91,7 +91,21 @@ describe("planDream guards", () => {
     expect(plan.rollups).toHaveLength(1);
     expect(plan.rollups[0]!.members).toEqual(["a", "b"]);
     expect(plan.rejected[0]).toMatch(/rollup: 1 members/);
-    expect(plan.rejected[1]).toMatch(/numbers not in its members \(10, 1\)/);
+    // The reason names no numbers: rejections are logged, and the log keeps no memory text.
+    expect(plan.rejected[1]).toBe("rollup: 2 numbers not in its members");
+  });
+
+  it("never lets a guess take over the person's own wording in a merge", () => {
+    const plan = planDream({ merge: [{ keep: 2, drop: [1] }] }, group);
+    expect(plan.merge).toEqual([]);
+    expect(plan.rejected).toEqual(["merge b into c: would replace more trusted wording"]);
+  });
+
+  it("does not replace a rollup with one that drops its entries", () => {
+    const trips = [note("t1", "The user flew to Lisbon.", "2023-03-12"), note("t2", "The user took a train to Porto.", "2023-07-04"), group[7]!];
+    const lossy = planDream({ rollups: [{ members: [1, 2], text: "Trips:\n- Porto (2023-07-04)" }] }, trips);
+    expect(lossy.rollups).toEqual([]);
+    expect(lossy.rejected).toEqual(["rollup: would drop entries of rollup r"]);
   });
 
   it("ignores garbage", () => {
@@ -115,10 +129,16 @@ vi.spyOn(Date, "now").mockImplementation(() => now);
 afterAll(() => vi.restoreAllMocks());
 
 let dreamInputs: string[] = [];
+/** Runs while the model "thinks", e.g. to forget a note mid-call. */
+let duringCall: (() => void) | null = null;
 /** The dreaming model: merges the two tea notes, replaces the old job, rolls up the weddings. */
 function generate(_model: string, system: string, user: string): string {
   if (system !== DREAM_PROMPT) return "{}";
   dreamInputs.push(user);
+  if (duringCall && user.includes("Rachel")) {
+    duringCall();
+    duringCall = null;
+  }
   const lines = user.split("\n").filter((l) => /^\d+\. /.test(l));
   const date = (i: number) => lines.find((l) => l.startsWith(`${i}.`))!.slice(4, 14);
   const find = (re: RegExp) => lines.filter((l) => re.test(l)).map((l) => Number(l.split(".")[0]));
@@ -126,12 +146,15 @@ function generate(_model: string, system: string, user: string): string {
     .filter((i) => !/ROLLUP/.test(lines.find((l) => l.startsWith(`${i}.`))!))
     .sort((a, b) => date(a).localeCompare(date(b)));
   const rollup = find(/ROLLUP/);
-  const tea = find(/green tea/);
+  // The person's own wording is the one to keep.
+  const tea = find(/green tea/).sort((a, b) => Number(/user_explicit/.test(lines[b]!)) - Number(/user_explicit/.test(lines[a]!)));
   // Dates of the weddings, with those an earlier rollup lists.
   const listed = (ws: number[], rs: number[]) =>
     [...new Set([...ws.map(date), ...rs.flatMap((i) => [...lines.find((l) => l.startsWith(`${i}.`))!.slice(30).matchAll(/\d{4}-\d{2}-\d{2}/g)].map((m) => m[0]))])].sort();
   const job = find(/works as a nurse|new job as a nurse/).sort((a, b) => date(a).localeCompare(date(b)));
+  const fragment = find(/it cost 450/);
   return JSON.stringify({
+    rewrite: fragment.map((i) => ({ note: i, text: "The garden wedding of Emily and Sarah cost 450 dollars." })),
     merge: tea.length === 2 ? [{ keep: tea[0], drop: [tea[1]] }] : [],
     supersede: job.length === 2 ? [{ old: job[0], new: job[1] }] : [],
     rollups:
@@ -199,6 +222,44 @@ describe("dreaming in the MemoryObject", () => {
     const after = db.prepare("SELECT content FROM items WHERE status = 'active' AND origin = 'reflection'").all() as { content: string }[];
     expect(after).toHaveLength(1);
     expect(after[0]!.content.split("\n")).toHaveLength(5);
+  });
+
+  it("logs rewrites by id only, so forget leaves no memory text behind", async () => {
+    await add("it cost 450 dollars, the wedding in the garden", "2023-06-03", "agent_inference");
+    await settle();
+    await mo.requestReflection(claude, day("2023-11-01"));
+    await settle();
+    const row = db.prepare("SELECT id FROM items WHERE content LIKE 'The garden wedding of Emily%'").get() as { id: string };
+    expect(row).toBeTruthy();
+    await mo.forget(claude, row.id);
+    const log = (db.prepare("SELECT detail FROM audit").all() as { detail: string | null }[]).map((r) => r.detail ?? "").join("\n");
+    expect(log).not.toMatch(/it cost 450|garden wedding of Emily|450 dollars/);
+  });
+
+  it("discards a group's proposals when one of its notes is forgotten during the model call", async () => {
+    const rachel = db.prepare("SELECT id FROM items WHERE content LIKE '%Rachel%'").get() as { id: string };
+    duringCall = () => {
+      // What forget does to the row, while the model call is in flight.
+      db.prepare("DELETE FROM items WHERE id = ?").run(rachel.id);
+    };
+    await mo.requestReflection(claude, day("2023-11-01"));
+    await settle();
+    const rollups = db.prepare("SELECT content FROM items WHERE origin = 'reflection'").all() as { content: string }[];
+    expect(rollups.every((r) => !r.content.includes("2023-03-12"))).toBe(true);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'dream.discarded'").get() as { n: number }).n).toBeGreaterThan(0);
+  });
+
+  it("keeps a rollup of another category that shares only one note", async () => {
+    const rachel = db.prepare("SELECT id FROM items WHERE content LIKE '%Rachel%'").get() as { id: string };
+    db.prepare(
+      `INSERT INTO items (id, kind, scope, content, note_kind, trust, client_id, agent, provider, t_event, created_at, origin)
+       VALUES ('trips', 'note', 'profile', 'Trips:\n- Rachel and Mike wedding trip (2023-03-12)\n- Lisbon (2022-01-01)', 'fact', 'agent_inference', 'system:dreaming', 'rhizome', 'dreaming', 0, 0, 'reflection')`,
+    ).run();
+    db.prepare("INSERT INTO links (src, dst, kind, weight, created_at) VALUES ('trips', ?, 'rolls_up', 1, 0), ('trips', 'lisbon', 'rolls_up', 1, 0)").run(rachel.id);
+    await mo.requestReflection(claude, day("2023-11-01"));
+    await settle();
+    expect(db.prepare("SELECT status FROM items WHERE id = 'trips'").get()).toEqual({ status: "active" });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM items WHERE origin = 'reflection' AND status = 'active' AND content LIKE 'Weddings%'").get()).toEqual({ n: 1 });
   });
 
   it("forgetting a note deletes the rollups that list it", async () => {

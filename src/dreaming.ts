@@ -129,6 +129,11 @@ export function planDream(raw: unknown, notes: DreamNote[]): DreamPlan {
         reject(`merge ${n.id} into ${keep.id}: similarity ${sim.toFixed(2)}`);
         continue;
       }
+      // The kept wording takes over the higher trust: it must not be a guess standing in for the person's words.
+      if (rank(n) > rank(keep)) {
+        reject(`merge ${n.id} into ${keep.id}: would replace more trusted wording`);
+        continue;
+      }
       // Merging keeps one wording; it must not lose a number only the other note has.
       if (!subset(numbers(n.content), numbers(keep.content))) {
         reject(`merge ${n.id} into ${keep.id}: numbers differ`);
@@ -213,13 +218,24 @@ export function planDream(raw: unknown, notes: DreamNote[]): DreamPlan {
     }
     const unknown = [...numbers(text)].filter((x) => !allowed.has(x));
     if (unknown.length) {
-      reject(`rollup: numbers not in its members (${unknown.slice(0, 5).join(", ")})`);
+      reject(`rollup: ${unknown.length} numbers not in its members`);
+      continue;
+    }
+    // A replaced rollup's entries must all be in the new one (its dates and numbers are the check).
+    const lost = replaces.find((old) => !keepsEntries(old.content, text));
+    if (lost) {
+      reject(`rollup: would drop entries of rollup ${lost.id}`);
       continue;
     }
     const t = Math.max(...picked.map((n) => n.t));
     plan.rollups.push({ members: [...members.keys()], replaces: replaces.map((n) => n.id), content: text, t });
   }
   return plan;
+}
+
+/** True when every number and date of an earlier rollup is still in the new text. */
+export function keepsEntries(oldContent: string, newText: string): boolean {
+  return subset(numbers(oldContent), numbers(newText));
 }
 
 /** Number of changes in a plan. */

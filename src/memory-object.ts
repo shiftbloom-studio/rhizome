@@ -45,6 +45,7 @@ import {
   DREAM_NEIGHBOUR,
   DREAM_PROMPT,
   dreamInput,
+  keepsEntries,
   planDream,
   planSize,
   type DreamNote,
@@ -2928,7 +2929,7 @@ export class MemoryObject extends DurableObject<Env> {
       report.groups++;
       report.rejected += plan.rejected.length;
       if (planSize(plan) === 0) continue;
-      const done = this.applyDream(plan, scope, model, now);
+      const done = this.applyDream(plan, group.map((n) => n.id), scope, model, now);
       report.merged += done.merged;
       report.superseded += done.superseded;
       report.rewritten += done.rewritten;
@@ -2990,11 +2991,20 @@ export class MemoryObject extends DurableObject<Env> {
   }
 
   /** Applies a checked dreaming plan in one transaction, with an audit row per change (what it was before). */
-  private applyDream(plan: DreamPlan, scope: string, model: string, now: number) {
+  private applyDream(plan: DreamPlan, group: string[], scope: string, model: string, now: number) {
     const done = { merged: 0, superseded: 0, rewritten: 0, kinds: 0, rollups: 0 };
     const log = (action: string, detail: unknown) =>
       this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, ?, ?)", now, SYSTEM_DREAMING, action, JSON.stringify(detail));
     this.ctx.storage.transactionSync(() => {
+      // A note forgotten while the model was thinking: its text may be in the proposals, so none of them apply.
+      const ids = new Set([...group, ...plan.rollups.flatMap((u) => [...u.members, ...u.replaces])]);
+      const present = Number(
+        this.sql.exec("SELECT COUNT(*) AS n FROM items WHERE id IN (SELECT value FROM json_each(?))", JSON.stringify([...ids])).toArray()[0]?.n ?? 0,
+      );
+      if (present < ids.size) {
+        log("dream.discarded", { missing: ids.size - present });
+        return;
+      }
       for (const m of plan.merge) {
         for (const loser of m.drop) {
           if (!this.isActive(m.keep) || !this.isActive(loser)) continue;
@@ -3010,14 +3020,14 @@ export class MemoryObject extends DurableObject<Env> {
         done.superseded++;
       }
       for (const w of plan.rewrite) {
-        const before = this.sql.exec("SELECT content FROM items WHERE id = ? AND status = 'active'", w.id).toArray()[0];
-        if (!before) continue;
+        if (!this.isActive(w.id)) continue;
         this.sql.exec("UPDATE items SET content = ?, updated_at = ? WHERE id = ?", w.content, now, w.id);
         // New wording, new embedding: the outbox embeds it again and updates the index.
         this.sql.exec("DELETE FROM embeddings WHERE item_id = ?", w.id);
         this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", w.id, now);
         this.refreshFactKeys(w.id);
-        log("dream.rewrite", { id: w.id, before: String(before.content) });
+        // Ids only: the log outlives forget, so it never holds memory text.
+        log("dream.rewrite", { id: w.id });
         done.rewritten++;
       }
       for (const k of plan.kind) {
@@ -3031,17 +3041,18 @@ export class MemoryObject extends DurableObject<Env> {
         // Members merged or replaced a moment ago are listed by their current version.
         const members = [...new Set(u.members.map((id) => this.currentVersion(id)))].filter((id) => this.isActive(id));
         if (members.length < 2) continue;
-        // An earlier rollup over mostly the same notes is replaced, even when it was not in the group.
+        // An earlier rollup outside the group is replaced only when the new one lists all of its
+        // notes and keeps all of its entries; sharing a note or two is not the same category.
         const replaces = new Set(u.replaces.filter((id) => this.isActive(id)));
         for (const r of this.sql
           .exec(
-            `SELECT l.src AS id, COUNT(*) AS shared FROM links l JOIN items i ON i.id = l.src AND i.status = 'active'
+            `SELECT l.src AS id, i.content, COUNT(*) AS shared FROM links l JOIN items i ON i.id = l.src AND i.status = 'active'
              WHERE l.kind = 'rolls_up' AND l.dst IN (SELECT value FROM json_each(?)) GROUP BY l.src`,
             JSON.stringify(members),
           )
           .toArray()) {
           const size = Number(this.sql.exec("SELECT COUNT(*) AS n FROM links WHERE src = ? AND kind = 'rolls_up'", r.id).toArray()[0]?.n ?? 0);
-          if (Number(r.shared) * 2 >= Math.min(size, members.length)) replaces.add(String(r.id));
+          if (Number(r.shared) === size && keepsEntries(String(r.content), u.content)) replaces.add(String(r.id));
         }
         const id = newId();
         this.sql.exec(
