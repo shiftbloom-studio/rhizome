@@ -73,6 +73,13 @@ export interface DreamPlan {
 
 const day = (t: number) => new Date(t).toISOString().slice(0, 10);
 
+const oneLine = (text: string) =>
+  text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join(" | ");
+
 /** The group as the model sees it. */
 export function dreamInput(notes: DreamNote[]): string {
   const index = new Map(notes.map((n, i) => [n.id, i]));
@@ -81,7 +88,7 @@ export function dreamInput(notes: DreamNote[]): string {
       const of = n.rollupOf?.map((id) => index.get(id)).filter((x) => x !== undefined);
       const head = n.rollupOf ? `ROLLUP${of?.length ? ` of ${of.join(", ")}` : ""}` : `${n.kind}, ${n.trust}`;
       // One line per note: a rollup's lines are joined with " | ".
-      return `${i}. (${day(n.t)}, ${head}) ${n.content.slice(0, n.rollupOf ? 1500 : 800).replace(/\s*\n\s*/g, " | ")}`;
+      return `${i}. (${day(n.t)}, ${head}) ${oneLine(n.content.slice(0, n.rollupOf ? 1500 : 800))}`;
     })
     .join("\n");
 }
