@@ -51,7 +51,7 @@ jobs:
         with:
           node-version: 26
           cache: npm
-      - run: npm ci --prefer-offline --no-audit --no-fund
+      - run: npm ci --prefer-offline --ignore-scripts --no-audit --no-fund
       - name: Restore the dataset
         id: data
         uses: actions/cache@v6
