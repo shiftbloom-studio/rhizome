@@ -12,6 +12,7 @@
     "migrate": "node scripts/render-config.mjs && wrangler d1 migrations apply rhizome-control --remote -c wrangler.deploy.jsonc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "check": "tsc --noEmit && npm run build:web && node scripts/render-config.mjs && wrangler deploy -c wrangler.deploy.jsonc --dry-run --outdir .wrangler/dry-run && wrangler deploy -c wrangler.bench.jsonc --dry-run --outdir .wrangler/dry-run-bench",
     "build:web": "npm --prefix web run build",
     "build:node": "node scripts/build-node.mjs",
@@ -27,6 +28,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261123.1",
     "@types/node": "^26.0.0",
+    "@vitest/coverage-v8": "^5.1.1",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
     "vitest": "^5.1.1",

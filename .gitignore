@@ -11,3 +11,4 @@ web/dist
 data/
 bench/cache/
 bench/runs/
+coverage/
