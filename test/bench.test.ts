@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AiCache, BenchAi, FakeAi, RateWindow, isRetryable, stableJson, type AiRunner, type Clock } from "../bench/ai";
 import { readResults, runBenchmark, workerVars } from "../bench/harness";
+import { PAID_MODELS } from "../bench/limits";
 import { parseDate, select, typeKey, validateDataset, type Question, type Turn } from "../bench/longmemeval";
 import { compareRuns, mcnemar, rankingScores, scoreQuestion, sessionOrder, summarize, turnCoverage } from "../bench/metrics";
 import { coveredTurns, indexSession, partTurn } from "../bench/question";
@@ -244,6 +245,8 @@ describe("Replays", () => {
       if (!i.messages) return new FakeAi().run(model, input);
       if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
       const user = i.messages.at(-1)!.content;
+      // Records are filed by a model outside the paid ones, whenever notes are waiting: not part of the replay.
+      if (!PAID_MODELS.test(model)) return { response: JSON.stringify({ r: [] }) };
       this.requests.push(stableJson({ model, input }));
       if (!user.startsWith("Episode time")) return { response: "{}" };
       const related = user.includes("Related memory:\n0.");

@@ -65,6 +65,8 @@
   // Optional var OPEN_LOOPS ("off"): open loops with a due date, shown under Due now in get_context. On by default.
   // Optional var STANDING_ORDERS ("off"): rules checked against agents' tool calls, see docs/standing-orders.md. On by default.
   // Optional var LEDGER ("off"): tells connectors when a memory they were given is replaced. On by default.
-  // LEDGER, OPEN_LOOPS, STANDING_ORDERS and DISPUTE_RESOLUTION, when unset, follow PostHog flags with POSTHOG_FLAGS=on (src/flags.ts).
+  // Optional var RECORDS ("off"): every note filed as a typed row for the recall step "records" and query_records. On by default. RECORDS_MODEL picks the model.
+  // Optional var VECTOR_FILTERS ("on"): recall in a time window also filters Vectorize by event day. Needs the metadata index "day" (number, see README).
+  // LEDGER, OPEN_LOOPS, STANDING_ORDERS, DISPUTE_RESOLUTION and RECORDS, when unset, follow PostHog flags with POSTHOG_FLAGS=on (src/flags.ts).
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }

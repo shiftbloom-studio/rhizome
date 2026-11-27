@@ -267,7 +267,7 @@ export class FakeAi implements AiRunner {
         }),
       };
     }
-    if (i.messages) return { response: JSON.stringify({ facts: [], entities: [] }) };
+    if (i.messages) return { response: JSON.stringify({ facts: [], entities: [], r: [] }) };
     throw new Error("unsupported AI input");
   }
 }

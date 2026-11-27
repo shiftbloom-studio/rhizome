@@ -14,6 +14,7 @@ import type { McpStat } from "./analytics";
 import { parseRangeBound } from "./timewindow";
 import type { Tracked } from "./walls";
 import { ORDER_ACTIONS, ordersText, type Decision, type Order, type OrderState, type ToolCall } from "./orders";
+import { aggregate, RECORD_TYPES, recordLine, recordsSection, type RecordOp, type RecordRow, type RecordType } from "./records";
 
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -25,7 +26,7 @@ export interface MemoryApi {
   recall(
     client: Client,
     input: { query: string; scopes: string[]; limit?: number; budgetTokens?: number; queries?: string[]; from?: number; to?: number; asOf?: number; named?: string[]; track?: Tracked },
-  ): Promise<{ items: MemoryItem[]; notices?: string[]; corrections?: string[] }>;
+  ): Promise<{ items: MemoryItem[]; notices?: string[]; corrections?: string[]; records?: { label: string; total: number; rows: RecordRow[] }[] }>;
   context(
     client: Client,
     scopes: string[],
@@ -50,6 +51,11 @@ export interface MemoryApi {
   listOrders?(client: Client, scopes: string[]): Promise<{ version: string; orders: Order[] }> | { version: string; orders: Order[] };
   addOrder?(client: Client, input: { scope: string; rule: unknown; state?: OrderState }): Promise<Order> | Order;
   checkToolCall?(client: Client, scopes: string[], call: ToolCall, session?: string): Promise<Decision | null> | Decision | null;
+  /** Records (RECORDS=on, src/records.ts). */
+  queryRecords?(
+    client: Client,
+    input: { scopes: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number },
+  ): Promise<{ labels: string[]; rows: RecordRow[]; total: number }>;
 }
 
 /** Server options that change what the MCP server offers. */
@@ -60,6 +66,8 @@ export interface McpOptions {
   orders?: boolean;
   /** Usage analytics is on (MCP_ANALYTICS=on): every tool offers the optional intent category. */
   intent?: boolean;
+  /** Offer query_records (RECORDS=on). */
+  records?: boolean;
 }
 
 interface JsonRpcRequest {
@@ -332,6 +340,31 @@ export const LOOP_TOOLS = [
   },
 ] as const;
 
+const RECORD_OPS = ["list", "count", "sum", "latest"] as const;
+export const RECORD_TOOLS = [
+  {
+    name: "query_records",
+    title: "Count and list records",
+    description:
+      "Memory as a table: every note filed under a kind of thing (e.g. wedding, concert, bike repair, pet), with its date, amount and source. Use it to count, sum or list things across all conversations, e.g. how many weddings, how much was spent on repairs, or the latest job. Give a category, or a question and the matching categories are picked. Check the rows: a total is only as good as the notes behind it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        category: { type: "string", maxLength: 60, description: "A kind of thing, generic and singular, e.g. \"wedding\" or \"musical instrument\"." },
+        query: { type: "string", maxLength: 500, description: "Or a question in plain words; the categories it asks for are used." },
+        op: { type: "string", enum: RECORD_OPS, default: "list", description: "list the rows, count them, sum their amounts per unit, or name the latest." },
+        type: { type: "string", enum: RECORD_TYPES, description: "Optional: only events, states, preferences or other." },
+        from: { type: "string", description: "Optional: only things from this date on (ISO 8601)." },
+        to: { type: "string", description: "Optional: only things up to this date (ISO 8601; a date includes that whole day)." },
+        project: projectProp,
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+] as const;
+
 class ToolError extends Error {}
 class RpcError extends Error {
   constructor(public code: number, message: string) {
@@ -377,9 +410,11 @@ function line(i: MemoryItem): string {
 }
 
 /** The text the recall tool hands an agent: notices first, then one line per item. The benchmark reads the same text. */
-export function recallText(res: { items: MemoryItem[]; notices?: string[]; corrections?: string[] }): string {
+export function recallText(res: { items: MemoryItem[]; notices?: string[]; corrections?: string[]; records?: { label: string; total: number; rows: RecordRow[] }[] }): string {
   const head = [res.corrections, res.notices].map((l) => (l?.length ? l.join("\n") + "\n\n" : "")).join("");
-  return head + (res.items.length ? res.items.map(line).join("\n") : "No matching memories.");
+  const records = res.records?.length ? recordsSection(res.records) : "";
+  if (!res.items.length && !records) return head + "No matching memories.";
+  return head + [records, res.items.map(line).join("\n")].filter(Boolean).join("\n\n");
 }
 
 function subQueries(v: unknown): string[] {
@@ -398,6 +433,7 @@ const text = (t: string, structured?: Record<string, unknown>): ToolResult => ({
 async function callTool(memory: MemoryApi, client: Client, name: string, args: Record<string, unknown>, opts: McpOptions): Promise<ToolResult> {
   if ((name === "open_loop" || name === "close_loop") && opts.loops && memory.openLoop && memory.closeLoop) return loopTool(memory, client, name, args);
   if (opts.orders && ORDER_TOOLS.some((t) => t.name === name)) return orderTool(memory, client, name, args);
+  if (name === "query_records" && opts.records && memory.queryRecords) return recordsTool(memory, client, args);
   switch (name) {
     case "get_context": {
       const proj = project(args.project);
@@ -442,9 +478,11 @@ async function callTool(memory: MemoryApi, client: Client, name: string, args: R
       const named = proj ? [`project:${proj}`] : [];
       const res = await memory.recall(client, { query, scopes, limit, budgetTokens: RECALL_TOOL.budgetTokens, queries, from, to, asOf, named, track: track(args) });
       const notices = { ...(res.notices?.length ? { notices: res.notices } : {}), ...(res.corrections?.length ? { corrections: res.corrections } : {}) };
-      if (!res.items.length) return text(recallText(res), Object.keys(notices).length ? { results: [], ...notices } : undefined);
+      const records = res.records?.length ? { records: res.records.map((g) => ({ label: g.label, total: g.total, rows: g.rows.map(recordOut) })) } : {};
+      if (!res.items.length && !res.records?.length) return text(recallText(res), Object.keys(notices).length ? { results: [], ...notices } : undefined);
       return text(recallText(res), {
         ...notices,
+        ...records,
         results: res.items.map((i) => ({
           id: i.id,
           scope: i.scope,
@@ -576,6 +614,55 @@ async function orderTool(memory: MemoryApi, client: Client, name: string, args: 
   }
 }
 
+function recordOut(r: RecordRow) {
+  return {
+    id: r.id,
+    date: r.date,
+    type: r.type,
+    category: r.category,
+    ...(r.tags.length ? { tags: r.tags } : {}),
+    ...(r.quantity !== null ? { quantity: r.quantity, unit: r.unit } : {}),
+    content: r.content,
+    status: r.status,
+    scope: r.scope,
+    sources: r.sources,
+  };
+}
+
+async function recordsTool(memory: MemoryApi, client: Client, args: Record<string, unknown>): Promise<ToolResult> {
+  const category = str(args.category, "category", 60)?.trim();
+  const query = str(args.query, "query", 500)?.trim();
+  const op = (args.op ?? "list") as RecordOp;
+  if (!(RECORD_OPS as readonly string[]).includes(op)) throw new ToolError(`op must be one of ${RECORD_OPS.join(", ")}`);
+  const type = args.type === undefined ? undefined : (args.type as RecordType);
+  if (type !== undefined && !(RECORD_TYPES as readonly string[]).includes(type)) throw new ToolError(`type must be one of ${RECORD_TYPES.join(", ")}`);
+  const limit = typeof args.limit === "number" ? Math.min(Math.max(Math.round(args.limit), 1), 200) : 50;
+  let from: number | undefined;
+  let to: number | undefined;
+  try {
+    from = parseRangeBound(args.from, false);
+    to = parseRangeBound(args.to, true);
+  } catch {
+    throw new ToolError("from and to must be ISO 8601 dates or times, e.g. 2026-11-01");
+  }
+  const proj = project(args.project);
+  const scopes = proj ? recallScopes(client, undefined, proj) : await readableScopes(memory, client);
+  // Every row counts for count and sum; limit only shortens the list shown.
+  const res = await memory.queryRecords!(client, { scopes, category, query, type, from, to, limit: 500 });
+  const result = aggregate(res.rows, op);
+  const shown = res.rows.slice(0, limit);
+  const what = res.labels.length ? res.labels.map((l) => `"${l}"`).join(", ") : category || query ? "nothing on file for that" : "all records";
+  const summary =
+    op === "count" ? `${res.total} records (${what}).`
+    : op === "sum"
+      ? `Sum (${what}): ${(result.sums as { unit: string | null; total: number }[]).map((s) => `${s.total}${s.unit ? ` ${s.unit}` : ""}`).join(", ") || "no amounts"}` +
+        (result.withoutQuantity ? `; ${result.withoutQuantity} of ${res.total} rows have no amount.` : ".")
+      : op === "latest" ? `Latest (${what}): ${shown.length ? res.rows.reduce((a, b) => (b.date > a.date ? b : a)).id : "none"}.`
+        : `${res.total} records (${what})${res.total > shown.length ? `, ${shown.length} shown` : ""}, oldest first.`;
+  const body = shown.length ? `\n${shown.map(recordLine).join("\n")}` : "";
+  return text(summary + body, { labels: res.labels, total: res.total, ...result, rows: shown.map(recordOut) });
+}
+
 async function loopTool(memory: MemoryApi, client: Client, name: "open_loop" | "close_loop", args: Record<string, unknown>): Promise<ToolResult> {
   if (name === "close_loop") {
     const id = str(args.id, "id", 64, true)!;
@@ -637,7 +724,7 @@ async function handle(memory: MemoryApi, client: Client, req: JsonRpcRequest, ve
     case "ping":
       return {};
     case "tools/list": {
-      const tools = [...TOOLS, ...(opts.loops ? LOOP_TOOLS : []), ...(opts.orders ? ORDER_TOOLS : [])];
+      const tools = [...TOOLS, ...(opts.loops ? LOOP_TOOLS : []), ...(opts.orders ? ORDER_TOOLS : []), ...(opts.records && memory.queryRecords ? RECORD_TOOLS : [])];
       if (!opts.intent) return { tools };
       return {
         tools: tools.map((t) => ({ ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, intent: intentProp } } })),
