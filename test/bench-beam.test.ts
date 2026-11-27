@@ -57,6 +57,9 @@ describe("BEAM's own evaluation", () => {
     expect(beamReaderPrompt("CONTEXT TEXT", "QUESTION TEXT")).toBe(fixture.readerPrompt);
     expect(beamJudgePrompt("RUBRIC ITEM", "RESPONSE TEXT")).toBe(fixture.judgePrompt);
     expect(equivalenceMessages("First event", "Second event")).toEqual(fixture.equivalence);
+    // As Python's str.replace: "$&" stays literal, and every placeholder is filled.
+    expect(beamReaderPrompt("echo $& and $1", "Q")).toContain("CONTEXT:\necho $& and $1\n");
+    expect(beamJudgePrompt("R", "see <rubric_item>")).toContain("RESPONSE TO EVALUATE: see <rubric_item>");
   });
 
   it("scores event ordering as event_ordering_score() with scipy's Kendall tau-b", () => {
@@ -337,7 +340,8 @@ describe("BEAM Workflow", () => {
       const out = (await workflow.run(event("beam-smoke", { conversations: [1], reader: "gpt-6.1-terra" }), run.step)) as BeamOutput;
       expect(out).toMatchObject({ tier: "100K", conversations: 1, failed: 0 });
       expect(run.ran.slice(0, 3)).toEqual(["dataset 100K/1", "config", "conversation beam-100K-1"]);
-      expect(run.ran.slice(3, -1).sort()).toEqual(["information_extraction-0", "event_ordering-0", "abstention-0"].flatMap((q) => [`answer 100K-1-${q}`, `judge 100K-1-${q}`]).sort());
+      const byName = (x: string, y: string) => x.localeCompare(y);
+      expect(run.ran.slice(3, -1).sort(byName)).toEqual(["information_extraction-0", "event_ordering-0", "abstention-0"].flatMap((q) => [`answer 100K-1-${q}`, `judge 100K-1-${q}`]).sort(byName));
       expect(run.ran.at(-1)).toBe("summary");
       expect(out.metrics).toMatchObject({ questions: 3, judged: 3, failed: 0 });
       expect(out.metrics.byAbility.information_extraction!.score).toBe(1);

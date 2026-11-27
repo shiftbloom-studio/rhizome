@@ -266,6 +266,14 @@ export const beamPartKey = (tier: BeamTier, n: number, part: number) => `${BEAM_
 
 type Bucket = Pick<R2Bucket, "get" | "put">;
 
+const BEAM_FILES = `https://raw.githubusercontent.com/mohammadtavakoli78/BEAM/${BEAM_UPSTREAM.commit}/chats/`;
+
+/** Fetches a file of BEAM's repository at the pinned commit, and nothing else. */
+async function fetchBeamFile(fetcher: typeof fetch, url: string): Promise<Response> {
+  if (!url.startsWith(BEAM_FILES) || new URL(url).host !== "raw.githubusercontent.com" || url.includes("..")) throw new Error(`not a BEAM file: ${url}`);
+  return fetcher(url);
+}
+
 async function sha256Hex(chunks: Uint8Array[]): Promise<string> {
   const size = chunks.reduce((n, c) => n + c.byteLength, 0);
   const all = new Uint8Array(size);
@@ -289,7 +297,7 @@ export async function importConversation(bucket: Bucket, tier: BeamTier, n: numb
   if (existing) return existing.json<BeamConversation>();
 
   const questionsUrl = beamFileUrl(tier, n, "probing_questions/probing_questions.json");
-  const qres = await fetcher(questionsUrl);
+  const qres = await fetchBeamFile(fetcher, questionsUrl);
   if (!qres.ok) throw new Error(`BEAM download failed: HTTP ${qres.status} for ${questionsUrl}`);
   const raw = (await qres.json()) as Record<string, unknown[]>;
   const questions = beamQuestions(tier, n, raw);
@@ -298,7 +306,7 @@ export async function importConversation(bucket: Bucket, tier: BeamTier, n: numb
   let source = "";
   for (const file of BEAM_CHAT_FILES) {
     source = beamFileUrl(tier, n, file);
-    const r = await fetcher(source);
+    const r = await fetchBeamFile(fetcher, source);
     if (r.ok && r.body) {
       res = r;
       break;
@@ -465,6 +473,12 @@ export async function runConversation(
 
 // ------------------------------------------------------------------- reader
 
+/**
+ * Python's str.replace: every occurrence, and the replacement taken literally ("$&" in an
+ * answer or a code snippet stays as it is), so the prompts come out as BEAM's code builds them.
+ */
+export const pyReplace = (text: string, old: string, value: string) => text.split(old).join(value);
+
 /** src/prompts.py, answer_generation_for_rag. */
 export const BEAM_READER_PROMPT = `
 You are an assistant that MUST answer questions using ONLY the information provided in the context below.\u0020
@@ -487,7 +501,7 @@ RESPONSE:
 `;
 
 /** The reader's prompt, as long_term_memory_methods.py fills it. */
-export const beamReaderPrompt = (context: string, question: string) => BEAM_READER_PROMPT.replace("<context>", context).replace("<question>", question);
+export const beamReaderPrompt = (context: string, question: string) => pyReplace(pyReplace(BEAM_READER_PROMPT, "<context>", context), "<question>", question);
 
 /**
  * The reader call: BEAM's reader runs at temperature 0 with no output limit. A reasoning
@@ -574,7 +588,7 @@ NOTE: ONLY output the json object, without any explanation before or after that
 `;
 
 /** The judge's prompt for one rubric item, as the evaluate_*() functions fill it. */
-export const beamJudgePrompt = (rubricItem: string, response: string) => BEAM_JUDGE_PROMPT.replace("<rubric_item>", rubricItem).replace("<llm_response>", response);
+export const beamJudgePrompt = (rubricItem: string, response: string) => pyReplace(pyReplace(BEAM_JUDGE_PROMPT, "<rubric_item>", rubricItem), "<llm_response>", response);
 
 /** llm_equivalence() in compute_metrics.py: do two snippets describe the same event? */
 export function equivalenceMessages(first: string, second: string): ChatRequest["messages"] {
