@@ -10,12 +10,13 @@
   "preview_urls": false,
   "routes": [{ "pattern": "<RHIZOME_HOSTNAME>", "custom_domain": true }],
   "observability": { "enabled": true },
-  // The memory explorer (web/). The Worker runs first for the API, the public pages and fonts.
+  // The memory explorer (web/). The Worker runs first for everything but the hashed bundles,
+  // so the page itself gets a per-request CSP nonce (see withScriptNonce in src/index.ts).
   "assets": {
     "directory": "./web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/v1/*", "/mcp", "/oauth/*", "/auth/*", "/.well-known/*", "/ui/api/*", "/fonts/*", "/favicon.svg", "/privacy", "/datenschutz", "/imprint", "/impressum"]
+    "run_worker_first": ["/*", "!/assets/*"]
   },
   // Nightly reflection (consolidation, decay, profile distillation) at 03:17 UTC.
   "triggers": { "crons": ["17 3 * * *"] },

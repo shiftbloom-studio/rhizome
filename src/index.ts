@@ -492,11 +492,30 @@ mem.post("/orders/check", async (c) => {
 
 app.route("/v1/memory", mem);
 
+/** The explorer's policy (also in web/public/_headers, which covers everything but the page itself). */
+const EXPLORER_CSP =
+  "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/**
+ * Gives the explorer page a fresh script nonce. Cloudflare's bot detection injects an
+ * inline script into HTML and adds the nonce it finds in this header to it, so the
+ * policy can stay strict without 'unsafe-inline'. The page's own scripts are files.
+ */
+export function withScriptNonce(res: Response): Response {
+  if (!(res.headers.get("content-type") ?? "").startsWith("text/html")) return res;
+  const bytes = crypto.getRandomValues(new Uint8Array(18));
+  const nonce = btoa(String.fromCharCode(...bytes));
+  const out = new Response(res.body, res);
+  out.headers.set("content-security-policy", EXPLORER_CSP.replace("{nonce}", nonce));
+  out.headers.set("cache-control", "no-store");
+  return out;
+}
+
 app.notFound(async (c) => {
   // Everything else is the explorer's single-page app.
   const api = ["/v1/", "/ui/api/", "/oauth/", "/.well-known/", "/auth/"].some((p) => c.req.path.startsWith(p));
-  if (c.env.ASSETS && c.req.method === "GET" && !api) {
-    return c.env.ASSETS.fetch(c.req.raw);
+  if (c.env.ASSETS && (c.req.method === "GET" || c.req.method === "HEAD") && !api) {
+    return withScriptNonce(await c.env.ASSETS.fetch(c.req.raw));
   }
   return c.json({ error: "not found" }, 404);
 });
