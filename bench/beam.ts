@@ -611,9 +611,12 @@ export const judgeCall = (model: string, messages: ChatRequest["messages"]): Cha
  */
 export function parseJudgeReply(reply: string): { score: number; reason?: string } {
   let text = reply.trim();
+  // A fenced reply: the object or list between the fences (no regex, so a long reply cannot make it backtrack).
   if (text.startsWith("```")) {
-    const m = /```(?:json)?\s*(\[.*\]|\{.*\})\s*```/s.exec(text);
-    if (m) text = m[1]!.trim();
+    const close = text.lastIndexOf("```");
+    let inside = close > 2 ? text.slice(3, close).trim() : "";
+    if (inside.startsWith("json")) inside = inside.slice(4).trim();
+    if ((inside.startsWith("{") && inside.endsWith("}")) || (inside.startsWith("[") && inside.endsWith("]"))) text = inside;
   }
   const read = (candidate: string) => {
     try {
@@ -627,11 +630,24 @@ export function parseJudgeReply(reply: string): { score: number; reason?: string
   };
   const whole = read(text);
   if (whole) return whole;
-  const inner = /(\{.*?\}|\[.*?\])/s.exec(text);
-  const part = inner ? read(inner[1]!) : null;
-  if (part) return part;
-  const loose = /["']?score["']?\s*:\s*\[?\s*["']?(\d+(?:\.\d+)?)/i.exec(text);
-  if (loose) return { score: Number(loose[1]) };
+  // The first object or list, up to its first closing bracket, as the non-greedy search does.
+  const braces = [text.indexOf("{"), text.indexOf("[")].filter((i) => i >= 0);
+  if (braces.length) {
+    const start = Math.min(...braces);
+    const end = text.indexOf(text[start] === "{" ? "}" : "]", start);
+    const part = end > start ? read(text.slice(start, end + 1)) : null;
+    if (part) return part;
+  }
+  // What json_repair recovers from a judge's reply: the number after "score".
+  const at = text.toLowerCase().indexOf("score");
+  if (at >= 0) {
+    let i = at + 5;
+    while (i < text.length && " \t\n'\":[".includes(text[i]!)) i++;
+    let j = i;
+    while (j < text.length && /[\d.]/.test(text[j]!)) j++;
+    const score = Number(text.slice(i, j));
+    if (j > i && Number.isFinite(score)) return { score };
+  }
   throw new Error(`the judge's reply has no score: ${reply.slice(0, 200)}`);
 }
 

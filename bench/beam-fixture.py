@@ -13,6 +13,7 @@
 
 import ast
 import json
+import math
 import os
 import subprocess
 import sys
@@ -66,9 +67,10 @@ def tau_norm(reference, system_canon):
         return [r.get(u, tie_rank) for u in union]
 
     tau_b, _ = kendalltau(to_rank(reference), to_rank(system_canon), variant="b", method="auto")
-    tau = float(tau_b)
-    norm = (tau + 1) / 2
-    return {"precision": precision, "recall": recall, "f1": f1, "tau_norm": None if norm != norm else norm, "final_score": None if norm != norm else norm * f1}
+    norm = (float(tau_b) + 1) / 2
+    if math.isnan(norm):
+        return {"precision": precision, "recall": recall, "f1": f1, "tau_norm": None, "final_score": None}
+    return {"precision": precision, "recall": recall, "f1": f1, "tau_norm": norm, "final_score": norm * f1}
 
 
 # Aligned lists (what align_with_llm returns for the system's lines) and their scores.

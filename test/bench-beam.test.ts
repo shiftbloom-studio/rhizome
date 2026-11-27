@@ -333,7 +333,7 @@ describe("BEAM Workflow", () => {
       }),
     );
     const { env, close } = benchEnv(dir);
-    Object.assign(env, { OPENAI_API_KEY: "sk-test", OPENAI_BASE_URL: "https://openai.test/v1" });
+    Object.assign(env, { OPENAI_API_KEY: "test-key", OPENAI_BASE_URL: "https://openai.test/v1" });
     try {
       const workflow = new BeamWorkflow({} as ExecutionContext, env);
       const run = fakeStep();
