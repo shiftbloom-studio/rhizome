@@ -65,6 +65,7 @@
   // Optional var OPEN_LOOPS ("off"): open loops with a due date, shown under Due now in get_context. On by default.
   // Optional var STANDING_ORDERS ("off"): rules checked against agents' tool calls, see docs/standing-orders.md. On by default.
   // Optional var LEDGER ("off"): tells connectors when a memory they were given is replaced. On by default.
-  // LEDGER, OPEN_LOOPS, STANDING_ORDERS and DISPUTE_RESOLUTION, when unset, follow PostHog flags with POSTHOG_FLAGS=on (src/flags.ts).
+  // Optional vars DREAMING ("off"), DREAM_MODEL, DREAM_DAILY_LIMIT: the care pass over all notes (see README). On by default.
+  // LEDGER, OPEN_LOOPS, STANDING_ORDERS, DISPUTE_RESOLUTION and DREAMING, when unset, follow PostHog flags with POSTHOG_FLAGS=on (src/flags.ts).
   // Placeholders ending in "?" are optional and become empty strings when unset.
 }

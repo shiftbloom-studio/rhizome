@@ -29,6 +29,17 @@ export interface Env {
    */
   DISPUTE_RESOLUTION?: string;
   /**
+   * "on": dreaming (src/dreaming.ts). When the person has been away for 10 minutes, and after each nightly
+   * reflection, a cheap model walks every note in neighbourhoods of related notes: merges repeats, marks notes a
+   * later one replaced, rewrites unclear notes and writes rollup notes that list every instance of one kind of thing.
+   * Default: on (unset follows the PostHog flag rhizome-dreaming, src/flags.ts); "off" turns it off. Needs extraction.
+   */
+  DREAMING?: string;
+  /** Model for dreaming. Default: EXTRACTION_MODEL, else DeepSeek V4.1 Flash on Workers AI, without thinking. */
+  DREAM_MODEL?: string;
+  /** Model calls (neighbourhoods) for dreaming per person and UTC day. Default: 100 (about 4,000 neurons). */
+  DREAM_DAILY_LIMIT?: string;
+  /**
    * "on": the ledger records which connector was given which memory and tells it once,
    * on its next get_context or recall, when that memory was replaced or deleted. Default: on (unset follows the
    * PostHog flag, src/flags.ts); "off" turns it off.
@@ -41,8 +52,8 @@ export interface Env {
   MCP_ANALYTICS?: string;
   /**
    * "on": feature flags from PostHog (src/flags.ts). Flag vars that are not set (LEDGER, STANDING_ORDERS,
-   * OPEN_LOOPS, DISPUTE_RESOLUTION) take the value of rhizome-ledger, rhizome-standing-orders,
-   * rhizome-open-loops and rhizome-dispute-resolution. Needs POSTHOG_KEY and POSTHOG_HOST. Default: off
+   * OPEN_LOOPS, DISPUTE_RESOLUTION, DREAMING) take the value of rhizome-ledger, rhizome-standing-orders,
+   * rhizome-open-loops, rhizome-dispute-resolution and rhizome-dreaming. Needs POSTHOG_KEY and POSTHOG_HOST. Default: off
    * (then those vars, when unset, are on).
    */
   POSTHOG_FLAGS?: string;
