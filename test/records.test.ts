@@ -49,7 +49,10 @@ describe("records helpers", () => {
     expect(pickLabels(scored, "How many weddings did I attend?")).toEqual(["wedding", "wedding attendance"]);
     // Nothing close enough and nothing named: no labels.
     expect(pickLabels(scored.map((s) => ({ ...s, similarity: s.similarity - 0.2 })), "What did I eat?")).toEqual([]);
-    expect(pickLabels(scored.map((s) => ({ ...s, similarity: 0.1 })), "my last bike repairs")).toEqual(["bike repair"]);
+    // A named category needs only 0.45; a named tag or a barely related label does not count.
+    expect(pickLabels(scored.map((s) => ({ ...s, similarity: 0.5 })), "my last bike repairs")).toEqual(["bike repair"]);
+    expect(pickLabels(scored.map((s) => ({ ...s, similarity: 0.3 })), "my last bike repairs")).toEqual([]);
+    expect(pickLabels([{ label: "family", kind: "tag", similarity: 0.5 }], "my family dinner")).toEqual([]);
   });
 
   const row = (id: string, date: string, quantity: number | null, unit: string | null): RecordRow => ({
@@ -148,7 +151,7 @@ describe("MemoryObject records", () => {
     // Every label has an embedding to match queries against.
     expect(db.prepare("SELECT label FROM record_labels ORDER BY label").all().map((r) => (r as { label: string }).label)).toEqual(["bike repair", "celebration", "expense", "habit", "wedding"]);
 
-    const res = await mo.recall(claude, { query: "How many weddings did I go to?", scopes: ["profile"] });
+    const res = await mo.recall(claude, { query: "How many wedding parties?", scopes: ["profile"] });
     expect(res.records).toHaveLength(1);
     expect(res.records![0]).toMatchObject({ label: "wedding", total: 2 });
     expect(res.records![0]!.rows.map((r) => r.id)).toEqual([rachel, emily]);
@@ -156,12 +159,12 @@ describe("MemoryObject records", () => {
     expect(res.sources.records).toBe(2);
 
     // A time window limits by when it happened, not by when the note was written.
-    const spring = await mo.recall(claude, { query: "weddings", scopes: ["profile"], from: Date.UTC(2023, 0, 1), to: Date.UTC(2023, 4, 1) });
+    const spring = await mo.recall(claude, { query: "wedding", scopes: ["profile"], from: Date.UTC(2023, 0, 1), to: Date.UTC(2023, 4, 1) });
     expect(spring.records?.[0]?.rows.map((r) => r.id)).toEqual([rachel]);
     // A broader label (tag) finds the same rows.
     expect((await mo.queryRecords(claude, { scopes: ["profile"], category: "celebration" })).rows.map((r) => r.id)).toEqual([rachel, emily]);
     // Without the step there are no records.
-    const plain = await mo.recall(claude, { query: "How many weddings did I go to?", scopes: ["profile"], features: ["abstain"] });
+    const plain = await mo.recall(claude, { query: "How many wedding parties?", scopes: ["profile"], features: ["abstain"] });
     expect(plain.records).toBeUndefined();
   });
 
@@ -175,6 +178,9 @@ describe("MemoryObject records", () => {
     expect(aggregate(res.rows, "sum")).toEqual({ sums: [{ unit: "USD", total: 125 }], withoutQuantity: 1 });
     const byQuery = await mo.queryRecords(claude, { scopes: ["profile", "project:other"], query: "what did my bike repairs cost" });
     expect(byQuery.total).toBe(4);
+    // total counts every match, rows stop at the limit.
+    const first = await mo.queryRecords(claude, { scopes: ["profile"], category: "bike repair", limit: 1 });
+    expect([first.total, first.rows.length]).toEqual([3, 1]);
     const none = await mo.queryRecords(claude, { scopes: ["profile"], category: "concert" });
     expect(none).toEqual({ labels: ["concert"], rows: [], total: 0 });
   });

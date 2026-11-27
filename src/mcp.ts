@@ -54,7 +54,7 @@ export interface MemoryApi {
   /** Records (RECORDS=on, src/records.ts). */
   queryRecords?(
     client: Client,
-    input: { scopes: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number },
+    input: { scopes: string[]; named?: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number },
   ): Promise<{ labels: string[]; rows: RecordRow[]; total: number }>;
 }
 
@@ -648,7 +648,10 @@ async function recordsTool(memory: MemoryApi, client: Client, args: Record<strin
   const proj = project(args.project);
   const scopes = proj ? recallScopes(client, undefined, proj) : await readableScopes(memory, client);
   // Every row counts for count and sum; limit only shortens the list shown.
-  const res = await memory.queryRecords!(client, { scopes, category, query, type, from, to, limit: 500 });
+  // Walled projects are only searched when the call names them, as in recall.
+  const named = proj ? [`project:${proj}`] : [];
+  const res = await memory.queryRecords!(client, { scopes, named, category, query, type, from, to, limit: 500 });
+  const capped = res.total > res.rows.length ? ` Only the first ${res.rows.length} of ${res.total} rows are summed; narrow it with type, from or to.` : "";
   const result = aggregate(res.rows, op);
   const shown = res.rows.slice(0, limit);
   const what = res.labels.length ? res.labels.map((l) => `"${l}"`).join(", ") : category || query ? "nothing on file for that" : "all records";
@@ -656,8 +659,8 @@ async function recordsTool(memory: MemoryApi, client: Client, args: Record<strin
     op === "count" ? `${res.total} records (${what}).`
     : op === "sum"
       ? `Sum (${what}): ${(result.sums as { unit: string | null; total: number }[]).map((s) => `${s.total}${s.unit ? ` ${s.unit}` : ""}`).join(", ") || "no amounts"}` +
-        (result.withoutQuantity ? `; ${result.withoutQuantity} of ${res.total} rows have no amount.` : ".")
-      : op === "latest" ? `Latest (${what}): ${(result.latest as string | null) ?? "none"}.`
+        (result.withoutQuantity ? `; ${result.withoutQuantity} of ${res.rows.length} rows have no amount.` : ".") + capped
+      : op === "latest" ? `Latest (${what}): ${(result.latest as string | null) ?? "none"}.${capped.replace("summed", "searched")}`
         : `${res.total} records (${what})${res.total > shown.length ? `, ${shown.length} shown` : ""}, oldest first.`;
   const body = shown.length ? `\n${shown.map(recordLine).join("\n")}` : "";
   return text(summary + body, { labels: res.labels, total: res.total, ...result, rows: shown.map(recordOut) });

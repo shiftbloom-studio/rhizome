@@ -26,6 +26,8 @@ export const RECORDS_VOCABULARY = 80;
 export const LABEL_SIMILARITY = 0.6;
 /** Labels this close to the best one are asked for too ("wedding" and "wedding attendance"). */
 export const LABEL_MARGIN = 0.05;
+/** A category the query names word for word still needs this much similarity. */
+export const NAMED_SIMILARITY = 0.45;
 export const MAX_LABELS = 3;
 /** Rows recall adds at most, and the share of its token budget they may take. */
 export const MAX_RECORD_ROWS = 25;
@@ -112,10 +114,11 @@ export function recordsInput(vocabulary: string[], notes: { content: string; at:
 
 /**
  * Which labels a query asks for: those at least LABEL_SIMILARITY from the query and within
- * LABEL_MARGIN of the best, at most MAX_LABELS. A label the query names word for word
- * (after a simple plural fold) always counts.
+ * LABEL_MARGIN of the best, at most MAX_LABELS. A category the query names word for word
+ * (after a simple plural fold) counts from NAMED_SIMILARITY on. Tags are broad ("family",
+ * "work"), so they only count by similarity.
  */
-export function pickLabels(scored: { label: string; similarity: number }[], query: string): string[] {
+export function pickLabels(scored: { label: string; similarity: number; kind?: "category" | "tag" }[], query: string): string[] {
   const words = new Set(
     query
       .toLowerCase()
@@ -123,11 +126,11 @@ export function pickLabels(scored: { label: string; similarity: number }[], quer
       .filter((w) => w.length > 2)
       .map(singular),
   );
-  const named = scored.filter((s) => s.label.split(" ").every((w) => words.has(singular(w))));
+  const named = scored.filter((s) => s.kind !== "tag" && s.similarity >= NAMED_SIMILARITY && s.label.split(" ").every((w) => words.has(singular(w))));
   const best = Math.max(...scored.map((s) => s.similarity), 0);
   const close = scored.filter((s) => s.similarity >= LABEL_SIMILARITY && s.similarity >= best - LABEL_MARGIN);
   const out: string[] = [];
-  for (const s of [...named, ...close.sort((a, b) => b.similarity - a.similarity)]) {
+  for (const s of [...named.sort((a, b) => b.similarity - a.similarity), ...close.sort((a, b) => b.similarity - a.similarity)]) {
     if (!out.includes(s.label)) out.push(s.label);
     if (out.length >= MAX_LABELS) break;
   }

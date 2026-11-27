@@ -774,7 +774,13 @@ export class MemoryObject extends DurableObject<Env> {
     // Step "records": when the query asks for a kind of thing, every note filed under it,
     // not only the most similar ones (src/records.ts).
     const recordGroups = features.has("records") && this.recordsOn ? this.recordGroups(this.labelsFor(input.query, qvecs), scopes, window, asOf) : [];
-    const recordIds = recordGroups.flatMap((g) => g.rows.map((r) => r.id));
+    // In the fusion the rows rank by how close they are to the query, not by date.
+    const recordVecs = this.storedVectors(recordGroups.flatMap((g) => g.rows.map((r) => r.id)));
+    const closeness = (id: string) => {
+      const v = recordVecs.get(id);
+      return v && qvecs.length ? Math.max(...qvecs.map((q) => cosine(q, v))) : 0;
+    };
+    const recordIds = recordGroups.flatMap((g) => g.rows.map((r) => r.id)).sort((a, b) => closeness(b) - closeness(a));
 
     // Superseded or merged memories are replaced by their current version, unless
     // recall runs as of a past time: then the version that was true back then counts.
@@ -813,6 +819,8 @@ export class MemoryObject extends DurableObject<Env> {
       return [{ ...item, score: s, similarity, coverage, vec }];
     });
 
+    // Rows under a label the query asks for are an answer, also when the window holds no excerpt:
+    // labels need real similarity (src/records.ts pickLabels), so this does not open on broad tags.
     if (features.has("abstain") && recordIds.length === 0 && shouldAbstain(candidates)) {
       this.audit(client, "recall", { scopes, results: 0, abstained: true });
       return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...notices };
@@ -2600,6 +2608,9 @@ export class MemoryObject extends DurableObject<Env> {
       this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'records', ?)", now, SYSTEM_RECORDS, JSON.stringify({ model, notes: notes.length, filed, failed }));
     });
     await this.embedLabels([...labels]);
+    // Labels no record uses any more (notes rewritten or deleted) leave the query matching.
+    this.sql.exec("DELETE FROM record_labels WHERE label NOT IN (SELECT category FROM records) AND label NOT IN (SELECT label FROM record_tags)");
+    this.labelCache = null;
     if (notes.length === RECORDS_BATCH * RECORDS_PARALLEL) this.enqueue("type", "all");
   }
 
@@ -2623,43 +2634,56 @@ export class MemoryObject extends DurableObject<Env> {
     );
   }
 
+  /** Label embeddings of the current model, kept per instance until the next filing run changes them. */
+  private labelCache: { model: string; labels: { label: string; kind: "category" | "tag"; vec: Float32Array }[] } | null = null;
+
   /** The labels a query asks for, from the stored label embeddings (src/records.ts pickLabels). */
   private labelsFor(query: string, qvecs: number[][]): string[] {
     if (qvecs.length === 0) return [];
-    const scored = this.sql
-      .exec(
-        `SELECT label, vec FROM record_labels WHERE model = ?
-           AND (label IN (SELECT category FROM records) OR label IN (SELECT label FROM record_tags))`,
-        this.embeddingModel,
-      )
-      .toArray()
-      .map((r) => {
-        const vec = decodeVector(r.vec as ArrayBuffer);
-        return { label: String(r.label), similarity: Math.max(...qvecs.map((q) => cosine(q, vec))) };
-      });
+    if (this.labelCache?.model !== this.embeddingModel) {
+      const labels = this.sql
+        .exec(
+          `SELECT l.label, l.vec, EXISTS (SELECT 1 FROM records r WHERE r.category = l.label AND r.type != 'none') AS cat
+           FROM record_labels l WHERE l.model = ?`,
+          this.embeddingModel,
+        )
+        .toArray()
+        .map((r) => ({ label: String(r.label), kind: (Number(r.cat) ? "category" : "tag") as "category" | "tag", vec: decodeVector(r.vec as ArrayBuffer) }));
+      this.labelCache = { model: this.embeddingModel, labels };
+    }
+    const scored = this.labelCache.labels.map((l) => ({ label: l.label, kind: l.kind, similarity: Math.max(...qvecs.map((q) => cosine(q, l.vec))) }));
     return pickLabels(scored, query);
   }
 
   /**
-   * Rows filed under one label (category or tag) in the given scopes, oldest first. A window
-   * limits by when the thing happened (the record's date, else the note's). As of a past
-   * time only notes true then count, as in recall.
+   * Records filed under one label (category or tag), or every record without a label, in the
+   * given scopes, oldest first: at most `limit` rows, with the total that matched. A window
+   * limits by when the thing happened (the record's date, else the note's). As of a past time
+   * only notes true then count, as in recall. Notes in `skip` are left out.
    */
-  private recordRows(label: string, scopes: string[], window: { from: number; to: number } | undefined, asOf: number | undefined, type?: RecordType): RecordRow[] {
-    const cond = recallCondition("i", undefined, asOf);
+  private recordQuery(
+    label: string | null,
+    scopes: string[],
+    opts: { window?: { from: number; to: number }; asOf?: number; type?: RecordType; skip?: string[]; limit: number },
+  ): { rows: RecordRow[]; total: number } {
+    const cond = recallCondition("i", undefined, opts.asOf);
     const when = "COALESCE(r.occurred_at, i.valid_from, i.t_event)";
+    const where = `FROM records r JOIN items i ON i.id = r.item_id
+       WHERE r.type != 'none' ${label !== null ? "AND (r.category = ? OR r.item_id IN (SELECT item_id FROM record_tags WHERE label = ?))" : ""}
+         AND i.scope IN (SELECT value FROM json_each(?)) AND ${cond.sql}
+         ${opts.window ? `AND ${when} >= ? AND ${when} < ?` : ""} ${opts.type ? "AND r.type = ?" : ""}
+         AND i.id NOT IN (SELECT value FROM json_each(?))`;
+    const args = [
+      ...(label !== null ? [label, label] : []), JSON.stringify(scopes), ...cond.args,
+      ...(opts.window ? [opts.window.from, opts.window.to] : []), ...(opts.type ? [opts.type] : []), JSON.stringify(opts.skip ?? []),
+    ];
+    const total = Number(this.sql.exec(`SELECT COUNT(*) AS n ${where}`, ...args).toArray()[0]?.n ?? 0);
+    if (total === 0) return { rows: [], total };
     const rows = this.sql
-      .exec(
-        `SELECT r.*, i.id AS id, i.scope, i.content, i.status, ${when} AS at FROM records r JOIN items i ON i.id = r.item_id
-         WHERE r.type != 'none' AND (r.category = ? OR r.item_id IN (SELECT item_id FROM record_tags WHERE label = ?))
-           AND i.scope IN (SELECT value FROM json_each(?)) AND ${cond.sql}
-           ${window ? `AND ${when} >= ? AND ${when} < ?` : ""} ${type ? "AND r.type = ?" : ""}
-         ORDER BY at, i.rowid LIMIT 500`,
-        label, label, JSON.stringify(scopes), ...cond.args,
-        ...(window ? [window.from, window.to] : []), ...(type ? [type] : []),
-      )
-      .toArray();
-    return rows.map((r) => this.recordRow(r));
+      .exec(`SELECT r.*, i.id AS id, i.scope, i.content, i.status, ${when} AS at ${where} ORDER BY at, i.rowid LIMIT ?`, ...args, opts.limit)
+      .toArray()
+      .map((r) => this.recordRow(r));
+    return { rows, total };
   }
 
   private recordRow(r: Row): RecordRow {
@@ -2682,56 +2706,50 @@ export class MemoryObject extends DurableObject<Env> {
     };
   }
 
-  /** Groups for the recall step "records": each asked-for label with its rows, a row listed once. */
+  /** Groups for the recall step "records": each asked-for label with its first rows and its total, a note listed once. */
   private recordGroups(labels: string[], scopes: string[], window: { from: number; to: number } | undefined, asOf: number | undefined): RecordGroup[] {
-    const seen = new Set<string>();
+    const seen: string[] = [];
     const groups: RecordGroup[] = [];
     for (const label of labels) {
-      const rows = this.recordRows(label, scopes, window, asOf).filter((r) => !seen.has(r.id));
+      const { rows, total } = this.recordQuery(label, scopes, { window, asOf, skip: seen, limit: MAX_RECORD_ROWS });
       if (rows.length === 0) continue;
-      rows.forEach((r) => seen.add(r.id));
-      groups.push({ label, total: rows.length, rows });
+      seen.push(...rows.map((r) => r.id));
+      groups.push({ label, total, rows });
     }
     return groups;
   }
 
   /**
    * Records for an agent (MCP query_records): by category, or the categories a query asks
-   * for, or every record in the scopes. Rows come with the episodes they were taken from.
+   * for, or every record in the scopes. Rows come with the episodes they were taken from;
+   * `total` counts every match, `rows` holds at most `limit` (500) of them.
    */
   async queryRecords(
     client: Client,
-    input: { scopes: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number },
+    input: { scopes: string[]; named?: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number },
   ): Promise<{ labels: string[]; rows: RecordRow[]; total: number }> {
     this.userId(client);
-    const scopes = admitNamed(input.scopes, [], this.walls()).scopes;
+    const scopes = admitNamed(input.scopes, input.named ?? [], this.walls()).scopes;
     const limit = Math.min(Math.max(input.limit ?? 100, 1), 500);
     const window = input.from !== undefined || input.to !== undefined ? { from: input.from ?? 0, to: input.to ?? Number.MAX_SAFE_INTEGER } : undefined;
-    let labels: string[];
+    let labels: string[] = [];
     if (input.category) labels = [normalizeLabel(input.category)].filter(Boolean);
     else if (input.query) labels = this.labelsFor(input.query, await this.embed([input.query]).catch(() => [] as number[][]));
-    else labels = [];
-    let rows: RecordRow[];
+    let rows: RecordRow[] = [];
+    let total = 0;
     if (labels.length) {
-      const seen = new Set<string>();
-      rows = labels.flatMap((l) => this.recordRows(l, scopes, window, undefined, input.type)).filter((r) => !seen.has(r.id) && !!seen.add(r.id));
+      const seen: string[] = [];
+      for (const l of labels) {
+        const res = this.recordQuery(l, scopes, { window, type: input.type, skip: seen, limit: limit - rows.length });
+        total += res.total;
+        rows.push(...res.rows);
+        seen.push(...res.rows.map((r) => r.id));
+        if (rows.length >= limit) break;
+      }
       rows.sort((a, b) => a.date.localeCompare(b.date));
-    } else if (input.category || input.query) rows = [];
-    else {
-      const when = "COALESCE(r.occurred_at, i.valid_from, i.t_event)";
-      rows = this.sql
-        .exec(
-          `SELECT r.*, i.id AS id, i.scope, i.content, i.status, ${when} AS at FROM records r JOIN items i ON i.id = r.item_id
-           WHERE r.type != 'none' AND i.status IN ${RECALLABLE} AND i.scope IN (SELECT value FROM json_each(?))
-             ${window ? `AND ${when} >= ? AND ${when} < ?` : ""} ${input.type ? "AND r.type = ?" : ""}
-           ORDER BY at, i.rowid LIMIT 500`,
-          JSON.stringify(scopes), ...(window ? [window.from, window.to] : []), ...(input.type ? [input.type] : []),
-        )
-        .toArray()
-        .map((r) => this.recordRow(r));
-    }
-    this.audit(client, "records.query", { scopes, labels, rows: rows.length });
-    return { labels, rows: rows.slice(0, limit), total: rows.length };
+    } else if (!input.category && !input.query) ({ rows, total } = this.recordQuery(null, scopes, { window, type: input.type, limit }));
+    this.audit(client, "records.query", { scopes, labels, rows: rows.length, total });
+    return { labels, rows, total };
   }
 
   /**
