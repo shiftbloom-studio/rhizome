@@ -187,7 +187,7 @@ function waitMs(headers: Headers, attempt: number): number {
 
 /** One chat completion, with further tries where they can help. The key never appears in an error. */
 export async function chatCompletion(request: ChatRequest, opts: OpenAiOptions): Promise<ChatReply> {
-  const url = `${(opts.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`;
+  const url = `${withoutTrailingSlashes(opts.baseUrl || "https://api.openai.com/v1")}/chat/completions`;
   const tries = opts.tries ?? 8;
   const call = opts.fetch ?? fetch;
   const sleep = opts.sleep ?? pause;
@@ -497,4 +497,11 @@ export function officialMarkdown(r: OfficialReport): string {
       "qa.jsonl (per question: answer, verdict, models, tokens), contexts.jsonl (what the reader got).",
   );
   return lines.join("\n") + "\n";
+}
+
+/** The URL without trailing "/"s; a loop instead of /\/+$/, which backtracks on long runs. */
+function withoutTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url[end - 1] === "/") end--;
+  return url.slice(0, end);
 }

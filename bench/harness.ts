@@ -99,16 +99,19 @@ async function runQuestion(q: Question, opts: BenchOptions, runId: string, store
 /** Walks JSON text, handing every character outside strings to `other`, which returns what to keep. */
 function outsideStrings(text: string, other: (i: number) => { keep: string; skip?: number }): string {
   let out = "";
-  for (let i = 0; i < text.length; i++) {
+  let i = 0;
+  while (i < text.length) {
     if (text[i] === '"') {
-      const start = i;
-      for (i++; i < text.length && text[i] !== '"'; i++) if (text[i] === "\\") i++;
-      out += text.slice(start, i + 1);
+      // Copy the string as it is, stepping over escapes like \".
+      let end = i + 1;
+      while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+      out += text.slice(i, end + 1);
+      i = end + 1;
       continue;
     }
     const r = other(i);
     out += r.keep;
-    i += r.skip ?? 0;
+    i += 1 + (r.skip ?? 0);
   }
   return out;
 }
