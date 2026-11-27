@@ -43,4 +43,10 @@ npm test
       "Uses Cloudflare.",
     ]);
   });
+  it("strips closing hashes from headings", () => {
+    expect(parseMemoryFile("## Testing ##  \n- run npm test before a push", "markdown")).toEqual(["Testing: run npm test before a push"]);
+  });
+  it("splits Hermes entries on a § line with surrounding spaces", () => {
+    expect(parseMemoryFile("Likes short replies.\n  §  \n\nUses Cloudflare.", "hermes")).toEqual(["Likes short replies.", "Uses Cloudflare."]);
+  });
 });

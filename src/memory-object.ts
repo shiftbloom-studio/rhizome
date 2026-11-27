@@ -11,7 +11,7 @@ import { correctionLines, ledgerEnabled, MAX_DELETED, MAX_REPLACED, needsCorrect
 import { evaluate, ORDER_LIMIT, ordersEnabled, parseRule, type Decision, type Order, type OrderState, type ToolCall } from "./orders";
 import { admitConversation, admitNamed, HANDLE_TTL_MS, heldTarget, isValidWallName, isWallableScope, latestWall, wallOf, WALL_LIMIT, WINDOW_MS, type Seen, type Tracked, type Walls } from "./walls";
 import { can, type Client } from "./scopes";
-import { chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
+import { byCodeUnit, chunk, estimateTokens, ftsQuery, roundChunks, rrf, transcript } from "./text";
 import { newId } from "./ids";
 import { DUE_SHOWN, dueSection, isLoopId, isValidDue, LOOP_PREFIX, loopsEnabled, MAX_OPEN_LOOPS, type DueLoop } from "./loops";
 import {
@@ -36,6 +36,22 @@ import {
   type CardUnit,
 } from "./recall";
 import { parseTimeWindow } from "./timewindow";
+import {
+  DEFAULT_RECORDS_MODEL,
+  MAX_RECORD_ROWS,
+  pickLabels,
+  RECORD_BUDGET_SHARE,
+  RECORDS_BATCH,
+  RECORDS_PARALLEL,
+  RECORDS_PROMPT,
+  RECORDS_VOCABULARY,
+  recordsInput,
+  normalizeLabel,
+  recordsSection,
+  validateRecords,
+  type RecordRow,
+  type RecordType,
+} from "./records";
 import {
   DEFAULT_DREAM_MODEL,
   DREAM_DAILY_LIMIT,
@@ -181,6 +197,15 @@ export interface RecallResult {
   notices?: string[];
   /** Ledger: what changed in memory this connector was given earlier, told once. */
   corrections?: string[];
+  /** Recall step "records": every note filed under the kinds of thing the query asks for (src/records.ts). */
+  records?: RecordGroup[];
+}
+
+export interface RecordGroup {
+  label: string;
+  /** Rows on file for the label, before the cap. */
+  total: number;
+  rows: RecordRow[];
 }
 
 export interface MemoryItem {
@@ -289,6 +314,9 @@ function recallCondition(t: string, window?: { from: number; to: number }, asOf?
   return { sql: parts.join(" AND "), args };
 }
 const SYSTEM_REFLECTION = "system:reflection";
+const SYSTEM_RECORDS = "system:records";
+/** Model call errors worth retrying (rate limits, overload, 5xx, network); anything else marks the batch failed. */
+const TRANSIENT_AI_ERROR = /\b(429|5\d\d)\b|rate.?limit|too many requests|capacity|overloaded|timed? ?out|timeout|network|fetch failed|ECONN|unavailable/i;
 const SYSTEM_DREAMING = "system:dreaming";
 /** Seeds looked at per dreaming run, including ones with no close neighbours (no model call). */
 const DREAM_SEEDS_PER_RUN = 300;
@@ -314,8 +342,10 @@ export class MemoryObject extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     ctx.blockConcurrencyWhile(async () => {
-      this.migrate();
+      const from = this.migrate();
       await this.flags.ready(env);
+      // Migration 11 queued every item for Vectorize (event day) and the notes for records.
+      if (from > 0 && from < 11 && MIGRATIONS.length >= 11 && this.meta("user_id")) await this.kick(1_000);
     });
   }
 
@@ -325,7 +355,8 @@ export class MemoryObject extends DurableObject<Env> {
     return this.flags.apply(this.env);
   }
 
-  private migrate(): void {
+  /** Runs pending migrations. Returns the version the object was at before. */
+  private migrate(): number {
     let version = 0;
     try {
       const row = this.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").toArray()[0];
@@ -340,6 +371,7 @@ export class MemoryObject extends DurableObject<Env> {
         String(i + 1),
       );
     }
+    return version;
   }
 
   private userId(client: Client): string {
@@ -369,7 +401,7 @@ export class MemoryObject extends DurableObject<Env> {
     if (current === null || current > at) await this.ctx.storage.setAlarm(at);
   }
 
-  private enqueue(kind: "extract" | "reflect" | "dream", ref: string, delayMs = 0): void {
+  private enqueue(kind: "extract" | "reflect" | "type" | "dream", ref: string, delayMs = 0): void {
     const now = Date.now();
     this.sql.exec("INSERT INTO jobs (kind, ref, not_before, created_at) VALUES (?, ?, ?, ?)", kind, ref, now + delayMs, now);
   }
@@ -387,6 +419,21 @@ export class MemoryObject extends DurableObject<Env> {
     if (Number.isFinite(limit) && used >= limit) return false;
     this.setMeta("extraction_budget", `${day}|${used + 1}`);
     return true;
+  }
+
+  private get vectorFiltersOn(): boolean {
+    return (this.env.VECTOR_FILTERS ?? "").trim().toLowerCase() === "on";
+  }
+
+  private get recordsOn(): boolean {
+    return (this.flagEnv().RECORDS ?? "").trim().toLowerCase() === "on";
+  }
+
+  /** Files notes without a record (src/records.ts), once: a pending job covers every note. */
+  private queueRecords(delayMs = 0): void {
+    if (!this.recordsOn) return;
+    const pending = this.sql.exec("SELECT 1 FROM jobs WHERE kind = 'type' AND attempts < ? LIMIT 1", MAX_JOB_ATTEMPTS).toArray()[0];
+    if (!pending) this.enqueue("type", "all", delayMs);
   }
 
   private get extractionEnabled(): boolean {
@@ -749,14 +796,32 @@ export class MemoryObject extends DurableObject<Env> {
       windowVecLists = exact(undefined);
     }
 
+    // VECTOR_FILTERS: Vectorize itself filtered to the window's days, which reaches past the
+    // exact search's cap. Needs the `day` metadata index (see README).
+    if (window && this.vectorFiltersOn && qvecs.length) {
+      const w = window;
+      windowVecLists.push(...(await Promise.all(qvecs.map((v) => this.vectorSearch(userId, v, scopes, w).catch(() => [] as string[])))));
+    }
+
+    // Step "records": when the query asks for a kind of thing, every note filed under it,
+    // not only the most similar ones (src/records.ts).
+    const recordGroups = features.has("records") && this.recordsOn ? this.recordGroups(this.labelsFor(input.query, qvecs), scopes, window, asOf) : [];
+    // In the fusion the rows rank by how close they are to the query, not by date.
+    const recordVecs = this.storedVectors(recordGroups.flatMap((g) => g.rows.map((r) => r.id)));
+    const closeness = (id: string) => {
+      const v = recordVecs.get(id);
+      return v && qvecs.length ? Math.max(...qvecs.map((q) => cosine(q, v))) : 0;
+    };
+    const recordIds = recordGroups.flatMap((g) => g.rows.map((r) => r.id)).sort((a, b) => closeness(b) - closeness(a));
+
     // Superseded or merged memories are replaced by their current version, unless
     // recall runs as of a past time: then the version that was true back then counts.
     const current = (ids: string[]) => (asOf !== undefined ? ids : ids.map((id) => this.currentVersion(id)));
-    const fused = rrf([...vecLists.map(current), ...windowVecLists.map(current), ...ftsLists.map(current), recentIds.slice(0, 5)]);
+    const fused = rrf([...vecLists.map(current), ...windowVecLists.map(current), ...ftsLists.map(current), recentIds.slice(0, 5), ...(recordIds.length ? [recordIds.slice(0, 50)] : [])]);
     const ranked = [...fused.entries()].sort((a, b) => b[1] - a[1]).slice(0, 24);
     const vectorCount = vecLists.reduce((n, l) => n + l.length, 0) + windowVecLists.reduce((n, l) => n + l.length, 0);
     const ftsCount = ftsLists.reduce((n, l) => n + l.length, 0);
-    const sources = { vector: vectorCount, fts: ftsCount, recent: recentIds.length };
+    const sources = { vector: vectorCount, fts: ftsCount, recent: recentIds.length, ...(recordGroups.length ? { records: recordIds.length } : {}) };
     const asOfOut = asOf !== undefined ? { asOf: iso(asOf) } : {};
     const windowOut = window && { from: iso(window.from), to: window.to >= Number.MAX_SAFE_INTEGER ? null : iso(window.to), source: window.source, ...(window.text ? { text: window.text } : {}) };
     if (ranked.length === 0) {
@@ -786,7 +851,9 @@ export class MemoryObject extends DurableObject<Env> {
       return [{ ...item, score: s, similarity, coverage, vec }];
     });
 
-    if (features.has("abstain") && shouldAbstain(candidates)) {
+    // Rows under a label the query asks for are an answer, also when the window holds no excerpt:
+    // labels need real similarity (src/records.ts pickLabels), so this does not open on broad tags.
+    if (features.has("abstain") && recordIds.length === 0 && shouldAbstain(candidates)) {
       this.audit(client, "recall", { scopes, results: 0, abstained: true });
       return { items: [], text: "", tookMs: Date.now() - started, sources, abstained: true, ...(windowOut ? { window: windowOut } : {}), ...asOfOut, ...notices };
     }
@@ -817,11 +884,29 @@ export class MemoryObject extends DurableObject<Env> {
     candidates.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
     if (features.has("diversity")) candidates = diversify(candidates);
 
+    // Records take up to RECORD_BUDGET_SHARE of the budget, oldest rows first. Items keep
+    // their own place, so a note can show in both.
+    const records: RecordGroup[] = [];
+    let recordTokens = 0;
+    let recordRows = 0;
+    for (const g of recordGroups) {
+      const rows: RecordRow[] = [];
+      for (const r of g.rows) {
+        const cost = estimateTokens(r.content) + 14;
+        if (recordRows >= MAX_RECORD_ROWS || recordTokens + cost > budget * RECORD_BUDGET_SHARE) break;
+        recordTokens += cost + (rows.length ? 0 : 16);
+        recordRows++;
+        rows.push(r);
+      }
+      if (rows.length) records.push({ ...g, rows });
+    }
+    const itemBudget = Math.max(budget - recordTokens, 0);
+
     // Feature "turns": the turns of the best conversations compete for the budget.
     // Without the reranker, or when it fails, recall hands out the excerpts as before.
     const cards =
       features.has("turns") && input.cards !== false && input.rerank !== false
-        ? await this.turnCards(input.query, candidates, terms, scopes, window, asOf, budget, limit).catch(() => null)
+        ? await this.turnCards(input.query, candidates, terms, scopes, window, asOf, itemBudget, limit).catch(() => null)
         : null;
     const items: MemoryItem[] = cards?.items ?? [];
     let used = cards?.used ?? 0;
@@ -829,7 +914,7 @@ export class MemoryObject extends DurableObject<Env> {
       for (const c of candidates) {
         if (items.length >= limit) break;
         const cost = estimateTokens(c.content) + 12;
-        if (used + cost > budget && items.length > 0) continue;
+        if (used + cost > itemBudget && items.length > 0) continue;
         used += cost;
         const { similarity, coverage, vec: _vec, ...item } = c;
         items.push({ ...item, score: Number((c.score ?? 0).toFixed(4)), confidence: confidence(similarity, coverage) });
@@ -843,7 +928,7 @@ export class MemoryObject extends DurableObject<Env> {
         const ev = this.bestEvidence(item.id, vecs.get(item.id) ?? null, qvecs, shown, scopes);
         if (!ev) continue;
         const cost = estimateTokens(ev.content) + 8;
-        if (used + cost > budget) continue;
+        if (used + cost > itemBudget) continue;
         used += cost;
         shown.add(ev.id);
         item.evidence = ev;
@@ -853,17 +938,17 @@ export class MemoryObject extends DurableObject<Env> {
     if (cards) items.sort((a, b) => a.tEvent.localeCompare(b.tEvent));
 
     const now = Date.now();
-    if (items.length) {
-      const hit = items.map(() => "?").join(", ");
+    const recordShown = records.flatMap((g) => g.rows);
+    if (items.length || recordShown.length) {
       this.sql.exec(
-        `UPDATE items SET access_count = access_count + 1, last_accessed = ? WHERE id IN (${hit})`,
+        "UPDATE items SET access_count = access_count + 1, last_accessed = ? WHERE id IN (SELECT value FROM json_each(?))",
         now,
-        ...items.map((i) => i.id),
+        JSON.stringify([...items.map((i) => i.id), ...recordShown.map((r) => r.id)]),
       );
     }
     this.audit(client, "recall", { scopes, results: items.length });
     if (input.track) {
-      const given = items.map((i) => i.scope);
+      const given = [...items.map((i) => i.scope), ...recordShown.map((r) => r.scope)];
       for (const i of items) {
         const source = i.evidence ? this.scopeOf(i.evidence.id) : null;
         if (source) given.push(source);
@@ -871,7 +956,7 @@ export class MemoryObject extends DurableObject<Env> {
       this.recordReads(client, input.track, given, now);
     }
     if (input.track && asOf === undefined && this.ledgerOn) {
-      const given = [...items];
+      const given: { id: string; scope: string }[] = [...items, ...recordShown];
       for (const i of items) {
         const source = i.evidence ? this.scopeOf(i.evidence.id) : null;
         if (source) given.push({ ...i, id: i.evidence!.id, scope: source });
@@ -879,15 +964,17 @@ export class MemoryObject extends DurableObject<Env> {
       this.recordDeliveries(client, given, now);
     }
 
-    const text = items
+    const lines = items
       .map((i) => {
         const head = `- [${i.scope} · ${i.kind === "note" ? i.noteKind : "episode"} · ${i.agent}/${i.provider} · ${i.tEvent.slice(0, 10)}] ${i.content}`;
         return i.evidence ? `${head}\n  source (${i.evidence.tEvent.slice(0, 10)}): ${i.evidence.content}` : head;
       })
       .join("\n");
+    const text = records.length ? [recordsSection(records), lines].filter(Boolean).join("\n\n") : lines;
     return {
       items,
       text,
+      ...(records.length ? { records } : {}),
       tookMs: now - started,
       sources,
       ...(features.has("abstain") ? { abstained: false } : {}),
@@ -988,12 +1075,11 @@ export class MemoryObject extends DurableObject<Env> {
     return { items, used };
   }
 
-  private async vectorSearch(userId: string, vector: number[], scopes: string[]): Promise<string[]> {
-    const res = await this.env.VECTORS.query(vector, {
-      topK: 50,
-      namespace: userId,
-      filter: scopes.length === 1 ? { scope: scopes[0]! } : { scope: { $in: scopes } },
-    });
+  private async vectorSearch(userId: string, vector: number[], scopes: string[], window?: { from: number; to: number }): Promise<string[]> {
+    const filter: VectorizeVectorMetadataFilter = scopes.length === 1 ? { scope: scopes[0]! } : { scope: { $in: scopes } };
+    // Days the window touches; recall checks the exact times on the rows afterwards.
+    if (window) filter.day = { $gte: Math.floor(window.from / DAY_MS), $lte: Math.floor(Math.max(window.from, window.to - 1) / DAY_MS) };
+    const res = await this.env.VECTORS.query(vector, { topK: 50, namespace: userId, filter });
     return res.matches.map((m) => m.id);
   }
 
@@ -1423,7 +1509,7 @@ export class MemoryObject extends DurableObject<Env> {
       for (const s of wanted) this.sql.exec("INSERT INTO walls (scope, wall, created_at) VALUES (?, ?, ?)", s, name, now);
     });
     this.audit(client, "wall", { name, scopes: wanted });
-    return { name, scopes: wanted.sort() };
+    return { name, scopes: wanted.sort(byCodeUnit) };
   }
 
   private scopeOf(itemId: string): string | null {
@@ -1901,6 +1987,7 @@ export class MemoryObject extends DurableObject<Env> {
         if (job.kind === "extract") await this.extract(String(job.ref));
         else if (job.kind === "reflect") await this.reflect(String(job.ref).startsWith("at:") ? Number(String(job.ref).slice(3)) : Date.now(), String(job.ref));
         else if (job.kind === "dream") await this.dream(String(job.ref));
+        else if (job.kind === "type") await this.fileRecords();
         this.sql.exec("DELETE FROM jobs WHERE seq = ?", job.seq);
       } catch (err) {
         const attempts = Number(job.attempts) + 1;
@@ -1914,6 +2001,9 @@ export class MemoryObject extends DurableObject<Env> {
         console.error(`job ${job.kind} ${job.ref} failed`, String(err));
       }
     }
+
+    // Reflection (and dreaming) can merge or rewrite notes, which drops their records: file them again.
+    if (due.some((j) => j.kind !== "extract" && j.kind !== "type")) this.queueRecords();
 
     const outboxPending = Number(this.sql.exec("SELECT COUNT(*) AS n FROM outbox WHERE attempts < 8").toArray()[0]?.n ?? 0);
     if (outboxPending > 0) {
@@ -1929,7 +2019,8 @@ export class MemoryObject extends DurableObject<Env> {
   /** Writes pending items to Vectorize, reusing stored embeddings. Returns "retry" when it backed off. */
   private async drainOutbox(userId: string): Promise<"ok" | "retry"> {
     const batch = this.sql
-      .exec("SELECT seq, op, item_id, attempts FROM outbox WHERE attempts < 8 ORDER BY seq LIMIT ?", OUTBOX_BATCH)
+      // Backfill rows (created_at 0, from migration 11) go after anything written since.
+      .exec("SELECT seq, op, item_id, attempts FROM outbox WHERE attempts < 8 ORDER BY (created_at = 0), seq LIMIT ?", OUTBOX_BATCH)
       .toArray();
     if (batch.length === 0) return "ok";
     const model = this.embeddingModel;
@@ -1941,7 +2032,7 @@ export class MemoryObject extends DurableObject<Env> {
       if (upserts.length) {
         const items = this.sql
           .exec(
-            `SELECT i.id, i.kind, i.scope, i.content, e.vec FROM items i LEFT JOIN embeddings e ON e.item_id = i.id AND e.model = ?
+            `SELECT i.id, i.kind, i.scope, i.content, i.t_event, e.vec FROM items i LEFT JOIN embeddings e ON e.item_id = i.id AND e.model = ?
              WHERE i.id IN (SELECT value FROM json_each(?))`,
             model,
             JSON.stringify(upserts),
@@ -1967,7 +2058,8 @@ export class MemoryObject extends DurableObject<Env> {
               id: String(i.id),
               values: vectors.get(String(i.id))!,
               namespace: userId,
-              metadata: { scope: String(i.scope), kind: String(i.kind) },
+              // day: event day number, for range filters on time windows (VECTOR_FILTERS).
+              metadata: { scope: String(i.scope), kind: String(i.kind), day: Math.floor(Number(i.t_event) / DAY_MS) },
             })),
           );
         }
@@ -1976,6 +2068,7 @@ export class MemoryObject extends DurableObject<Env> {
       this.sql.exec("DELETE FROM outbox WHERE seq IN (SELECT value FROM json_each(?))", seqs);
       // Notes written directly by agents: merge exact repeats, link the rest.
       for (const id of fresh) this.settleNote(id);
+      if (fresh.length) this.queueRecords(1_000);
       return "ok";
     } catch (err) {
       this.sql.exec("UPDATE outbox SET attempts = attempts + 1 WHERE seq IN (SELECT value FROM json_each(?))", seqs);
@@ -2216,6 +2309,7 @@ export class MemoryObject extends DurableObject<Env> {
       );
     });
     this.storeFactKeys(episodeId, facts.map((f) => f.statement), vectors);
+    if (created.length) this.queueRecords();
     if (created.length) await this.kick(100);
   }
 
@@ -2484,6 +2578,256 @@ export class MemoryObject extends DurableObject<Env> {
 
   // ------------------------------------------------------------ reflection
 
+  // ------------------------------------------------------------- records
+
+  /**
+   * Files notes without a record (src/records.ts): RECORDS_PARALLEL calls of RECORDS_BATCH
+   * notes each, with the categories in use so the model keeps to them. A note whose text
+   * changed while the model ran is left for the next run. Queues itself again while notes
+   * are left. The notes of a call that failed twice are marked failed, so one bad batch
+   * cannot keep the queue busy, and get another try a day later.
+   */
+  private async fileRecords(): Promise<void> {
+    if (!this.recordsOn) return;
+    this.sql.exec("DELETE FROM records WHERE model LIKE '%#failed' AND created_at < ?", Date.now() - DAY_MS);
+    const notes = this.sql
+      .exec(
+        `SELECT i.id, i.scope, i.content, COALESCE(i.valid_from, i.t_event) AS at FROM items i
+         WHERE i.kind = 'note' AND i.status IN ${RECALLABLE}
+           AND NOT EXISTS (SELECT 1 FROM records r WHERE r.item_id = i.id)
+           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.src = i.id AND l.kind = 'rolls_up')
+         ORDER BY i.created_at, i.rowid LIMIT ?`,
+        RECORDS_BATCH * RECORDS_PARALLEL,
+      )
+      .toArray()
+      .map((r) => ({ id: String(r.id), scope: String(r.scope), content: String(r.content), at: Number(r.at) }));
+    if (notes.length === 0) return;
+    const model = this.env.RECORDS_MODEL ?? DEFAULT_RECORDS_MODEL;
+    // Walls: a batch holds notes of one wall (or none), and the model only sees categories used there.
+    const walls = this.walls();
+    const wallKey = (scope: string) => wallOf(scope, walls) ?? "";
+    const counts = new Map<string, Map<string, number>>();
+    for (const r of this.sql
+      .exec("SELECT r.category, i.scope, COUNT(*) AS n FROM records r JOIN items i ON i.id = r.item_id WHERE r.type != 'none' GROUP BY r.category, i.scope")
+      .toArray()) {
+      const key = wallKey(String(r.scope));
+      const m = counts.get(key) ?? new Map<string, number>();
+      m.set(String(r.category), (m.get(String(r.category)) ?? 0) + Number(r.n));
+      counts.set(key, m);
+    }
+    const vocabularyOf = (key: string) =>
+      [...(counts.get(key) ?? new Map<string, number>()).entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, RECORDS_VOCABULARY)
+        .map(([c]) => c);
+    const groups = new Map<string, typeof notes>();
+    for (const n of notes) groups.set(wallKey(n.scope), [...(groups.get(wallKey(n.scope)) ?? []), n]);
+    const batches: { key: string; notes: typeof notes }[] = [];
+    for (const [key, g] of groups) for (let i = 0; i < g.length; i += RECORDS_BATCH) batches.push({ key, notes: g.slice(i, i + RECORDS_BATCH) });
+    const answers = await Promise.all(
+      batches.map(({ key, notes: b }) =>
+        this.generateJson(model, RECORDS_PROMPT, recordsInput(vocabularyOf(key), b), (raw) => validateRecords(raw, b.length), 2000).catch((err) => {
+          console.error("records batch failed", String(err));
+          // Output the model got wrong twice is marked failed; a call that did not go through (rate limit, outage) is not.
+          return TRANSIENT_AI_ERROR.test(String(err)) ? ("transient" as const) : null;
+        }),
+      ),
+    );
+    const transient = answers.filter((a) => a === "transient").length;
+    const now = Date.now();
+    const labels = new Set<string>();
+    let filed = 0;
+    this.ctx.storage.transactionSync(() => {
+      batches.forEach(({ notes: b }, n) => {
+        const answer = answers[n];
+        if (answer === "transient") return;
+        const records = answer ?? null;
+        b.forEach((note, i) => {
+          const r = records?.[i] ?? null;
+          // Only while the note still says what the model read.
+          this.sql.exec(
+            `INSERT OR REPLACE INTO records (item_id, type, category, tags, quantity, unit, occurred_at, model, created_at)
+             SELECT id, ?, ?, ?, ?, ?, ?, ?, ? FROM items WHERE id = ? AND content = ?`,
+            r ? r.type : "none", r ? r.category : "", r ? r.tags.join(" | ") : "", r?.quantity ?? null, r?.unit ?? null, r?.date ?? null,
+            records ? model : `${model}#failed`, now, note.id, note.content,
+          );
+          // INSERT OR REPLACE deleted an older row and its tags (trigger) first.
+          if (r && this.sql.exec("SELECT 1 FROM records WHERE item_id = ? AND created_at = ?", note.id, now).toArray().length) {
+            filed++;
+            labels.add(r.category);
+            for (const t of r.tags) {
+              labels.add(t);
+              this.sql.exec("INSERT OR IGNORE INTO record_tags (label, item_id) VALUES (?, ?)", t, note.id);
+            }
+          }
+        });
+      });
+      const failed = answers.reduce((k, a, n) => k + (a === null ? batches[n]!.notes.length : 0), 0);
+      this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'records', ?)", now, SYSTEM_RECORDS, JSON.stringify({ model, notes: notes.length, filed, failed, transient }));
+    });
+    await this.embedLabels([...labels]);
+    // Labels no record uses any more (notes rewritten or deleted) leave the query matching.
+    this.sql.exec("DELETE FROM record_labels WHERE label NOT IN (SELECT category FROM records) AND label NOT IN (SELECT label FROM record_tags)");
+    this.labelCache = null;
+    // Calls that did not go through: the job backs off and the notes are tried again.
+    if (transient) throw new Error(`records: ${transient} of ${batches.length} batches did not reach the model`);
+    if (notes.length === RECORDS_BATCH * RECORDS_PARALLEL) this.enqueue("type", "all");
+  }
+
+  /** Embeddings for labels that have none for the current model yet. */
+  private async embedLabels(labels: string[]): Promise<void> {
+    if (labels.length === 0) return;
+    const known = new Set(
+      this.sql
+        .exec("SELECT label FROM record_labels WHERE model = ? AND label IN (SELECT value FROM json_each(?))", this.embeddingModel, JSON.stringify(labels))
+        .toArray()
+        .map((r) => String(r.label)),
+    );
+    const missing = labels.filter((l) => !known.has(l));
+    if (missing.length === 0) return;
+    const vecs = await this.embed(missing);
+    missing.forEach((label, i) =>
+      this.sql.exec(
+        "INSERT INTO record_labels (label, model, vec) VALUES (?, ?, ?) ON CONFLICT (label) DO UPDATE SET model = excluded.model, vec = excluded.vec",
+        label, this.embeddingModel, encodeVector(vecs[i]!),
+      ),
+    );
+  }
+
+  /** Label embeddings of the current model, kept per instance until the next filing run changes them. */
+  private labelCache: { model: string; labels: { label: string; kind: "category" | "tag"; vec: Float32Array }[] } | null = null;
+
+  /** The labels a query asks for, from the stored label embeddings (src/records.ts pickLabels). */
+  private labelsFor(query: string, qvecs: number[][]): string[] {
+    if (qvecs.length === 0) return [];
+    if (this.labelCache?.model !== this.embeddingModel) {
+      const labels = this.sql
+        .exec(
+          `SELECT l.label, l.vec, EXISTS (SELECT 1 FROM records r WHERE r.category = l.label AND r.type != 'none') AS cat
+           FROM record_labels l WHERE l.model = ?`,
+          this.embeddingModel,
+        )
+        .toArray()
+        .map((r) => ({ label: String(r.label), kind: (Number(r.cat) ? "category" : "tag") as "category" | "tag", vec: decodeVector(r.vec as ArrayBuffer) }));
+      this.labelCache = { model: this.embeddingModel, labels };
+    }
+    const scored = this.labelCache.labels.map((l) => ({ label: l.label, kind: l.kind, similarity: Math.max(...qvecs.map((q) => cosine(q, l.vec))) }));
+    return pickLabels(scored, query);
+  }
+
+  /**
+   * Records filed under one label (category or tag), or every record without a label, in the
+   * given scopes, oldest first: at most `limit` rows, with the total that matched. A window
+   * limits by when the thing happened (the record's date, else the note's). As of a past time
+   * only notes true then count, as in recall. Notes in `skip` are left out.
+   */
+  private recordQuery(
+    label: string | null,
+    scopes: string[],
+    opts: { window?: { from: number; to: number }; asOf?: number; type?: RecordType; skip?: string[]; limit: number },
+  ): { rows: RecordRow[]; total: number } {
+    const cond = recallCondition("i", undefined, opts.asOf);
+    const when = "COALESCE(r.occurred_at, i.valid_from, i.t_event)";
+    const where = `FROM records r JOIN items i ON i.id = r.item_id
+       WHERE r.type != 'none' ${label !== null ? "AND (r.category = ? OR r.item_id IN (SELECT item_id FROM record_tags WHERE label = ?))" : ""}
+         AND i.scope IN (SELECT value FROM json_each(?)) AND ${cond.sql}
+         ${opts.window ? `AND ${when} >= ? AND ${when} < ?` : ""} ${opts.type ? "AND r.type = ?" : ""}
+         AND i.id NOT IN (SELECT value FROM json_each(?))`;
+    const args = [
+      ...(label !== null ? [label, label] : []), JSON.stringify(scopes), ...cond.args,
+      ...(opts.window ? [opts.window.from, opts.window.to] : []), ...(opts.type ? [opts.type] : []), JSON.stringify(opts.skip ?? []),
+    ];
+    const total = Number(this.sql.exec(`SELECT COUNT(*) AS n ${where}`, ...args).toArray()[0]?.n ?? 0);
+    if (total === 0) return { rows: [], total };
+    const rows = this.sql
+      .exec(`SELECT r.*, i.id AS id, i.scope, i.content, i.status, ${when} AS at ${where} ORDER BY at, i.rowid LIMIT ?`, ...args, opts.limit)
+      .toArray()
+      .map((r) => this.recordRow(r));
+    return { rows, total };
+  }
+
+  private recordRow(r: Row): RecordRow {
+    const sources = this.sql
+      .exec("SELECT dst FROM links WHERE src = ? AND kind = 'derived_from' ORDER BY created_at", r.id)
+      .toArray()
+      .map((s) => String(s.dst));
+    return {
+      id: String(r.id),
+      scope: String(r.scope),
+      type: String(r.type) as RecordType,
+      category: String(r.category),
+      tags: String(r.tags ?? "").split(" | ").filter(Boolean),
+      quantity: r.quantity === null || r.quantity === undefined ? null : Number(r.quantity),
+      unit: r.unit === null || r.unit === undefined ? null : String(r.unit),
+      date: iso(Number(r.at)),
+      content: String(r.content),
+      status: String(r.status),
+      sources,
+    };
+  }
+
+  /** Groups for the recall step "records": each asked-for label with its first rows and its total, a note listed once. */
+  private recordGroups(labels: string[], scopes: string[], window: { from: number; to: number } | undefined, asOf: number | undefined): RecordGroup[] {
+    const seen: string[] = [];
+    const groups: RecordGroup[] = [];
+    for (const label of labels) {
+      const { rows, total } = this.recordQuery(label, scopes, { window, asOf, skip: seen, limit: MAX_RECORD_ROWS });
+      if (rows.length === 0) continue;
+      seen.push(...rows.map((r) => r.id));
+      groups.push({ label, total, rows });
+    }
+    return groups;
+  }
+
+  /**
+   * Records for an agent (MCP query_records): by category, or the categories a query asks
+   * for, or every record in the scopes. Rows come with the episodes they were taken from;
+   * `total` counts every match, `rows` holds at most `limit` (500) of them.
+   */
+  async queryRecords(
+    client: Client,
+    input: { scopes: string[]; named?: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number; track?: Tracked },
+  ): Promise<{ labels: string[]; rows: RecordRow[]; total: number; notices?: string[] }> {
+    this.userId(client);
+    const now = Date.now();
+    const walls = this.walls();
+    const gate = admitNamed(input.scopes, input.named ?? [], walls);
+    // Walls rule 2, as in recall: nothing from a second wall for a conversation that was given one.
+    const second = input.track && Object.keys(walls).length ? admitConversation(gate.scopes, this.seenWalls(client, input.track, now), walls) : null;
+    const scopes = second ? second.scopes : gate.scopes;
+    const notices = [...gate.notices, ...(second?.notices ?? [])];
+    const told = notices.length ? { notices } : {};
+    if (scopes.length === 0) return { labels: [], rows: [], total: 0, ...told };
+    const limit = Math.min(Math.max(input.limit ?? 100, 1), 500);
+    const window = input.from !== undefined || input.to !== undefined ? { from: input.from ?? 0, to: input.to ?? Number.MAX_SAFE_INTEGER } : undefined;
+    let labels: string[] = [];
+    if (input.category) labels = [normalizeLabel(input.category)].filter(Boolean);
+    else if (input.query) labels = this.labelsFor(input.query, await this.embed([input.query]).catch(() => [] as number[][]));
+    let rows: RecordRow[] = [];
+    let total = 0;
+    if (labels.length) {
+      const seen: string[] = [];
+      const found: string[] = [];
+      for (const l of labels) {
+        const res = this.recordQuery(l, scopes, { window, type: input.type, skip: seen, limit: limit - rows.length });
+        // Labels are shared across scopes: only name the ones with rows this call may read.
+        if (res.total > 0) found.push(l);
+        total += res.total;
+        rows.push(...res.rows);
+        seen.push(...res.rows.map((r) => r.id));
+        if (rows.length >= limit) break;
+      }
+      rows.sort((a, b) => a.date.localeCompare(b.date));
+      labels = found;
+    } else if (!input.category && !input.query) ({ rows, total } = this.recordQuery(null, scopes, { window, type: input.type, limit }));
+    this.audit(client, "records.query", { scopes, labels, rows: rows.length, total });
+    if (input.track) {
+      this.recordReads(client, input.track, rows.map((r) => r.scope), now);
+      if (this.ledgerOn) this.recordDeliveries(client, rows, now);
+    }
+    return { labels, rows, total, ...told };
+  }
+
   /**
    * Sleep-time work on Workers AI: decay and importance for every memory,
    * archiving of stale chunks, merging of duplicates the day produced, and a
@@ -2651,7 +2995,7 @@ export class MemoryObject extends DurableObject<Env> {
           const current = this.currentVersion(o.id);
           if (current === id || !live(current)) continue;
           if (current !== o.id) this.link(id, current, "contradicts", o.weight, now);
-          pairs.set([id, current].sort().join("|"), [id, current]);
+          pairs.set([id, current].sort(byCodeUnit).join("|"), [id, current]);
         }
       }
     });

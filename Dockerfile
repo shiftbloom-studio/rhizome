@@ -4,7 +4,7 @@ FROM node:26-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY web/package.json web/package-lock.json web/
-RUN npm ci --no-audit --no-fund && npm ci --prefix web --no-audit --no-fund
+RUN npm ci --ignore-scripts --no-audit --no-fund && npm ci --prefix web --ignore-scripts --no-audit --no-fund
 COPY . .
 RUN npm run build:web && npm run build:node
 

@@ -251,7 +251,7 @@ export function validateExtraction(raw: unknown): Extraction {
   for (const f of r.facts.slice(0, 12)) {
     const statement = typeof f?.statement === "string" ? f.statement.trim() : "";
     if (statement.length < 8 || statement.length > 600) continue;
-    const validFrom = parseDay(f.valid_from) ?? NaN;
+    const validFrom = parseDay(f.valid_from) ?? Number.NaN;
     facts.push({
       statement,
       kind: KINDS.includes(f.kind) ? f.kind : "fact",

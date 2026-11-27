@@ -95,7 +95,7 @@ app.post("/mcp", async (c) => {
     return rpcError(null, -32700, "parse error");
   }
   const stub = c.env.MEMORY.get(c.env.MEMORY.idFromName(`user:${client.userId}`));
-  const opts = { loops: loopsEnabled(c.env), orders: ordersEnabled(c.env) };
+  const opts = { loops: loopsEnabled(c.env), orders: ordersEnabled(c.env), records: c.env.RECORDS === "on" };
   if (!analyticsHost(c.env)) return mcpResponse(stub, client, raw, VERSION, undefined, opts);
   // Anonymous usage analytics (MCP_ANALYTICS=on): sent after the answer, never in its way.
   const stats: McpStat[] = [];

@@ -202,7 +202,7 @@ async function signedInUser(env: Env, req: Request): Promise<{ id: string; name:
 /** Guesses agent and provider slugs from the app's name, e.g. "Claude" → claude / anthropic. */
 export function guessIdentity(name: string): { agent: string; provider: string } {
   const n = name.toLowerCase();
-  const slug = n.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "mcp-client";
+  const slug = n.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "mcp-client";
   if (/claude|anthropic/.test(n)) return { agent: n.includes("code") ? "claude-code" : "claude", provider: "anthropic" };
   if (/chatgpt|openai|codex/.test(n)) return { agent: n.includes("codex") ? "codex" : "chatgpt", provider: "openai" };
   if (/gemini|google/.test(n)) return { agent: "gemini", provider: "google" };
@@ -349,7 +349,7 @@ async function clientFromRequest(env: Env, auth: string | undefined, form: Recor
 
 async function pkceS256(verifier: string): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
-  return btoa(String.fromCharCode(...digest)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(String.fromCharCode(...digest)).replace(/\+/g, "-").replace(/\//g, "_").replace(/={1,2}$/, "");
 }
 
 /** Issues an access token (a short-lived API key) and a fresh refresh token for a grant. */

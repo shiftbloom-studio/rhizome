@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { sameOriginSignIn } from "./redirect";
 import type { Block, Detail, Graph, Me, SearchResult, Held, StandingOrder, Strike, Wall } from "./types";
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -12,7 +13,8 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     // The session ended. With the built-in sign-in the server names its page; behind
     // Cloudflare Access or a sign-in proxy, reloading goes through sign-in again.
     const { signIn } = (await res.json().catch(() => ({}))) as { signIn?: string | null };
-    if (signIn) window.location.assign(`${signIn}?next=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+    const target = sameOriginSignIn(signIn, window.location.origin, window.location.pathname + window.location.search);
+    if (target) window.location.assign(target);
     else window.location.reload();
     throw new Error("signed out");
   }
