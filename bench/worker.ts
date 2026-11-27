@@ -510,7 +510,8 @@ export class AiOutputCache {
       this.misses++;
       const output = await runAi<unknown>(ai, model, input);
       try {
-        await this.bucket.put(key, JSON.stringify({ model, output }), { httpMetadata: { contentType: "application/json" } });
+        // The request is kept too, so a rerun that misses can be compared with what the first run sent.
+        await this.bucket.put(key, JSON.stringify({ model, input, output }), { httpMetadata: { contentType: "application/json" } });
       } catch (err) {
         console.error("bench: could not write the AI cache", String(err));
       }

@@ -498,6 +498,20 @@ describe("MemoryObject pipeline", () => {
     });
   });
 
+  it("extracts an episode once, even when its job runs again", async () => {
+    const run = vi.spyOn(fake.env.AI, "run");
+    const ep = await mo.addEpisode(claude, { scope: "project:rhizome", messages: [{ role: "user", content: "STYLE please keep replies short and deploy via Workers Builds" }] });
+    await settle(mo);
+    const calls = run.mock.calls.length;
+    const before = notes();
+    // As after an alarm that was cut off between writing the notes and deleting its job.
+    db.prepare("INSERT INTO jobs (kind, ref, not_before, created_at) VALUES ('extract', ?, 0, 0)").run(ep.id);
+    await settle(mo);
+    expect(run.mock.calls.length).toBe(calls);
+    expect(notes()).toEqual(before);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n).toBe(0);
+  });
+
   it("stops queueing extraction once the daily limit is reached", async () => {
     (fake.env as { EXTRACTION_DAILY_LIMIT?: string }).EXTRACTION_DAILY_LIMIT = "1";
     await mo.addEpisode(claude, { scope: "profile", messages: [{ role: "user", content: "AGPL for all of it, every single repository from now on" }] });

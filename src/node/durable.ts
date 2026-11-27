@@ -42,6 +42,8 @@ class Cursor<T extends Record<string, unknown>> implements Iterable<T> {
 class LocalStorage {
   private alarmTimer: NodeJS.Timeout | null = null;
   private retries = 0;
+  /** The alarm handler while it runs: like Durable Objects, only one runs at a time. */
+  private running: Promise<void> | null = null;
   readonly sql;
 
   constructor(
@@ -81,6 +83,10 @@ class LocalStorage {
   }
 
   async getAlarm(): Promise<number | null> {
+    return this.storedAlarm();
+  }
+
+  private storedAlarm(): number | null {
     const row = this.db.prepare("SELECT at FROM _node_alarm WHERE id = 1").get() as { at: number } | undefined;
     return row ? Number(row.at) : null;
   }
@@ -112,9 +118,29 @@ class LocalStorage {
 
   private async fire(at: number) {
     this.alarmTimer = null;
+    // Like Durable Objects, never two handlers at once: an alarm that comes due while the
+    // handler runs waits until it has finished.
+    while (this.running) await this.running;
+    // Read and cleared without a pause in between, so two waiting timers cannot both run it.
+    const stored = this.storedAlarm();
+    if (stored === null) return;
+    if (stored > Date.now()) {
+      // Moved later meanwhile: its own timer runs it, or a new one if that timer was this one.
+      if (!this.alarmTimer) this.schedule(stored);
+      return;
+    }
+    if (stored !== at && this.alarmTimer) return; // a timer of its own runs it
     // Like Durable Objects: the alarm is cleared before the handler runs, and the handler may set a new one.
-    if ((await this.getAlarm()) !== at) return;
     this.db.exec("DELETE FROM _node_alarm");
+    this.running = this.handle();
+    try {
+      await this.running;
+    } finally {
+      this.running = null;
+    }
+  }
+
+  private async handle() {
     try {
       await this.runAlarm();
       this.retries = 0;

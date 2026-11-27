@@ -234,6 +234,48 @@ describe("benchmark AI client", () => {
   });
 });
 
+describe("Replays", () => {
+  /** Extraction that finds one fact per user line, labels the second one an update when notes are shown, and logs every paid request. */
+  class LoggingAi implements AiRunner {
+    readonly requests: string[] = [];
+    constructor(private delayMs: number) {}
+    async run(model: string, input: unknown): Promise<unknown> {
+      const i = input as { messages?: { content: string }[] };
+      if (!i.messages) return new FakeAi().run(model, input);
+      if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
+      const user = i.messages.at(-1)!.content;
+      this.requests.push(stableJson({ model, input }));
+      if (!user.startsWith("Episode time")) return { response: "{}" };
+      const related = user.includes("Related memory:\n0.");
+      const facts = [...user.matchAll(/\[user\] (.*)/g)].flatMap((m) =>
+        m[1]!.split(". ").map((statement, k) => ({ statement, trust: "user_explicit", relation: related && k === 1 ? "update" : "new", related: related && k === 1 ? 0 : null })),
+      );
+      return { response: JSON.stringify({ facts, entities: [] }) };
+    }
+  }
+
+  it("send the same paid requests however fast the models answer, so a rerun hits the cache", async () => {
+    const topics = ["my cat Luna", "the Berlin marathon", "my job at Acme", "the tomato garden", "piano lessons", "a trip to Japan"];
+    const sessions = Array.from({ length: 20 }, (_, i) => ({
+      id: `s${i}`,
+      date: `2023/0${1 + Math.floor(i / 5)}/1${i % 5} (Mon) 10:00`,
+      turns: [
+        { role: "user", content: `I talk about ${topics[i % 6]} and ${topics[(i * 5) % 6]} today. My ${topics[i % 6]} is great.` },
+        { role: "assistant", content: `Nice to hear about ${topics[i % 6]}.` },
+      ] as Turn[],
+    }));
+    const q = question("replay", "multi-session", "What about my cat?", sessions);
+    const requests: string[][] = [];
+    for (const delayMs of [60, 0]) {
+      const ai = new LoggingAi(delayMs);
+      await runBenchmark([q], { out: join(dir, `run-${delayMs}`), ai, concurrency: 1, extraction: true, reflect: true, vars: { DISPUTE_RESOLUTION: "on" }, log: () => {} });
+      requests.push(ai.requests);
+    }
+    expect(requests[0]!.length).toBeGreaterThan(12);
+    expect(requests[1]).toEqual(requests[0]);
+  }, 60_000);
+});
+
 describe("Worker vars", () => {
   it("reads plain values from wrangler.jsonc and skips deploy placeholders", () => {
     const jsonc = `// comment with "quotes"

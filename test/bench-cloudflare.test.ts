@@ -346,6 +346,7 @@ describe("AI cache", () => {
     await runAi(next.wrap(ai), "@cf/baai/bge-reranker-base", { query: "q", contexts: [] });
     expect(calls).toBe(4);
     expect(objects.size).toBe(2);
+    expect(JSON.parse(objects.get(await aiCacheKey(paid, input))!)).toEqual({ model: paid, input, output: { response: `${paid} 1` } });
     expect(await aiCacheKey(paid, input)).toMatch(/^cache\/ai\/%40cf%2Fdeepseek-ai%2Fdeepseek-v4\.1-flash-1017\/[0-9a-f]{64}\.json$/);
   });
 
