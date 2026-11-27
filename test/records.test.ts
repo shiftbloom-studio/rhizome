@@ -89,10 +89,15 @@ afterAll(() => vi.restoreAllMocks());
 /** Files every wedding note under "wedding" with its date, bike notes with their price, the rest as "habit". */
 let recordsCalls = 0;
 let failRecords = false;
+let rateLimited = 0;
 function generate(_model: string, system: string, user: string): string {
   if (system !== RECORDS_PROMPT) return "{}";
   recordsCalls++;
   if (failRecords) return "not json";
+  if (rateLimited > 0) {
+    rateLimited--;
+    throw new Error("AiError: 429 Too Many Requests");
+  }
   const notes = user.split("Notes:\n")[1]!.split("\n");
   return JSON.stringify({
     r: notes.map((line, i) => {
@@ -124,6 +129,7 @@ describe("MemoryObject records", () => {
     mo = new MemoryObject(s.state as never, fake.env as never);
     recordsCalls = 0;
     failRecords = false;
+    rateLimited = 0;
   });
 
   const remember = async (...contents: string[]) => {
@@ -236,6 +242,22 @@ describe("MemoryObject records", () => {
     now += 86_400_000 + 1;
     await remember("The user cycles to work.");
     expect(db.prepare("SELECT type FROM records ORDER BY created_at").all()).toEqual([{ type: "event" }, { type: "state" }]);
+  });
+
+  it("does not mark notes failed when the model is rate-limited, and files them once it answers", async () => {
+    rateLimited = 1;
+    await mo.addNote(claude, { scope: "profile", content: "The user went to a wedding on 2024-05-04.", kind: "fact" });
+    for (let i = 0; i < 3; i++) {
+      now += 5_000;
+      await mo.alarm();
+    }
+    expect(db.prepare("SELECT COUNT(*) AS n FROM records WHERE model LIKE '%#failed'").get()).toEqual({ n: 0 });
+    // The job backs off, then files the note.
+    for (let i = 0; i < 10; i++) {
+      now += 60_000;
+      await mo.alarm();
+    }
+    expect(db.prepare("SELECT type, category FROM records").all()).toEqual([{ type: "event", category: "wedding" }]);
   });
 
   it("does nothing with RECORDS=off", async () => {

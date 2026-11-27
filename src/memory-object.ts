@@ -315,6 +315,8 @@ function recallCondition(t: string, window?: { from: number; to: number }, asOf?
 }
 const SYSTEM_REFLECTION = "system:reflection";
 const SYSTEM_RECORDS = "system:records";
+/** Model call errors worth retrying (rate limits, overload, 5xx, network); anything else marks the batch failed. */
+const TRANSIENT_AI_ERROR = /\b(429|5\d\d)\b|rate.?limit|too many requests|capacity|overloaded|timed? ?out|timeout|network|fetch failed|ECONN|unavailable/i;
 const SYSTEM_DREAMING = "system:dreaming";
 /** Seeds looked at per dreaming run, including ones with no close neighbours (no model call). */
 const DREAM_SEEDS_PER_RUN = 300;
@@ -2627,7 +2629,7 @@ export class MemoryObject extends DurableObject<Env> {
         this.generateJson(model, RECORDS_PROMPT, recordsInput(vocabularyOf(key), b), (raw) => validateRecords(raw, b.length), 2000).catch((err) => {
           console.error("records batch failed", String(err));
           // Output the model got wrong twice is marked failed; a call that did not go through (rate limit, outage) is not.
-          return String(err).includes("model output invalid") ? null : ("transient" as const);
+          return TRANSIENT_AI_ERROR.test(String(err)) ? ("transient" as const) : null;
         }),
       ),
     );
