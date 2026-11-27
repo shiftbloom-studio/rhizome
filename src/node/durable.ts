@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { toSqlParam } from "./d1";
 
-const ROW_RETURNING = /^\s*(SELECT|WITH|PRAGMA|VALUES|EXPLAIN)\b|\bRETURNING\b/i;
+const ROW_RETURNING = /(?:^\s*(?:SELECT|WITH|PRAGMA|VALUES|EXPLAIN)\b)|(?:\bRETURNING\b)/i;
 const MAX_TIMER = 2_000_000_000; // setTimeout's limit is 2^31-1 ms
 const ALARM_RETRIES = 6;
 

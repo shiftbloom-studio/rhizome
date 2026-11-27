@@ -4,6 +4,7 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DISPUTE_PROMPT, EXTRACTION_PROMPT, NOTE_ENTITIES_PROMPT, PROFILE_PROMPT, RESOLVER_PROMPT } from "../src/intel";
 import { MemoryObject } from "../src/memory-object";
+import { RECORDS_PROMPT } from "../src/records";
 import { MIGRATIONS } from "../src/schema";
 import type { Client } from "../src/scopes";
 import { fakeEnv, fakeState } from "./support/fake-do";
@@ -36,6 +37,7 @@ let resolverAnswer = "update";
 let disputeAnswer = "newer";
 let disputeInputs: string[] = [];
 let tagCalls = 0;
+let recordsCalls = 0;
 let resolverCalls = 0;
 let extractionInputs: string[] = [];
 function generate(_model: string, system: string, user: string): string {
@@ -58,6 +60,12 @@ function generate(_model: string, system: string, user: string): string {
     // Tags every note that mentions Cloudflare; the rest get nothing.
     const notes = user.split("\n").map((line) => ({ note: Number(line.split(".")[0]), entities: /cloudflare/i.test(line) ? [{ name: "Cloudflare", type: "org" }] : [] }));
     return JSON.stringify({ notes });
+  }
+  if (system === RECORDS_PROMPT) {
+    recordsCalls++;
+    // Files licence notes under "license", the rest under "habit".
+    const notes = user.split("Notes:\n")[1]!.split("\n");
+    return JSON.stringify({ r: notes.map((line, i) => [i, /license/i.test(line) ? "preference" : "state", /license/i.test(line) ? "license" : "habit", [], null, null, null]) });
   }
   if (system === PROFILE_PROMPT) return "## Rules\n- AGPL for everything.\n- Short replies.";
   return "## Project\n- Workers Builds.";

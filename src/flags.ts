@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The flag vars below (LEDGER, STANDING_ORDERS, OPEN_LOOPS, DISPUTE_RESOLUTION, DREAMING) default to ON.
+// The flag vars below (LEDGER, STANDING_ORDERS, OPEN_LOOPS, DISPUTE_RESOLUTION, DREAMING, RECORDS) default to ON.
 // A var that is set ("on" or "off") always wins, so env stays the kill switch. An unset var takes the value
 // of its PostHog flag when POSTHOG_FLAGS=on (with POSTHOG_KEY and POSTHOG_HOST): enabled -> "on",
 // disabled -> "off". Without POSTHOG_FLAGS, or when PostHog is unreachable, slow (over 1.5 s), or the flag
@@ -15,6 +15,7 @@ export const FLAGS = {
   OPEN_LOOPS: "rhizome-open-loops",
   DISPUTE_RESOLUTION: "rhizome-dispute-resolution",
   DREAMING: "rhizome-dreaming",
+  RECORDS: "rhizome-records",
 } as const;
 
 export type FlagVar = keyof typeof FLAGS;

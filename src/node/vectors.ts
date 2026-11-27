@@ -5,7 +5,8 @@
 import { DatabaseSync } from "node:sqlite";
 
 type Meta = Record<string, string | number | boolean>;
-type Filter = Record<string, string | number | boolean | { $eq?: unknown; $ne?: unknown; $in?: unknown[]; $nin?: unknown[] }>;
+type Range = { $lt?: string | number; $lte?: string | number; $gt?: string | number; $gte?: string | number };
+type Filter = Record<string, string | number | boolean | ({ $eq?: unknown; $ne?: unknown; $in?: unknown[]; $nin?: unknown[] } & Range)>;
 interface Row {
   id: string;
   metadata: Meta;
@@ -28,6 +29,14 @@ function matches(meta: Meta, filter: Filter | undefined): boolean {
       if ("$ne" in cond && v === cond.$ne) return false;
       if (cond.$in && !cond.$in.includes(v)) return false;
       if (cond.$nin && cond.$nin.includes(v)) return false;
+      // Ranges match values of the bound's type only, as in Vectorize.
+      const r = cond as Range;
+      for (const [op, bound] of [["$lt", r.$lt], ["$lte", r.$lte], ["$gt", r.$gt], ["$gte", r.$gte]] as const) {
+        if (bound === undefined) continue;
+        if (typeof v !== typeof bound) return false;
+        const a = v as string | number;
+        if ((op === "$lt" && !(a < bound)) || (op === "$lte" && !(a <= bound)) || (op === "$gt" && !(a > bound)) || (op === "$gte" && !(a >= bound))) return false;
+      }
     } else if (v !== cond) return false;
   }
   return true;

@@ -319,7 +319,7 @@ function Remember({ scopes, onSaved }: { scopes: string[]; onSaved: () => void }
           <select value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Kind">
             {["preference", "decision", "fact", "learning", "note"].map((k) => <option key={k}>{k}</option>)}
           </select>
-          <button className="btn" disabled={busy || !text.trim()}>Save note</button>
+          <button type="submit" className="btn" disabled={busy || !text.trim()}>Save note</button>
         </div>
       </form>
     </section>

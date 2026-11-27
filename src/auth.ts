@@ -64,7 +64,7 @@ export interface KeyOptions {
 /** Accepts epoch ms or an ISO date. Must lie in the future. */
 export function parseExpiresAt(v: unknown, now = Date.now()): number | null {
   if (v === undefined || v === null || v === "") return null;
-  const ms = typeof v === "number" ? v : typeof v === "string" ? Date.parse(v) : NaN;
+  const ms = typeof v === "number" ? v : typeof v === "string" ? Date.parse(v) : Number.NaN;
   if (!Number.isFinite(ms)) throw new Error("expiresAt must be epoch milliseconds or an ISO date");
   if (ms <= now) throw new Error("expiresAt must be in the future");
   return Math.floor(ms);
