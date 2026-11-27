@@ -59,8 +59,19 @@ jobs:
             echo "::error::Cannot check for bench runs: the secrets CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_BENCH_READ_TOKEN are not available (missing, or a PR from a fork)."
             exit 1
           fi
-          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workflows"
-          get() { curl -fsS --retry 3 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$@"; }
+          account=$(printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | tr -d '[:space:]')
+          token=$(printf '%s' "$CLOUDFLARE_API_TOKEN" | tr -d '[:space:]')
+          api="https://api.cloudflare.com/client/v4/accounts/$account/workflows"
+          get() {
+            local body status
+            body=$(mktemp)
+            status=$(curl -sS --retry 3 -o "$body" -w '%{http_code}' -H "Authorization: Bearer $token" "$1")
+            if [ "$status" != "200" ]; then
+              echo "::error::Cloudflare API returned HTTP $status for ${1#https://api.cloudflare.com/client/v4/accounts/*/}: $(jq -c '.errors' "$body" 2>/dev/null || head -c 300 "$body"). Check CLOUDFLARE_ACCOUNT_ID (the 32-character account ID) and the token's Workers Scripts Read permission." >&2
+              exit 1
+            fi
+            cat "$body"
+          }
           # Every Workflow of the rhizome-bench Worker (LongMemEval, BEAM, ...).
           workflows=$(get "$api?per_page=100" | jq -r '.result[] | select(.script_name == "rhizome-bench") | .name')
           if [ -z "$workflows" ]; then
