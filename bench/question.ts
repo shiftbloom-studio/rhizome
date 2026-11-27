@@ -104,7 +104,7 @@ export function coveredTurns(index: SessionIndex, content: string): number[] {
 }
 
 /** Waits until embeddings and jobs are done, looking twice in a row so a finishing alarm can write its last rows. */
-async function waitIdle(memory: Memory, client: Client, timeoutMs: number) {
+export async function waitIdle(memory: Memory, client: Client, timeoutMs: number) {
   const until = Date.now() + timeoutMs;
   let quiet = 0;
   for (;;) {
@@ -148,7 +148,7 @@ export function partTurn(index: SessionIndex, part: string): number | undefined 
 }
 
 /** Maps recalled items to the sessions and turns they stand for. A note stands for the episodes it was extracted from. */
-function itemRefs(memory: Memory, client: Client, sessionOf: Map<string, string>, indexes: Map<string, SessionIndex>) {
+export function itemRefs(memory: Memory, client: Client, sessionOf: Map<string, string>, indexes: Map<string, SessionIndex>) {
   const noteSessions = new Map<string, string[]>();
   const chunkRef = (episodeId: string | null | undefined, content: string, parts?: string[]): ItemRef => {
     const session = episodeId ? sessionOf.get(episodeId) : undefined;

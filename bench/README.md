@@ -2,6 +2,8 @@
 
 `bench/` scores rhizome on [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (ICLR 2025): 500 questions about a person's past chats, each with its own history of about 50 sessions (roughly 115k tokens). The dataset marks the sessions and turns that hold each answer, so retrieval is scored from these labels, without an LLM judge.
 
+On Cloudflare it also runs [BEAM](#beam) (ICLR 2026): conversations of 100K to 10M tokens, judged against rubrics.
+
 Every question runs in a fresh `MemoryObject` on the Node stand-ins from `src/node/` (SQLite, files, exact vector search), with the same Workers AI models as the Worker. Its sessions are saved as episodes at their original dates, and the question is asked through the same `recall` an agent calls, dated to the day it was asked. Nothing touches a deployed rhizome or anyone's memory. The same questions also run on Cloudflare itself, with Durable Objects, Vectorize and Workers AI: see [On Cloudflare](#on-cloudflare).
 
 ## Run it
@@ -148,6 +150,27 @@ python3 src/evaluation/print_qa_metrics.py hypotheses.jsonl.eval-results-gpt-4o 
 `qa.jsonl` has every question's answer, verdict, the models OpenAI named and the tokens; `contexts.jsonl` has what the reader got. A full run of 500 questions with GPT-4o as reader and judge sends about 2 million tokens to OpenAI. The prompts and scores are checked against the upstream code in `test/bench-official.test.ts`; `bench/official-fixture.py` writes its fixture from an upstream checkout.
 
 A question gets three tries, each on a fresh memory; one that fails every time is recorded with its error, and the run goes on. Nothing is cached here, so every run pays for its own Workers AI calls. A question takes about three minutes without extraction, most of it waiting for Vectorize to make its vectors searchable, so all 500 questions take about three hours at the default concurrency of 8; more at a time (up to 32) shortens that. With extraction, the paid-model limit sets the pace: about 10 hours for 150 questions. Deploy before a run, not during one: a deploy resets the Durable Objects of the questions in progress, and they start over.
+
+### BEAM
+
+The Workflow `rhizome-bench-beam` in the same Worker runs [BEAM](https://github.com/mohammadtavakoli78/BEAM) (ICLR 2026, [arXiv 2510.27246](https://arxiv.org/abs/2510.27246)): 100 conversations between a user and an assistant in four tiers (20 of about 100K tokens, 35 of 500K, 35 of 1M, 10 of 10M), with 20 questions each, two for each of ten abilities (abstention, contradiction resolution, event ordering, information extraction, instruction following, knowledge update, multi-session reasoning, preference following, summarization, temporal reasoning). `bench/beam.ts` holds what it takes from BEAM's repository at commit `b2da22e`:
+
+1. The first run of a conversation copies it from that commit into the bucket (`data/beam/`): its questions, and its turns in parts of one batch each. Where BEAM cut a conversation to its tier (`chat_trunecated.json`), that file is used, as BEAM's own answer script does. Every turn (a user message, the reply, sometimes a follow-up) becomes one episode, dated at its batch's time anchor (08:00, five minutes per turn).
+2. A conversation gets one fresh memory: all its turns go in, the background work finishes (extraction and one reflection, if asked), and each question is recalled as the recall tool does for an agent (8 items in 4,000 tokens), a day after the last turn.
+3. With `reader`, the reader answers from that text with BEAM's RAG prompt (`answer_generation_for_rag` in `src/prompts.py`), at temperature 0; a reasoning reader gets `readerEffort` instead, as above.
+4. The judge (`judge`, default `gpt-4.1-mini`, BEAM's own) scores the answer against each item of the question's rubric with `unified_llm_judge_base_prompt` (1, 0.5 or 0), and the question scores their mean. Event-ordering questions score the normalised Kendall tau-b between the rubric's order and the answer's lines, after the judge aligns each line to a rubric item (`align_with_llm`), as `src/evaluation/report_results.py` reports them; a tau that is undefined counts as 0.
+5. `beam.md` and `beam.json` hold the mean per ability (per conversation, then over the conversations) and their mean over the ten abilities, which is how the paper reports a tier.
+
+Params: `tier` (`"100K"` default, `"500K"`, `"1M"`, `"10M"`), `conversations` (numbers in the tier, default all), `abilities`, `limit` (the first n conversations) and `judge`, plus `features`, `chunking`, `extraction`, `reflect`, `asOf`, `vars`, `paidRpm`, `reader`, `readerEffort`, `aiCache` and `embeddingCache` as above. `concurrency` counts conversations (default 4); each conversation answers and judges four questions at a time. The embedding cache is on by default only for 100K: a larger conversation's vectors do not fit one object well.
+
+```sh
+npx wrangler workflows trigger rhizome-bench-beam '{"conversations": [1], "reader": "gpt-6.1-terra", "extraction": true, "reflect": true}' --id beam-smoke
+npx wrangler r2 object get rhizome-bench/runs/beam-smoke/beam.md --remote --pipe
+```
+
+`runs/<id>/` then holds `config.json`, `conversations.jsonl` (ingest per conversation), `answers.jsonl` (every question's answer, verdict per rubric item, tokens, and how many of its evidence messages the reader's text covers), `contexts/` (what the reader got), and in `upstream/<tier>/<n>/` BEAM's own files: `rhizome.json` as `answer_generation.py` writes answers and `evaluation-results-rhizome.json` as `run_evaluation.py` writes verdicts, which `report_results.py` reads. The prompts and scores are checked against BEAM's code in `test/bench-beam.test.ts`; `bench/beam-fixture.py` writes its fixture from a BEAM checkout in `./BEAM`.
+
+A 100K conversation has about 95 turns; with extraction, the paid-model limit sets the pace (one or two calls per turn). The larger tiers scale with it: about 400 turns at 500K, 800 at 1M and 7,000 at 10M per conversation.
 
 ## On GitHub
 
