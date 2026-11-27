@@ -1,9 +1,9 @@
 name: Bench run guard
 
-# Fails a PR that touches the benchmark while a benchmark run is active on
-# Cloudflare. A deploy of the rhizome-bench Worker (its Workers Builds trigger
-# watches wrangler.bench.jsonc) resets the Durable Objects of a running run.
-# PRs that touch no benchmark file pass without calling Cloudflare.
+# Fails a PR into the bench branch, or a PR that touches benchmark files,
+# while a benchmark run is active on Cloudflare. A deploy of the rhizome-bench
+# Worker resets the Durable Objects of a running run. Other PRs pass without
+# calling Cloudflare.
 # Needs the repository secrets CLOUDFLARE_ACCOUNT_ID and
 # CLOUDFLARE_BENCH_READ_TOKEN (an API token with Workers Scripts Read).
 # When the run has ended, re-run this job on the PR.
@@ -31,8 +31,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
+          if [ "$BASE" = "bench" ]; then
+            echo "PR into the bench branch."
+            echo "bench=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           touched=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' \
             | grep -E '^(bench/|wrangler\.bench\.jsonc$)' || true)
           if [ -z "$touched" ]; then
