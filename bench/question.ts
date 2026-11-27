@@ -18,18 +18,7 @@ import { officialRetrieval } from "./official";
 export const SCOPE = "profile";
 
 /** Variables of the memory code a run may set over the Worker's vars. */
-export const MEMORY_VARS = [
-  "EMBEDDING_MODEL",
-  "RERANK_MODEL",
-  "EXTRACTION_MODEL",
-  "REFLECTION_MODEL",
-  "RECALL_FEATURES",
-  "CHUNKING",
-  "DISPUTE_RESOLUTION",
-  "DREAMING",
-  "DREAM_MODEL",
-  "DREAM_DAILY_LIMIT",
-] as const;
+export const MEMORY_VARS = ["EMBEDDING_MODEL", "RERANK_MODEL", "EXTRACTION_MODEL", "REFLECTION_MODEL", "RECALL_FEATURES", "CHUNKING", "DISPUTE_RESOLUTION"] as const;
 
 /** What a question needs of a memory: a store stub on Node, the Durable Object itself on Cloudflare. */
 export type Memory = Pick<MemoryObject, "addEpisode" | "stats" | "recall" | "detail" | "requestReflection">;

@@ -33,7 +33,7 @@ Run the same command with the same `--out` to continue a stopped run; finished q
 | Option | Effect |
 | --- | --- |
 | `--extraction` | Extracts notes from every session, as in production. Without it, recall searches the session chunks only. |
-| `--reflect` | Runs one nightly reflection per question after its sessions, before recall. Use it with `--extraction`; compare `--set DISPUTE_RESOLUTION=on` against `off` to measure dispute resolution. Each reflection can also call the reflection model once for the profile summary. With dreaming on (the default, `--set DREAMING=off` turns it off) the reflection is followed by one dreaming pass over all notes before recall (src/dreaming.ts): one call to `DREAM_MODEL` per neighbourhood of related notes, at most `DREAM_DAILY_LIMIT` (default 100) per question. The default model needs the Workers Paid plan and its 18 requests a minute; `--set DREAM_MODEL=@cf/mistralai/mistral-small-3.1-24b-instruct` uses the 300-a-minute limit instead. |
+| `--reflect` | Runs one nightly reflection per question after its sessions, before recall. Use it with `--extraction`; compare `--set DISPUTE_RESOLUTION=on` against `off` to measure dispute resolution. Each reflection can also call the reflection model once for the profile summary. |
 | `--features <list>` | Recall steps for every recall, or `none`. Default: `RECALL_FEATURES` from the Worker's vars in `wrangler.jsonc`, so a run measures what is deployed. |
 | `--chunking <mode>` | Episode chunking. Default: `CHUNKING` from the Worker's vars. |
 | `--set KEY=VALUE` | Any other variable for the memory code, e.g. `EMBEDDING_MODEL`. |
