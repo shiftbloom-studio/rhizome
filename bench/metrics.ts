@@ -171,7 +171,7 @@ export function summarize(all: ResultRecord[]): Summary {
   const ok = records.filter((r) => !r.error);
   const scored = ok.filter((r) => r.metrics);
   const byType: Summary["byType"] = {};
-  for (const type of [...new Set(scored.map((r) => r.type))].sort()) {
+  for (const type of [...new Set(scored.map((r) => r.type))].sort((a, b) => a.localeCompare(b))) {
     const rs = scored.filter((r) => r.type === type);
     byType[type] = { n: rs.length, metrics: averages(rs) };
   }
