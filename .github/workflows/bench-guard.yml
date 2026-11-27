@@ -1,0 +1,82 @@
+name: Bench run guard
+
+# Fails a PR into the bench branch, or a PR that touches benchmark files,
+# while a benchmark run is active on Cloudflare. A deploy of the rhizome-bench
+# Worker resets the Durable Objects of a running run. Other PRs pass without
+# calling Cloudflare.
+# Needs the repository secrets CLOUDFLARE_ACCOUNT_ID and
+# CLOUDFLARE_BENCH_READ_TOKEN (an API token with Workers Scripts Read).
+# When the run has ended, re-run this job on the PR.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: bench-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: No active bench run
+    runs-on: ${{ (github.event.repository.private || vars.CI_RUNNER_PUBLIC == 'true') && github.event.pull_request.head.repo.full_name == github.repository && vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Find benchmark files in the PR
+        id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$BASE" = "bench" ]; then
+            echo "PR into the bench branch."
+            echo "bench=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          touched=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' \
+            | grep -E '^(bench/|wrangler\.bench\.jsonc$)' || true)
+          if [ -z "$touched" ]; then
+            echo "No benchmark files changed."
+            echo "bench=false" >> "$GITHUB_OUTPUT"
+          else
+            printf 'Benchmark files changed:\n%s\n' "$touched"
+            echo "bench=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check for active runs
+        if: steps.files.outputs.bench == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_BENCH_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] || [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Cannot check for bench runs: the secrets CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_BENCH_READ_TOKEN are not available (missing, or a PR from a fork)."
+            exit 1
+          fi
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workflows"
+          get() { curl -fsS --retry 3 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$@"; }
+          # Every Workflow of the rhizome-bench Worker (LongMemEval, BEAM, ...).
+          workflows=$(get "$api?per_page=100" | jq -r '.result[] | select(.script_name == "rhizome-bench") | .name')
+          if [ -z "$workflows" ]; then
+            echo "::error::Found no Workflows of the rhizome-bench Worker; check the token's permissions."
+            exit 1
+          fi
+          active=""
+          for wf in $workflows; do
+            for status in queued running waiting paused waitingForPause; do
+              ids=$(get "$api/$wf/instances?status=$status&per_page=100" | jq -r '.result[].id')
+              for id in $ids; do active+="$wf/$id ($status)"$'\n'; done
+            done
+          done
+          if [ -n "$active" ]; then
+            printf 'Active bench runs:\n%s' "$active"
+            echo "::error::A bench run is active. Merging would redeploy rhizome-bench and reset it. Re-run this job once the run has ended."
+            exit 1
+          fi
+          echo "No active bench run."
