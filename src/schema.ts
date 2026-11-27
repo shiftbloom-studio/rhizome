@@ -303,4 +303,53 @@ export const MIGRATIONS: string[] = [
   CREATE INDEX order_strikes_order ON order_strikes (order_id, at);
   CREATE INDEX order_strikes_time ON order_strikes (at);
   `,
+  // 11: records (src/records.ts). One typed row per note: what kind of thing it is about
+  // (category, broader tags), how much and when, so recall and agents can list, count and
+  // sum every note of a kind. The note stays the source of truth: when it is deleted or its
+  // text changes, its record goes and the note is filed again. type 'none' marks a note the
+  // model could not file, so it is not asked again until the note changes.
+  `
+  CREATE TABLE records (
+    item_id     TEXT PRIMARY KEY,
+    type        TEXT NOT NULL,             -- event | state | preference | other | none
+    category    TEXT NOT NULL,
+    tags        TEXT NOT NULL DEFAULT '',  -- broader labels, joined by " | " (also in record_tags)
+    quantity    REAL,
+    unit        TEXT,
+    occurred_at INTEGER,                   -- when it happened or became true, if the note says
+    model       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+  );
+  CREATE INDEX records_category ON records (category, occurred_at);
+
+  -- The broader labels of each record, for lookups by label.
+  CREATE TABLE record_tags (
+    label   TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    PRIMARY KEY (label, item_id)
+  ) WITHOUT ROWID;
+  CREATE INDEX record_tags_item ON record_tags (item_id);
+  CREATE TRIGGER records_tags_ad AFTER DELETE ON records BEGIN
+    DELETE FROM record_tags WHERE item_id = old.item_id;
+  END;
+
+  -- Labels (categories and tags) with their embeddings, matched against the query.
+  CREATE TABLE record_labels (
+    label TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    vec   BLOB NOT NULL
+  ) WITHOUT ROWID;
+
+  CREATE TRIGGER items_records_ad AFTER DELETE ON items BEGIN
+    DELETE FROM records WHERE item_id = old.id;
+  END;
+  CREATE TRIGGER items_records_au AFTER UPDATE OF content ON items BEGIN
+    DELETE FROM records WHERE item_id = new.id;
+  END;
+
+  -- Existing memory: write every vector again (stored embeddings, no model calls) so it
+  -- carries the event day, and file every note.
+  INSERT INTO outbox (op, item_id, created_at) SELECT 'upsert', id, 0 FROM items;
+  INSERT INTO jobs (kind, ref, not_before, created_at) SELECT 'type', 'all', 0, 0 WHERE EXISTS (SELECT 1 FROM items WHERE kind = 'note');
+  `,
 ];

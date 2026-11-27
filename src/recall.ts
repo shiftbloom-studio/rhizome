@@ -17,8 +17,10 @@ import { chunk, estimateTokens, trimChars } from "./text";
  * - keys: excerpts are also found through the facts extracted from them.
  * - turns: conversations come back as turn cards: the turns of the best
  *   conversations are scored one by one and the best of them fill the budget.
+ * - records: when the query asks for a kind of thing ("how many weddings"), every note
+ *   filed under it (src/records.ts) comes along as a list, not only the most similar ones.
  */
-export const RECALL_FEATURES = ["abstain", "diversity", "evidence", "time", "keys", "turns"] as const;
+export const RECALL_FEATURES = ["abstain", "diversity", "evidence", "time", "keys", "turns", "records"] as const;
 export type RecallFeature = (typeof RECALL_FEATURES)[number];
 
 /**

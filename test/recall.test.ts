@@ -42,10 +42,10 @@ describe("recall helpers", () => {
 
   it("parses feature lists", () => {
     expect([...parseFeatures("abstain, diversity,unknown")]).toEqual(["abstain", "diversity"]);
-    expect(parseFeatures("all").size).toBe(6);
+    expect(parseFeatures("all").size).toBe(7);
     // Unset means every step; "none" or an empty list turns them all off.
-    expect(parseFeatures(undefined).size).toBe(6);
-    expect(parseFeatures(null).size).toBe(6);
+    expect(parseFeatures(undefined).size).toBe(7);
+    expect(parseFeatures(null).size).toBe(7);
     expect(parseFeatures("none").size).toBe(0);
     expect(parseFeatures("").size).toBe(0);
     expect(parseFeatures([]).size).toBe(0);

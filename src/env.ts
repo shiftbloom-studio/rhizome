@@ -8,7 +8,7 @@ export interface Env {
   CONTROL_DB: D1Database;
   /** Raw episodes, verbatim. The lossless source every derived index can be rebuilt from. */
   EPISODES: R2Bucket;
-  /** Semantic index. Namespace = user id, metadata `scope` and `kind` are indexed. */
+  /** Semantic index. Namespace = user id, metadata `scope` and `kind` are indexed, and `day` (event day) for VECTOR_FILTERS. */
   VECTORS: VectorizeIndex;
   AI: Ai;
   /** Optional per-key rate limiter. */
@@ -63,11 +63,25 @@ export interface Env {
   POSTHOG_HOST?: string;
   /** "on": open loops. Agents can open a loop with a due time, get_context leads with what is due, close_loop ends it. Default: on (unset follows the PostHog flag, src/flags.ts); "off" turns it off. */
   OPEN_LOOPS?: string;
+  /**
+   * "on": records (src/records.ts). Every note is filed into a typed row (category, tags, quantity,
+   * date) by RECORDS_MODEL; the recall step "records" then adds every note of the kind a query asks
+   * for, and the query_records tool lists, counts and sums them. Default: on (unset follows the
+   * PostHog flag, src/flags.ts); "off" turns it off.
+   */
+  RECORDS?: string;
+  /** Model that files notes into records. Default: Llama 4 Scout on Workers AI. */
+  RECORDS_MODEL?: string;
+  /**
+   * "on": recall inside a time window also asks Vectorize with a range filter on the event day.
+   * Needs a number metadata index `day` on the index (see README). Default: off.
+   */
+  VECTOR_FILTERS?: string;
   /** "off" disables fact extraction from episodes. */
   EXTRACTION?: string;
   /** "on" turns on standing orders: rules checked against agents' tool calls (src/orders.ts). Default: on (unset follows the PostHog flag, src/flags.ts); "off" turns it off. */
   STANDING_ORDERS?: string;
-  /** Recall steps, comma separated: abstain, diversity, evidence, time, keys, turns, "all" or "none". Default: all. */
+  /** Recall steps, comma separated: abstain, diversity, evidence, time, keys, turns, records, "all" or "none". Default: all. */
   RECALL_FEATURES?: string;
   /** How conversations are cut for search: "fixed" (1,200 characters, default) or "rounds" (one question and its answers). */
   CHUNKING?: string;
