@@ -37,6 +37,20 @@ import {
 } from "./recall";
 import { parseTimeWindow } from "./timewindow";
 import {
+  DEFAULT_DREAM_MODEL,
+  DREAM_DAILY_LIMIT,
+  DREAM_GROUP,
+  DREAM_GROUPS_PER_RUN,
+  DREAM_IDLE_MS,
+  DREAM_NEIGHBOUR,
+  DREAM_PROMPT,
+  dreamInput,
+  planDream,
+  planSize,
+  type DreamNote,
+  type DreamPlan,
+} from "./dreaming";
+import {
   DEFAULT_EXTRACTION_MODEL,
   DEFAULT_REFLECTION_MODEL,
   DISPUTE_PROMPT,
@@ -274,6 +288,21 @@ function recallCondition(t: string, window?: { from: number; to: number }, asOf?
   return { sql: parts.join(" AND "), args };
 }
 const SYSTEM_REFLECTION = "system:reflection";
+const SYSTEM_DREAMING = "system:dreaming";
+/** Seeds looked at per dreaming run, including ones with no close neighbours (no model call). */
+const DREAM_SEEDS_PER_RUN = 300;
+/** Ids remembered as already looked at in the current pass, so a neighbourhood is not sent twice. */
+const DREAM_VISITED = 20_000;
+
+/** Where the dreaming pass is: cursor over notes (created_at, id) and what it has seen this pass. */
+interface DreamState {
+  at: number;
+  id: string;
+  visited: string[];
+  passes: number;
+  /** When the last full pass ended. */
+  doneAt?: number;
+}
 
 export class MemoryObject extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -339,7 +368,7 @@ export class MemoryObject extends DurableObject<Env> {
     if (current === null || current > at) await this.ctx.storage.setAlarm(at);
   }
 
-  private enqueue(kind: "extract" | "reflect", ref: string, delayMs = 0): void {
+  private enqueue(kind: "extract" | "reflect" | "dream", ref: string, delayMs = 0): void {
     const now = Date.now();
     this.sql.exec("INSERT INTO jobs (kind, ref, not_before, created_at) VALUES (?, ?, ?, ?)", kind, ref, now + delayMs, now);
   }
@@ -1109,6 +1138,8 @@ export class MemoryObject extends DurableObject<Env> {
       for (const ep of sources) {
         this.sql.exec("DELETE FROM chunk_keys WHERE rowid IN (SELECT rowid FROM items WHERE episode_id = ? AND kind = 'chunk')", ep);
       }
+      // Rollups quote the note: they go with it, including earlier versions.
+      this.dropRollupsOf(id, now);
       this.dropDerived(id);
       // Anything that pointed at the forgotten item as its newer version becomes current again.
       this.sql.exec("UPDATE items SET status = 'active', superseded_by = NULL, valid_to = NULL, expired_at = NULL WHERE superseded_by = ?", id);
@@ -1859,6 +1890,7 @@ export class MemoryObject extends DurableObject<Env> {
     if (!userId) return;
     const outboxLeft = await this.drainOutbox(userId);
     if (outboxLeft === "retry") return;
+    this.wakeDream();
 
     const due = this.sql
       .exec("SELECT seq, kind, ref, attempts FROM jobs WHERE attempts < ? AND not_before <= ? ORDER BY seq LIMIT ?", MAX_JOB_ATTEMPTS, Date.now(), JOBS_PER_ALARM)
@@ -1866,7 +1898,8 @@ export class MemoryObject extends DurableObject<Env> {
     for (const job of due) {
       try {
         if (job.kind === "extract") await this.extract(String(job.ref));
-        else if (job.kind === "reflect") await this.reflect(String(job.ref).startsWith("at:") ? Number(String(job.ref).slice(3)) : Date.now());
+        else if (job.kind === "reflect") await this.reflect(String(job.ref).startsWith("at:") ? Number(String(job.ref).slice(3)) : Date.now(), String(job.ref));
+        else if (job.kind === "dream") await this.dream(String(job.ref));
         this.sql.exec("DELETE FROM jobs WHERE seq = ?", job.seq);
       } catch (err) {
         const attempts = Number(job.attempts) + 1;
@@ -1886,8 +1919,10 @@ export class MemoryObject extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now() + 100);
       return;
     }
+    const wake = this.scheduleIdleDream();
     const next = this.sql.exec("SELECT MIN(not_before) AS t FROM jobs WHERE attempts < ?", MAX_JOB_ATTEMPTS).toArray()[0]?.t;
-    if (next !== null && next !== undefined) await this.ctx.storage.setAlarm(Math.max(Number(next), Date.now() + 100));
+    const at = Math.min(next === null || next === undefined ? Infinity : Number(next), wake ?? Infinity);
+    if (Number.isFinite(at)) await this.ctx.storage.setAlarm(Math.max(at, Date.now() + 100));
   }
 
   /** Writes pending items to Vectorize, reusing stored embeddings. Returns "retry" when it backed off. */
@@ -2453,7 +2488,7 @@ export class MemoryObject extends DurableObject<Env> {
    * archiving of stale chunks, merging of duplicates the day produced, and a
    * rewrite of the distilled profile and project summaries when their notes changed.
    */
-  private async reflect(now = Date.now()): Promise<void> {
+  private async reflect(now = Date.now(), ref = "all"): Promise<void> {
     const since = Number(this.meta("last_reflection_at") ?? 0);
     const report: Record<string, unknown> = {};
 
@@ -2570,6 +2605,16 @@ export class MemoryObject extends DurableObject<Env> {
 
     this.setMeta("last_reflection_at", String(now));
     this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'reflect', ?)", now, SYSTEM_REFLECTION, JSON.stringify(report));
+
+    // 6. dreaming: a new pass over all notes once the last one is done (src/dreaming.ts).
+    // A replayed history (ref "at:...") dreams right away and as of the same time.
+    // Otherwise it waits until the person has been away a while (wakeDream).
+    if (this.dreamingOn && this.extractionEnabled && !this.dreamPending()) {
+      const state = this.dreamState();
+      if (state.doneAt !== undefined) this.saveDreamState({ at: 0, id: "", visited: [], passes: state.passes });
+      if (ref.startsWith("at:")) this.enqueue("dream", ref);
+      else this.setMeta("dream_wake", String(Date.now() + DREAM_IDLE_MS));
+    }
   }
 
   /**
@@ -2727,6 +2772,305 @@ export class MemoryObject extends DurableObject<Env> {
       });
     }
     return tagged;
+  }
+
+  // -------------------------------------------------------------- dreaming
+
+  private get dreamingOn(): boolean {
+    return this.flagEnv().DREAMING === "on";
+  }
+
+  private dreamPending(): boolean {
+    return !!this.sql.exec("SELECT 1 FROM jobs WHERE kind = 'dream' AND attempts < ? LIMIT 1", MAX_JOB_ATTEMPTS).toArray()[0];
+  }
+
+  private dreamState(): DreamState {
+    try {
+      const s = JSON.parse(this.meta("dream_state") ?? "null") as DreamState | null;
+      if (s && typeof s.at === "number" && typeof s.id === "string" && Array.isArray(s.visited)) return s;
+    } catch {
+      // a broken state starts a new pass
+    }
+    return { at: 0, id: "", visited: [], passes: 0 };
+  }
+
+  private saveDreamState(s: DreamState): void {
+    this.setMeta("dream_state", JSON.stringify({ ...s, visited: s.visited.slice(-DREAM_VISITED) }));
+  }
+
+  /** One model call of the day's dreaming budget (DREAM_DAILY_LIMIT, default 100). False when it is spent. */
+  private takeDreamBudget(): boolean {
+    const limit = Number(this.env.DREAM_DAILY_LIMIT ?? DREAM_DAILY_LIMIT);
+    const day = new Date(Date.now()).toISOString().slice(0, 10);
+    const [d, n] = (this.meta("dream_budget") ?? "").split("|");
+    const used = d === day ? Number(n) || 0 : 0;
+    if (Number.isFinite(limit) && used >= limit) return false;
+    this.setMeta("dream_budget", `${day}|${used + 1}`);
+    return true;
+  }
+
+  private dreamBudgetLeft(): boolean {
+    const limit = Number(this.env.DREAM_DAILY_LIMIT ?? DREAM_DAILY_LIMIT);
+    const [d, n] = (this.meta("dream_budget") ?? "").split("|");
+    return !Number.isFinite(limit) || d !== new Date(Date.now()).toISOString().slice(0, 10) || (Number(n) || 0) < limit;
+  }
+
+  /**
+   * After background work settles: dream once the person has been away a while,
+   * while today's budget lasts and the current pass is not done (or new notes came
+   * in since it ended). The nightly reflection also starts a pass. Returns when the
+   * alarm should look again. A wake time, not a job, so waiting for it does not
+   * count as pending work.
+   */
+  private scheduleIdleDream(): number | null {
+    if (!this.dreamingOn || !this.extractionEnabled || this.dreamPending() || !this.dreamBudgetLeft()) return null;
+    const s = this.dreamState();
+    if (s.doneAt !== undefined) {
+      const fresh = this.sql
+        .exec("SELECT 1 FROM items WHERE kind = 'note' AND status = 'active' AND origin != 'reflection' AND created_at > ? LIMIT 1", s.doneAt)
+        .toArray()[0];
+      if (!fresh) return null;
+    }
+    const at = Math.max(this.lastActivity() + DREAM_IDLE_MS, Date.now() + 1_000);
+    this.setMeta("dream_wake", String(at));
+    return at;
+  }
+
+  /** Turns a due idle wake into a dream job (run by the same alarm). */
+  private wakeDream(): void {
+    const at = Number(this.meta("dream_wake") ?? 0);
+    if (!at || at > Date.now()) return;
+    this.sql.exec("DELETE FROM meta WHERE key = 'dream_wake'");
+    if (!this.dreamingOn || this.dreamPending()) return;
+    const s = this.dreamState();
+    if (s.doneAt !== undefined) this.saveDreamState({ at: 0, id: "", visited: [], passes: s.passes });
+    this.enqueue("dream", "idle");
+  }
+
+  /** When the person (or an agent) last wrote or recalled, from the stored rows. */
+  private lastActivity(): number {
+    const r = this.sql
+      .exec("SELECT MAX(created_at) AS c, MAX(last_accessed) AS a FROM items WHERE client_id NOT LIKE 'system:%'")
+      .toArray()[0];
+    return Math.max(Number(r?.c ?? 0), Number(r?.a ?? 0));
+  }
+
+  /**
+   * Dreaming (src/dreaming.ts): walks every active note in order, one
+   * neighbourhood of related notes at a time, and lets a cheap model tidy it up.
+   * Runs DREAM_GROUPS_PER_RUN model calls, then comes back until the pass is done
+   * or the day's budget is spent. "idle" waits until nothing happened for
+   * DREAM_IDLE_MS; "at:<ms>" (a replayed history) runs at once, as of that time.
+   */
+  private async dream(ref: string): Promise<void> {
+    if (!this.dreamingOn || !this.extractionEnabled) return;
+    const replay = ref.startsWith("at:");
+    const now = replay ? Number(ref.slice(3)) : Date.now();
+    // Someone is using memory right now: look again once they have been away a while.
+    if (!replay && Date.now() - this.lastActivity() < DREAM_IDLE_MS) {
+      this.setMeta("dream_wake", String(this.lastActivity() + DREAM_IDLE_MS));
+      return;
+    }
+    const model = this.env.DREAM_MODEL ?? this.env.EXTRACTION_MODEL ?? DEFAULT_DREAM_MODEL;
+    const state = this.dreamState();
+    const visited = new Set(state.visited);
+    const pools = new Map<string, { id: string; vec: Float32Array }[]>();
+    const report = { groups: 0, seeds: 0, merged: 0, superseded: 0, rewritten: 0, kinds: 0, rollups: 0, rejected: 0, failed: 0, budget: false, done: false };
+    let calls = 0;
+    while (calls < DREAM_GROUPS_PER_RUN && report.seeds < DREAM_SEEDS_PER_RUN) {
+      // Next note in the walk. Rollups are not seeds: they come along as neighbours.
+      const seed = this.sql
+        .exec(
+          `SELECT i.id, i.scope, i.created_at, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id AND e.model = ?
+           WHERE i.kind = 'note' AND i.status = 'active' AND (i.created_at > ?2 OR (i.created_at = ?2 AND i.id > ?3))
+             AND NOT EXISTS (SELECT 1 FROM links l WHERE l.src = i.id AND l.kind = 'rolls_up')
+           ORDER BY i.created_at, i.id LIMIT 1`,
+          this.embeddingModel,
+          state.at,
+          state.id,
+        )
+        .toArray()[0];
+      if (!seed) {
+        report.done = true;
+        break;
+      }
+      report.seeds++;
+      const seedId = String(seed.id);
+      const scope = String(seed.scope);
+      let near: { item: { id: string }; similarity: number }[] = [];
+      if (!visited.has(seedId)) {
+        let pool = pools.get(scope);
+        if (!pool) pools.set(scope, (pool = this.dreamPool(scope)));
+        // Neighbours may have been seen in an earlier group: an update can sit in two topics.
+        near = nearest(decodeVector(seed.vec as ArrayBuffer), pool.filter((c) => c.id !== seedId), DREAM_GROUP - 1, DREAM_NEIGHBOUR);
+      }
+      // Out of budget: the cursor stays before this seed, so the walk goes on from here next time.
+      if (near.length && !this.takeDreamBudget()) {
+        report.budget = true;
+        break;
+      }
+      state.at = Number(seed.created_at);
+      state.id = seedId;
+      visited.add(seedId);
+      // A note with nothing close to it has nothing to merge, replace or roll up.
+      if (near.length === 0) continue;
+      calls++;
+      const group = this.dreamGroup([seedId, ...near.map((n) => n.item.id)]);
+      for (const n of group) if (!n.rollupOf) visited.add(n.id);
+      let plan: DreamPlan;
+      try {
+        plan = await this.generateJson(model, DREAM_PROMPT, dreamInput(group), (r) => planDream(r, group), 2000, { reasoning_effort: "none" });
+      } catch (err) {
+        report.failed++;
+        console.error("dreaming failed", String(err));
+        continue;
+      }
+      report.groups++;
+      report.rejected += plan.rejected.length;
+      if (planSize(plan) === 0) continue;
+      const done = this.applyDream(plan, scope, model, now);
+      report.merged += done.merged;
+      report.superseded += done.superseded;
+      report.rewritten += done.rewritten;
+      report.kinds += done.kinds;
+      report.rollups += done.rollups;
+      pools.delete(scope);
+      if (plan.rejected.length) {
+        this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'dream.rejected', ?)", now, SYSTEM_DREAMING, JSON.stringify(plan.rejected.slice(0, 20)));
+      }
+    }
+    if (report.done) {
+      // Wall-clock time, compared with created_at to see whether new notes came in since.
+      state.doneAt = Date.now();
+      state.passes++;
+      state.visited = [];
+    } else state.visited = [...visited];
+    this.saveDreamState(state);
+    if (report.seeds) this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'dream', ?)", now, SYSTEM_DREAMING, JSON.stringify(report));
+    if (!report.done && !report.budget) this.enqueue("dream", ref, replay ? 0 : 1_000);
+  }
+
+  /** Active notes of a scope with their embeddings, for neighbourhoods. */
+  private dreamPool(scope: string): { id: string; vec: Float32Array }[] {
+    return this.sql
+      .exec(
+        `SELECT i.id, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id AND e.model = ?
+         WHERE i.kind = 'note' AND i.status = 'active' AND i.scope = ? ORDER BY i.importance DESC LIMIT ?`,
+        this.embeddingModel,
+        scope,
+        MAX_CANDIDATES,
+      )
+      .toArray()
+      .map((r) => ({ id: String(r.id), vec: decodeVector(r.vec as ArrayBuffer) }));
+  }
+
+  private isActive(id: string): boolean {
+    return this.sql.exec("SELECT status FROM items WHERE id = ?", id).toArray()[0]?.status === "active";
+  }
+
+  /** Notes of a neighbourhood, as the dreaming model and its guards see them. */
+  private dreamGroup(ids: string[]): DreamNote[] {
+    const rows = this.sql
+      .exec(
+        `SELECT i.id, i.content, i.note_kind, i.trust, i.t_event, e.vec FROM items i JOIN embeddings e ON e.item_id = i.id
+         WHERE i.id IN (SELECT value FROM json_each(?))`,
+        JSON.stringify(ids),
+      )
+      .toArray();
+    const byId = new Map(rows.map((r) => [String(r.id), r]));
+    return ids.flatMap((id) => {
+      const r = byId.get(id);
+      if (!r) return [];
+      const of = this.sql.exec("SELECT dst FROM links WHERE src = ? AND kind = 'rolls_up'", id).toArray().map((l) => String(l.dst));
+      return [{
+        id, content: String(r.content), kind: String(r.note_kind ?? "note"), trust: String(r.trust), t: Number(r.t_event),
+        vec: decodeVector(r.vec as ArrayBuffer), ...(of.length ? { rollupOf: of } : {}),
+      }];
+    });
+  }
+
+  /** Applies a checked dreaming plan in one transaction, with an audit row per change (what it was before). */
+  private applyDream(plan: DreamPlan, scope: string, model: string, now: number) {
+    const done = { merged: 0, superseded: 0, rewritten: 0, kinds: 0, rollups: 0 };
+    const log = (action: string, detail: unknown) =>
+      this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, ?, ?)", now, SYSTEM_DREAMING, action, JSON.stringify(detail));
+    this.ctx.storage.transactionSync(() => {
+      for (const m of plan.merge) {
+        for (const loser of m.drop) {
+          if (!this.isActive(m.keep) || !this.isActive(loser)) continue;
+          this.merge(m.keep, loser, now);
+          log("dream.merge", { keep: m.keep, drop: loser });
+          done.merged++;
+        }
+      }
+      for (const s of plan.supersede) {
+        if (!this.isActive(s.old) || !this.isActive(s.new)) continue;
+        this.supersede(s.old, s.new, now);
+        log("dream.supersede", { old: s.old, new: s.new });
+        done.superseded++;
+      }
+      for (const w of plan.rewrite) {
+        const before = this.sql.exec("SELECT content FROM items WHERE id = ? AND status = 'active'", w.id).toArray()[0];
+        if (!before) continue;
+        this.sql.exec("UPDATE items SET content = ?, updated_at = ? WHERE id = ?", w.content, now, w.id);
+        // New wording, new embedding: the outbox embeds it again and updates the index.
+        this.sql.exec("DELETE FROM embeddings WHERE item_id = ?", w.id);
+        this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", w.id, now);
+        this.refreshFactKeys(w.id);
+        log("dream.rewrite", { id: w.id, before: String(before.content) });
+        done.rewritten++;
+      }
+      for (const k of plan.kind) {
+        const before = this.sql.exec("SELECT note_kind FROM items WHERE id = ? AND status = 'active'", k.id).toArray()[0];
+        if (!before) continue;
+        this.sql.exec("UPDATE items SET note_kind = ?, updated_at = ? WHERE id = ?", k.kind, now, k.id);
+        log("dream.kind", { id: k.id, before: before.note_kind, after: k.kind });
+        done.kinds++;
+      }
+      for (const u of plan.rollups) {
+        // Members merged or replaced a moment ago are listed by their current version.
+        const members = [...new Set(u.members.map((id) => this.currentVersion(id)))].filter((id) => this.isActive(id));
+        if (members.length < 2) continue;
+        // An earlier rollup over mostly the same notes is replaced, even when it was not in the group.
+        const replaces = new Set(u.replaces.filter((id) => this.isActive(id)));
+        for (const r of this.sql
+          .exec(
+            `SELECT l.src AS id, COUNT(*) AS shared FROM links l JOIN items i ON i.id = l.src AND i.status = 'active'
+             WHERE l.kind = 'rolls_up' AND l.dst IN (SELECT value FROM json_each(?)) GROUP BY l.src`,
+            JSON.stringify(members),
+          )
+          .toArray()) {
+          const size = Number(this.sql.exec("SELECT COUNT(*) AS n FROM links WHERE src = ? AND kind = 'rolls_up'", r.id).toArray()[0]?.n ?? 0);
+          if (Number(r.shared) * 2 >= Math.min(size, members.length)) replaces.add(String(r.id));
+        }
+        const id = newId();
+        this.sql.exec(
+          `INSERT INTO items (id, kind, episode_id, scope, content, note_kind, trust, client_id, agent, provider, model, t_event, created_at,
+                              origin, importance, updated_at)
+           VALUES (?, 'note', NULL, ?, ?, 'fact', 'agent_inference', ?, 'rhizome', 'dreaming', ?, ?, ?, 'reflection', ?, ?)`,
+          id, scope, u.content, SYSTEM_DREAMING, model, u.t, Date.now(),
+          importance({ trust: "agent_inference", kind: "note", confirmations: members.length, accessCount: 0, lastTouched: u.t }, now),
+          now,
+        );
+        this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('upsert', ?, ?)", id, now);
+        for (const m of members) this.link(id, m, "rolls_up", 1, now);
+        for (const old of replaces) this.supersede(old, id, now, false);
+        log("dream.rollup", { id, members, replaces: [...replaces] });
+        done.rollups++;
+      }
+    });
+    return done;
+  }
+
+  /** Deletes the rollups that list a note (they quote it); older rollups they replaced become current again. */
+  private dropRollupsOf(noteId: string, now: number): void {
+    const rollups = this.sql.exec("SELECT src FROM links WHERE dst = ? AND kind = 'rolls_up'", noteId).toArray().map((r) => String(r.src));
+    for (const r of rollups) {
+      this.sql.exec("UPDATE items SET status = 'active', superseded_by = NULL, valid_to = NULL, expired_at = NULL WHERE superseded_by = ?", r);
+      this.dropDerived(r);
+      this.sql.exec("DELETE FROM items WHERE id = ?", r);
+      this.sql.exec("INSERT INTO outbox (op, item_id, created_at) VALUES ('delete', ?, ?)", r, now);
+    }
   }
 
   private meta(key: string): string | null {
