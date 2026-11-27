@@ -182,7 +182,23 @@ describe("MemoryObject records", () => {
     const first = await mo.queryRecords(claude, { scopes: ["profile"], category: "bike repair", limit: 1 });
     expect([first.total, first.rows.length]).toEqual([3, 1]);
     const none = await mo.queryRecords(claude, { scopes: ["profile"], category: "concert" });
-    expect(none).toEqual({ labels: ["concert"], rows: [], total: 0 });
+    expect(none).toEqual({ labels: [], rows: [], total: 0 });
+  });
+
+  it("keeps a conversation that read one wall out of another wall's records", async () => {
+    await mo.addNote(claude, { scope: "project:acme", content: "The team paid $85 for a bike repair on 2023-07-15.", kind: "fact" });
+    await mo.addNote(claude, { scope: "project:globex", content: "The team paid $40 for a bike repair on 2023-09-01.", kind: "fact" });
+    await settle(mo);
+    mo.setWall(claude, "acme", ["project:acme"]);
+    mo.setWall(claude, "globex", ["project:globex"]);
+    const track = { conversation: "sess-a" };
+    const acme = await mo.queryRecords(claude, { scopes: ["project:acme"], named: ["project:acme"], category: "bike repair", track });
+    expect(acme.total).toBe(1);
+    const globex = await mo.queryRecords(claude, { scopes: ["project:globex"], named: ["project:globex"], category: "bike repair", track });
+    expect([globex.total, globex.labels]).toEqual([0, []]);
+    expect(globex.notices?.[0]).toContain("Not searched: project:globex");
+    // A new conversation is served.
+    expect((await mo.queryRecords(claude, { scopes: ["project:globex"], named: ["project:globex"], category: "bike repair", track: { conversation: "sess-b" } })).total).toBe(1);
   });
 
   it("offers query_records over MCP only with RECORDS on, and sums with the rows behind it", async () => {

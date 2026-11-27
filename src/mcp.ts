@@ -54,8 +54,8 @@ export interface MemoryApi {
   /** Records (RECORDS=on, src/records.ts). */
   queryRecords?(
     client: Client,
-    input: { scopes: string[]; named?: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number },
-  ): Promise<{ labels: string[]; rows: RecordRow[]; total: number }>;
+    input: { scopes: string[]; named?: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number; track?: Tracked },
+  ): Promise<{ labels: string[]; rows: RecordRow[]; total: number; notices?: string[] }>;
 }
 
 /** Server options that change what the MCP server offers. */
@@ -357,6 +357,7 @@ export const RECORD_TOOLS = [
         from: { type: "string", description: "Optional: only things from this date on (ISO 8601)." },
         to: { type: "string", description: "Optional: only things up to this date (ISO 8601; a date includes that whole day)." },
         project: projectProp,
+        conversation: conversationProp,
         limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
       },
       additionalProperties: false,
@@ -650,7 +651,7 @@ async function recordsTool(memory: MemoryApi, client: Client, args: Record<strin
   // Every row counts for count and sum; limit only shortens the list shown.
   // Walled projects are only searched when the call names them, as in recall.
   const named = proj ? [`project:${proj}`] : [];
-  const res = await memory.queryRecords!(client, { scopes, named, category, query, type, from, to, limit: 500 });
+  const res = await memory.queryRecords!(client, { scopes, named, category, query, type, from, to, limit: 500, track: track(args) });
   const capped = res.total > res.rows.length ? ` Only the first ${res.rows.length} of ${res.total} rows are summed; narrow it with type, from or to.` : "";
   const result = aggregate(res.rows, op);
   const shown = res.rows.slice(0, limit);
@@ -663,7 +664,8 @@ async function recordsTool(memory: MemoryApi, client: Client, args: Record<strin
       : op === "latest" ? `Latest (${what}): ${(result.latest as string | null) ?? "none"}.${capped.replace("summed", "searched")}`
         : `${res.total} records (${what})${res.total > shown.length ? `, ${shown.length} shown` : ""}, oldest first.`;
   const body = shown.length ? `\n${shown.map(recordLine).join("\n")}` : "";
-  return text(summary + body, { labels: res.labels, total: res.total, ...result, rows: shown.map(recordOut) });
+  const notes = res.notices?.length ? `\n\n${res.notices.join("\n")}` : "";
+  return text(summary + body + notes, { labels: res.labels, total: res.total, ...result, rows: shown.map(recordOut), ...(res.notices?.length ? { notices: res.notices } : {}) });
 }
 
 async function loopTool(memory: MemoryApi, client: Client, name: "open_loop" | "close_loop", args: Record<string, unknown>): Promise<ToolResult> {

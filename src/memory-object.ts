@@ -2017,7 +2017,8 @@ export class MemoryObject extends DurableObject<Env> {
   /** Writes pending items to Vectorize, reusing stored embeddings. Returns "retry" when it backed off. */
   private async drainOutbox(userId: string): Promise<"ok" | "retry"> {
     const batch = this.sql
-      .exec("SELECT seq, op, item_id, attempts FROM outbox WHERE attempts < 8 ORDER BY seq LIMIT ?", OUTBOX_BATCH)
+      // Backfill rows (created_at 0, from migration 11) go after anything written since.
+      .exec("SELECT seq, op, item_id, attempts FROM outbox WHERE attempts < 8 ORDER BY (created_at = 0), seq LIMIT ?", OUTBOX_BATCH)
       .toArray();
     if (batch.length === 0) return "ok";
     const model = this.embeddingModel;
@@ -2589,7 +2590,7 @@ export class MemoryObject extends DurableObject<Env> {
     this.sql.exec("DELETE FROM records WHERE model LIKE '%#failed' AND created_at < ?", Date.now() - DAY_MS);
     const notes = this.sql
       .exec(
-        `SELECT i.id, i.content, COALESCE(i.valid_from, i.t_event) AS at FROM items i
+        `SELECT i.id, i.scope, i.content, COALESCE(i.valid_from, i.t_event) AS at FROM items i
          WHERE i.kind = 'note' AND i.status IN ${RECALLABLE}
            AND NOT EXISTS (SELECT 1 FROM records r WHERE r.item_id = i.id)
            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.src = i.id AND l.kind = 'rolls_up')
@@ -2597,29 +2598,48 @@ export class MemoryObject extends DurableObject<Env> {
         RECORDS_BATCH * RECORDS_PARALLEL,
       )
       .toArray()
-      .map((r) => ({ id: String(r.id), content: String(r.content), at: Number(r.at) }));
+      .map((r) => ({ id: String(r.id), scope: String(r.scope), content: String(r.content), at: Number(r.at) }));
     if (notes.length === 0) return;
     const model = this.env.RECORDS_MODEL ?? DEFAULT_RECORDS_MODEL;
-    const vocabulary = this.sql
-      .exec("SELECT category, COUNT(*) AS n FROM records WHERE type != 'none' GROUP BY category ORDER BY n DESC, category LIMIT ?", RECORDS_VOCABULARY)
-      .toArray()
-      .map((r) => String(r.category));
-    const batches: (typeof notes)[] = [];
-    for (let i = 0; i < notes.length; i += RECORDS_BATCH) batches.push(notes.slice(i, i + RECORDS_BATCH));
+    // Walls: a batch holds notes of one wall (or none), and the model only sees categories used there.
+    const walls = this.walls();
+    const wallKey = (scope: string) => wallOf(scope, walls) ?? "";
+    const counts = new Map<string, Map<string, number>>();
+    for (const r of this.sql
+      .exec("SELECT r.category, i.scope, COUNT(*) AS n FROM records r JOIN items i ON i.id = r.item_id WHERE r.type != 'none' GROUP BY r.category, i.scope")
+      .toArray()) {
+      const key = wallKey(String(r.scope));
+      const m = counts.get(key) ?? new Map<string, number>();
+      m.set(String(r.category), (m.get(String(r.category)) ?? 0) + Number(r.n));
+      counts.set(key, m);
+    }
+    const vocabularyOf = (key: string) =>
+      [...(counts.get(key) ?? new Map<string, number>()).entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, RECORDS_VOCABULARY)
+        .map(([c]) => c);
+    const groups = new Map<string, typeof notes>();
+    for (const n of notes) groups.set(wallKey(n.scope), [...(groups.get(wallKey(n.scope)) ?? []), n]);
+    const batches: { key: string; notes: typeof notes }[] = [];
+    for (const [key, g] of groups) for (let i = 0; i < g.length; i += RECORDS_BATCH) batches.push({ key, notes: g.slice(i, i + RECORDS_BATCH) });
     const answers = await Promise.all(
-      batches.map((b) =>
-        this.generateJson(model, RECORDS_PROMPT, recordsInput(vocabulary, b), (raw) => validateRecords(raw, b.length), 2000).catch((err) => {
+      batches.map(({ key, notes: b }) =>
+        this.generateJson(model, RECORDS_PROMPT, recordsInput(vocabularyOf(key), b), (raw) => validateRecords(raw, b.length), 2000).catch((err) => {
           console.error("records batch failed", String(err));
-          return null;
+          // Output the model got wrong twice is marked failed; a call that did not go through (rate limit, outage) is not.
+          return String(err).includes("model output invalid") ? null : ("transient" as const);
         }),
       ),
     );
+    const transient = answers.filter((a) => a === "transient").length;
     const now = Date.now();
     const labels = new Set<string>();
     let filed = 0;
     this.ctx.storage.transactionSync(() => {
-      batches.forEach((b, n) => {
-        const records = answers[n];
+      batches.forEach(({ notes: b }, n) => {
+        const answer = answers[n];
+        if (answer === "transient") return;
+        const records = answer ?? null;
         b.forEach((note, i) => {
           const r = records?.[i] ?? null;
           // Only while the note still says what the model read.
@@ -2640,13 +2660,15 @@ export class MemoryObject extends DurableObject<Env> {
           }
         });
       });
-      const failed = answers.reduce((k, a, n) => k + (a ? 0 : batches[n]!.length), 0);
-      this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'records', ?)", now, SYSTEM_RECORDS, JSON.stringify({ model, notes: notes.length, filed, failed }));
+      const failed = answers.reduce((k, a, n) => k + (a === null ? batches[n]!.notes.length : 0), 0);
+      this.sql.exec("INSERT INTO audit (at, client_id, action, detail) VALUES (?, ?, 'records', ?)", now, SYSTEM_RECORDS, JSON.stringify({ model, notes: notes.length, filed, failed, transient }));
     });
     await this.embedLabels([...labels]);
     // Labels no record uses any more (notes rewritten or deleted) leave the query matching.
     this.sql.exec("DELETE FROM record_labels WHERE label NOT IN (SELECT category FROM records) AND label NOT IN (SELECT label FROM record_tags)");
     this.labelCache = null;
+    // Calls that did not go through: the job backs off and the notes are tried again.
+    if (transient) throw new Error(`records: ${transient} of ${batches.length} batches did not reach the model`);
     if (notes.length === RECORDS_BATCH * RECORDS_PARALLEL) this.enqueue("type", "all");
   }
 
@@ -2762,10 +2784,18 @@ export class MemoryObject extends DurableObject<Env> {
    */
   async queryRecords(
     client: Client,
-    input: { scopes: string[]; named?: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number },
-  ): Promise<{ labels: string[]; rows: RecordRow[]; total: number }> {
+    input: { scopes: string[]; named?: string[]; category?: string; query?: string; type?: RecordType; from?: number; to?: number; limit?: number; track?: Tracked },
+  ): Promise<{ labels: string[]; rows: RecordRow[]; total: number; notices?: string[] }> {
     this.userId(client);
-    const scopes = admitNamed(input.scopes, input.named ?? [], this.walls()).scopes;
+    const now = Date.now();
+    const walls = this.walls();
+    const gate = admitNamed(input.scopes, input.named ?? [], walls);
+    // Walls rule 2, as in recall: nothing from a second wall for a conversation that was given one.
+    const second = input.track && Object.keys(walls).length ? admitConversation(gate.scopes, this.seenWalls(client, input.track, now), walls) : null;
+    const scopes = second ? second.scopes : gate.scopes;
+    const notices = [...gate.notices, ...(second?.notices ?? [])];
+    const told = notices.length ? { notices } : {};
+    if (scopes.length === 0) return { labels: [], rows: [], total: 0, ...told };
     const limit = Math.min(Math.max(input.limit ?? 100, 1), 500);
     const window = input.from !== undefined || input.to !== undefined ? { from: input.from ?? 0, to: input.to ?? Number.MAX_SAFE_INTEGER } : undefined;
     let labels: string[] = [];
@@ -2775,17 +2805,25 @@ export class MemoryObject extends DurableObject<Env> {
     let total = 0;
     if (labels.length) {
       const seen: string[] = [];
+      const found: string[] = [];
       for (const l of labels) {
         const res = this.recordQuery(l, scopes, { window, type: input.type, skip: seen, limit: limit - rows.length });
+        // Labels are shared across scopes: only name the ones with rows this call may read.
+        if (res.total > 0) found.push(l);
         total += res.total;
         rows.push(...res.rows);
         seen.push(...res.rows.map((r) => r.id));
         if (rows.length >= limit) break;
       }
       rows.sort((a, b) => a.date.localeCompare(b.date));
+      labels = found;
     } else if (!input.category && !input.query) ({ rows, total } = this.recordQuery(null, scopes, { window, type: input.type, limit }));
     this.audit(client, "records.query", { scopes, labels, rows: rows.length, total });
-    return { labels, rows, total };
+    if (input.track) {
+      this.recordReads(client, input.track, rows.map((r) => r.scope), now);
+      if (this.ledgerOn) this.recordDeliveries(client, rows, now);
+    }
+    return { labels, rows, total, ...told };
   }
 
   /**
