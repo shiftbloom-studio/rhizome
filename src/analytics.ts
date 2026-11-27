@@ -6,15 +6,19 @@
 // work. Events never carry memory content, queries, tool arguments or results,
 // project or scope names, user or client ids, emails or tokens. What they carry:
 // the tool name, success or failure, the error class, latency, the response size,
-// and the MCP client's software name and version.
+// the MCP client's software name and version, the intent category the agent picked
+// from a fixed list, and a hash of the conversation handle.
 
 import type { Client } from "./scopes";
-import { TOOLS } from "./mcp";
+import { INTENTS, TOOLS, type Intent } from "./mcp";
 
-/** What mcp.ts reports about one handled message. Nothing here comes from tool arguments or results. */
+/**
+ * What mcp.ts reports about one handled message. From the tool arguments only the
+ * intent category and the conversation handle are taken; the handle is hashed before sending.
+ */
 export type McpStat =
   | { kind: "initialize"; clientName?: string; clientVersion?: string; protocolVersion?: string }
-  | { kind: "tool_call"; tool: string; ok: boolean; errorType?: "validation" | "internal"; durationMs: number; responseBytes: number };
+  | { kind: "tool_call"; tool: string; ok: boolean; errorType?: "validation" | "internal"; durationMs: number; responseBytes: number; conversation?: string; intent?: Intent };
 
 export interface AnalyticsEnv {
   MCP_ANALYTICS?: string;
@@ -23,6 +27,7 @@ export interface AnalyticsEnv {
 }
 
 const TOOL_NAMES = new Set<string>(TOOLS.map((t) => t.name));
+const INTENT_NAMES = new Set<string>(INTENTS);
 
 /** The ingestion host, or null when analytics is off or not configured. */
 export function analyticsHost(env: AnalyticsEnv): string | null {
@@ -58,6 +63,17 @@ export async function dailyPseudonym(client: Client, now = Date.now()): Promise<
   return (await sha256Hex(`rhizome-mcp:${client.id}:${day}`)).slice(0, 32);
 }
 
+/**
+ * Groups the calls of one conversation. It is a hash of the connector's id and the
+ * handle the agent passes as conversation, so neither is sent and it cannot be
+ * turned back into them. Unlike the daily pseudonym it stays the same for the whole
+ * conversation.
+ */
+export async function conversationPseudonym(client: Client, conversation: string): Promise<string> {
+  const h = await sha256Hex(`rhizome-mcp-conversation:${client.id}:${conversation}`);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+
 export async function buildBatch(
   stats: McpStat[],
   client: Client,
@@ -79,6 +95,12 @@ export async function buildBatch(
   // The connector's agent slug (e.g. claude-code) stands in when the call itself has no client info.
   const agent = label(client.agent);
   const userAgent = label(ctx.userAgent?.split(" ")[0], 100);
+  const conversations = new Map<string, string>();
+  for (const s of stats) {
+    if (s.kind === "tool_call" && s.conversation && !conversations.has(s.conversation)) {
+      conversations.set(s.conversation, await conversationPseudonym(client, s.conversation));
+    }
+  }
   return stats.map((s) => {
     if (s.kind === "initialize") {
       return {
@@ -105,6 +127,8 @@ export async function buildBatch(
         ...(s.ok ? {} : { $mcp_error_type: s.errorType ?? "internal" }),
         $mcp_duration_ms: Math.round(s.durationMs),
         response_bytes: s.responseBytes,
+        ...(s.intent && INTENT_NAMES.has(s.intent) ? { $mcp_intent: s.intent, $mcp_intent_source: "context_parameter" } : {}),
+        ...(s.conversation ? { $mcp_conversation_id: conversations.get(s.conversation) } : {}),
         ...(agent ? { $mcp_client_name: agent } : {}),
         ...(userAgent ? { $mcp_client_user_agent: userAgent } : {}),
       },

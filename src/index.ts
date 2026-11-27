@@ -99,7 +99,7 @@ app.post("/mcp", async (c) => {
   if (!analyticsHost(c.env)) return mcpResponse(stub, client, raw, VERSION, undefined, opts);
   // Anonymous usage analytics (MCP_ANALYTICS=on): sent after the answer, never in its way.
   const stats: McpStat[] = [];
-  const res = await mcpResponse(stub, client, raw, VERSION, (s) => stats.push(s), opts);
+  const res = await mcpResponse(stub, client, raw, VERSION, (s) => stats.push(s), { ...opts, intent: true });
   if (stats.length) c.executionCtx.waitUntil(sendStats(c.env, stats, client, { serverVersion: VERSION, userAgent: c.req.header("user-agent") }));
   return res;
 });
