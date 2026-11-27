@@ -53,6 +53,19 @@ describe("LongMemEval's own evaluation", () => {
   it("prompts the reader exactly as run_generation.py does", () => {
     for (const c of fixture.reader) expect(readerPrompt(c.history, c.date, c.question)).toBe(c.prompt);
     expect(readerRequest("gpt-4o-2024-08-06", "p")).toEqual({ model: "gpt-4o-2024-08-06", messages: [{ role: "user", content: "p" }], n: 1, temperature: 0, max_tokens: 800 });
+    expect(readerRequest("gpt-4o-2024-08-06", "p", null)).toEqual(readerRequest("gpt-4o-2024-08-06", "p"));
+  });
+
+  it("gives a reasoning reader the same prompt, an effort and room to think", () => {
+    expect(readerRequest("gpt-6.1-terra", "p", "medium")).toEqual({
+      model: "gpt-6.1-terra",
+      messages: [{ role: "user", content: "p" }],
+      n: 1,
+      max_completion_tokens: 16_000,
+      reasoning_effort: "medium",
+    });
+    // Temperature only goes with no reasoning at all.
+    expect(readerRequest("gpt-6.1-terra", "p", "none")).toMatchObject({ temperature: 0, reasoning_effort: "none" });
   });
 
   it("counts a reply as correct when it has yes in it, as evaluate_qa.py does", () => {
@@ -145,6 +158,13 @@ describe("OpenAI calls", () => {
     expect(url).toBe("https://example.test/v1/chat/completions");
     expect(JSON.parse(String(init.body))).toEqual(judgeRequest("p"));
     expect((init.headers as Record<string, string>).authorization).toBe("Bearer sk-test");
+  });
+
+  it("reads how many output tokens a reasoning model spent thinking", async () => {
+    const thought = { ...ok, model: "gpt-6.1-terra", usage: { prompt_tokens: 12, completion_tokens: 900, completion_tokens_details: { reasoning_tokens: 850 } } };
+    const fetch = vi.fn(async () => reply(thought));
+    const out = await chatCompletion(readerRequest("gpt-6.1-terra", "p", "low"), { apiKey: "k", fetch: fetch as unknown as typeof globalThis.fetch });
+    expect(out).toMatchObject({ completionTokens: 900, reasoningTokens: 850 });
   });
 
   it("waits as long as a rate limit asks, and tries again", async () => {

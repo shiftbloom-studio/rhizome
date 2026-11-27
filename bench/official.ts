@@ -24,6 +24,16 @@ export const JUDGE_MODEL = "gpt-4o-2024-08-06";
 export const EVAL_RESULTS_SUFFIX = ".eval-results-gpt-4o";
 /** run_generation.py: 500 tokens to answer, 800 when it answers step by step. */
 export const READER_MAX_TOKENS = 800;
+/**
+ * Readers that think before they answer (o-series, GPT-5 and later) count their reasoning
+ * against the output limit, so the 800 tokens of run_generation.py would cut them off.
+ * They get room for the reasoning plus the answer.
+ */
+export const REASONING_READER_MAX_TOKENS = 16_000;
+/** Reader models that reason: they take reasoning_effort and max_completion_tokens instead of temperature and max_tokens. */
+export const REASONING_READER = /^(o\d|gpt-([5-9]|\d{2}))/i;
+export const READER_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+export type ReaderEffort = (typeof READER_EFFORTS)[number];
 
 // ------------------------------------------------------------------ prompts
 
@@ -96,13 +106,28 @@ export interface ChatRequest {
   model: string;
   messages: { role: "user"; content: string }[];
   n: 1;
-  temperature: 0;
-  max_tokens: number;
+  temperature?: 0;
+  max_tokens?: number;
+  /** Reasoning models: the output limit, reasoning included. */
+  max_completion_tokens?: number;
+  reasoning_effort?: ReaderEffort;
 }
 
-/** The reader call of run_generation.py. */
-export function readerRequest(model: string, prompt: string): ChatRequest {
-  return { model, messages: [{ role: "user", content: prompt }], n: 1, temperature: 0, max_tokens: READER_MAX_TOKENS };
+/**
+ * The reader call of run_generation.py. A reasoning model gets the same prompt, with a
+ * reasoning effort and room for its reasoning; it takes no temperature unless the effort is "none".
+ */
+export function readerRequest(model: string, prompt: string, effort?: ReaderEffort | null): ChatRequest {
+  const messages: ChatRequest["messages"] = [{ role: "user", content: prompt }];
+  if (!effort) return { model, messages, n: 1, temperature: 0, max_tokens: READER_MAX_TOKENS };
+  return {
+    model,
+    messages,
+    n: 1,
+    ...(effort === "none" ? { temperature: 0 as const } : {}),
+    max_completion_tokens: REASONING_READER_MAX_TOKENS,
+    reasoning_effort: effort,
+  };
 }
 
 /** The judge call of evaluate_qa.py. */
@@ -117,6 +142,8 @@ export interface ChatReply {
   finishReason: string | null;
   promptTokens: number;
   completionTokens: number;
+  /** Part of completionTokens a reasoning model spent thinking. */
+  reasoningTokens?: number;
 }
 
 export class OpenAiError extends Error {
@@ -181,7 +208,7 @@ export async function chatCompletion(request: ChatRequest, opts: OpenAiOptions):
       const body = (await res.json()) as {
         model?: string;
         choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
-        usage?: { prompt_tokens?: number; completion_tokens?: number };
+        usage?: { prompt_tokens?: number; completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } };
       };
       const choice = body.choices?.[0];
       const content = choice?.message?.content;
@@ -192,6 +219,7 @@ export async function chatCompletion(request: ChatRequest, opts: OpenAiOptions):
         finishReason: choice?.finish_reason ?? null,
         promptTokens: body.usage?.prompt_tokens ?? 0,
         completionTokens: body.usage?.completion_tokens ?? 0,
+        ...(body.usage?.completion_tokens_details?.reasoning_tokens !== undefined ? { reasoningTokens: body.usage.completion_tokens_details.reasoning_tokens } : {}),
       };
     }
     const text = await res.text();
@@ -362,7 +390,7 @@ export interface QaRecord {
   readerModel?: string;
   judgeModel?: string;
   readerFinish?: string | null;
-  readerTokens?: { prompt: number; completion: number };
+  readerTokens?: { prompt: number; completion: number; reasoning?: number };
   judgeTokens?: { prompt: number; completion: number };
   error?: string;
 }
@@ -399,6 +427,8 @@ const pct = (x: number) => (Number.isNaN(x) ? "–" : (100 * x).toFixed(1));
 export interface OfficialReport {
   runId: string;
   reader: string;
+  /** Reasoning effort of a reasoning reader. */
+  readerEffort?: ReaderEffort | null;
   dataset: string;
   records: QaRecord[];
   metrics: QaMetrics;
@@ -417,7 +447,9 @@ export function officialMarkdown(r: OfficialReport): string {
     `## LongMemEval, official evaluation: run ${r.runId}`,
     "",
     `Scored as LongMemEval's own scripts score it (${UPSTREAM.repo}, commit ${UPSTREAM.commit.slice(0, 7)}): ` +
-      `the reader prompt of src/generation/run_generation.py (reading method "con") with ${r.reader}, ` +
+      `the reader prompt of src/generation/run_generation.py (reading method "con") with ${r.reader}` +
+      (r.readerEffort ? ` (reasoning effort ${r.readerEffort}, up to ${REASONING_READER_MAX_TOKENS} output tokens)` : "") +
+      ", " +
       `the answer check of src/evaluation/evaluate_qa.py with ${JUDGE_MODEL}, the averages of src/evaluation/print_qa_metrics.py. ` +
       `The reader gets what rhizome's recall tool hands an agent for the question: up to 8 items in 4,000 tokens. Dataset LongMemEval_S, cleaned (sha256 ${r.dataset.slice(0, 12)}…).`,
     "",
@@ -437,7 +469,9 @@ export function officialMarkdown(r: OfficialReport): string {
     "```",
     "",
     `OpenAI named the reader ${models(r.records.map((x) => x.readerModel))} and the judge ${models(r.records.map((x) => x.judgeModel))}. ` +
-      `Tokens: reader ${total(r.records, (x) => x.readerTokens?.prompt)} in, ${total(r.records, (x) => x.readerTokens?.completion)} out; ` +
+      `Tokens: reader ${total(r.records, (x) => x.readerTokens?.prompt)} in, ${total(r.records, (x) => x.readerTokens?.completion)} out` +
+      (r.readerEffort ? ` (${total(r.records, (x) => x.readerTokens?.reasoning)} of them reasoning)` : "") +
+      "; " +
       `judge ${total(r.records, (x) => x.judgeTokens?.prompt)} in, ${total(r.records, (x) => x.judgeTokens?.completion)} out. ` +
       `The reader stopped at its token limit on ${r.records.filter((x) => x.readerFinish === "length").length} questions.`,
   ];

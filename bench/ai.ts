@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
-import { DEFAULT_API_LIMIT, RetryableError, defaultRpm, isRetryable } from "./limits";
+import { DEFAULT_API_LIMIT, RetryableError, defaultRpm, isRetryable, stableJson } from "./limits";
 
 /** What MemoryObject calls as env.AI: `run(model, input)`. */
 export interface AiRunner {
@@ -22,14 +22,7 @@ export function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-/** JSON with sorted object keys, so equal inputs always give the same cache key. */
-export function stableJson(value: unknown): string {
-  return JSON.stringify(value, (_key, v: unknown) =>
-    v && typeof v === "object" && !Array.isArray(v)
-      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
-      : v,
-  );
-}
+export { stableJson };
 
 /** SQLite file with embeddings (per model and text) and all other model answers (per model and input). */
 export class AiCache {
