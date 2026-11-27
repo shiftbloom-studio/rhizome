@@ -168,7 +168,7 @@ npx wrangler workflows trigger rhizome-bench-beam '{"conversations": [1], "reade
 npx wrangler r2 object get rhizome-bench/runs/beam-smoke/beam.md --remote --pipe
 ```
 
-`runs/<id>/` then holds `config.json`, `conversations.jsonl` (ingest per conversation), `answers.jsonl` (every question's answer, verdict per rubric item, tokens, and how many of its evidence messages the reader's text covers), `contexts/` (what the reader got), and in `upstream/<tier>/<n>/` BEAM's own files: `rhizome.json` as `answer_generation.py` writes answers and `evaluation-results-rhizome.json` as `run_evaluation.py` writes verdicts, which `report_results.py` reads. The prompts and scores are checked against BEAM's code in `test/bench-beam.test.ts`; `bench/beam-fixture.py` writes its fixture from a BEAM checkout.
+`runs/<id>/` then holds `config.json`, `conversations.jsonl` (ingest per conversation), `answers.jsonl` (every question's answer, verdict per rubric item, tokens, and how many of its evidence messages the reader's text covers), `contexts/` (what the reader got), and in `upstream/<tier>/<n>/` BEAM's own files: `rhizome.json` as `answer_generation.py` writes answers and `evaluation-results-rhizome.json` as `run_evaluation.py` writes verdicts, which `report_results.py` reads. The prompts and scores are checked against BEAM's code in `test/bench-beam.test.ts`; `bench/beam-fixture.py` writes its fixture from a BEAM checkout in `./BEAM`.
 
 A 100K conversation has about 95 turns; with extraction, the paid-model limit sets the pace (one or two calls per turn). The larger tiers scale with it: about 400 turns at 500K, 800 at 1M and 7,000 at 10M per conversation.
 

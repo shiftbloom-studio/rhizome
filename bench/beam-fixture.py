@@ -5,7 +5,9 @@
 #
 #   git clone https://github.com/mohammadtavakoli78/BEAM
 #   git -C BEAM checkout b2da22eac88bb0874c64665f13457eb99835774a
-#   python3 -I bench/beam-fixture.py BEAM > test/fixtures/beam-official.json
+#   python3 -I bench/beam-fixture.py > test/fixtures/beam-official.json
+#
+# The checkout must be ./BEAM, next to where it runs (no path is taken from the command line).
 #
 # Needs scipy. Nothing of the checkout runs: its prompts and the strings of the judge's
 # messages are read from the source with ast, and the event-ordering cases are scored
@@ -15,11 +17,10 @@ import ast
 import json
 import math
 import os
-import sys
 
 from scipy.stats import kendalltau
 
-root = os.path.abspath(sys.argv[1])
+root = os.path.abspath("BEAM")
 # The checkout is detached at the commit, so .git/HEAD holds its id.
 commit = open(os.path.join(root, ".git", "HEAD"), encoding="utf-8").read().strip()
 if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
